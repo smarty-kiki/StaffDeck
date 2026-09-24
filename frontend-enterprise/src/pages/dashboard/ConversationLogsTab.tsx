@@ -33,6 +33,7 @@ import { notify } from '@/components/ui/app-toast';
 import { cn } from '@/lib/utils';
 import { SELECT_TRIGGER_CLASS, formatDateTime } from '@/lib/enterprise-ui';
 import { isTeamScope, readEmployeeScope } from '@/lib/agent-scope-storage';
+import { saveBlob } from '@/lib/download';
 import { MarkdownMessage } from '../chat/chatHelpers';
 
 import { api, TENANT_ID } from '../../api/client';
@@ -245,8 +246,8 @@ export default function ConversationLogsTab() {
       const blob = await api.blob(
         `/api/enterprise/sessions/${encodeURIComponent(row.id)}/export?tenant_id=${TENANT_ID}`,
       );
-      downloadBlob(blob, `staffdeck-conversation-log-${safeFilenamePart(row.id)}.json`);
-      notify.success('对话日志 JSON 已导出');
+      const saved = await downloadBlob(blob, `staffdeck-conversation-log-${safeFilenamePart(row.id)}.json`);
+      if (saved) notify.success('对话日志 JSON 已导出');
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '导出对话日志失败');
     } finally {
@@ -267,8 +268,8 @@ export default function ConversationLogsTab() {
         `/api/enterprise/sessions/export?tenant_id=${TENANT_ID}`,
         { session_ids: sessionIds },
       );
-      downloadBlob(blob, `staffdeck-conversation-logs-${filenameTimestamp()}.json`);
-      notify.success(`已导出 ${sessionIds.length} 条对话日志`);
+      const saved = await downloadBlob(blob, `staffdeck-conversation-logs-${filenameTimestamp()}.json`);
+      if (saved) notify.success(`已导出 ${sessionIds.length} 条对话日志`);
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '批量导出对话日志失败');
     } finally {
@@ -341,7 +342,7 @@ export default function ConversationLogsTab() {
     {
       key: 'title',
       title: '对话任务',
-      width: 200,
+      width: 168,
       className: 'whitespace-normal text-[#18181a]',
       render: (row) => (
         <span className="line-clamp-1 wrap-break-word">
@@ -352,13 +353,13 @@ export default function ConversationLogsTab() {
     {
       key: 'agent',
       title: '数字员工',
-      width: 180,
+      width: 136,
       render: (row) => <span className="block truncate" title={agentLabel(row)}>{agentLabel(row)}</span>,
     },
     {
       key: 'source',
       title: '来源/用户',
-      width: 140,
+      width: 124,
       render: (row) => (
         <div className="flex min-w-0 flex-col items-start gap-[4px]">
           <ChannelBadge channel={row.channel} />
@@ -371,7 +372,7 @@ export default function ConversationLogsTab() {
     {
       key: 'status',
       title: '状态',
-      width: 120,
+      width: 92,
       render: (row) => (
         <div className="flex flex-wrap gap-[4px]">
           {row.downFeedback && <StatusBadge tone="red">差评</StatusBadge>}
@@ -383,7 +384,7 @@ export default function ConversationLogsTab() {
     {
       key: 'attribution',
       title: '问题归因',
-      width: 130,
+      width: 120,
       render: (row) => (
         <span>
           {row.downFeedback
@@ -395,6 +396,7 @@ export default function ConversationLogsTab() {
     {
       key: 'latest',
       title: '最近内容',
+      width: 168,
       className: 'whitespace-normal',
       render: (row) => (
         <span className="line-clamp-1 wrap-break-word">
@@ -409,13 +411,13 @@ export default function ConversationLogsTab() {
     {
       key: 'updated',
       title: '时间',
-      width: 170,
+      width: 154,
       render: (row) => formatDateTime(row.updated_at),
     },
     {
       key: 'actions',
       title: '操作',
-      width: 150,
+      width: 120,
       render: (row) => (
         <div className="flex items-center gap-[12px]">
           <UIButton
@@ -1134,15 +1136,10 @@ function analysisStatusLabel(status?: string): string {
   return status || '未知';
 }
 
-function downloadBlob(blob: Blob, filename: string): void {
-  const objectUrl = window.URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = objectUrl;
-  link.download = filename;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  window.URL.revokeObjectURL(objectUrl);
+/** Saves a blob and reports whether the user actually kept the file. */
+async function downloadBlob(blob: Blob, filename: string): Promise<boolean> {
+  const outcome = await saveBlob(blob, filename);
+  return outcome.status !== 'cancelled';
 }
 
 function safeFilenamePart(value: string): string {

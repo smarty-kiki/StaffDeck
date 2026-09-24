@@ -3444,5 +3444,10 @@
   "引用到 SOP": "Reference to SOP",
   "可引用和复用的业务流程与执行规范。": "Business processes and execution standards that can be referenced and reused.",
   "可引用": "Referenceable",
-  "请先选择一个员工，再引用广场资源。": "Select an employee first, then reference Marketplace resources."
+  "请先选择一个员工，再引用广场资源。": "Select an employee first, then reference Marketplace resources.",
+  "保存文件超时，请重试": "Timed out saving the file. Please try again.",
+  "保存文件失败": "Failed to save the file.",
+  "附件下载失败": "Failed to download the attachment.",
+  "下载群聊完整日志失败": "Failed to download the full group chat log.",
+  "已保存文件：{1}": "Saved file: {1}"
 }

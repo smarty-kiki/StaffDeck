@@ -2,7 +2,7 @@ import { ApiOutlined, CheckOutlined, ExperimentOutlined, ToolOutlined } from '..
 import type { ReactNode } from 'react';
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { Activity, FlaskConical, RotateCcw, TerminalSquare, XCircle } from 'lucide-react';
+import { Activity, Copy, FlaskConical, RotateCcw, TerminalSquare, XCircle } from 'lucide-react';
 import { pinyin } from 'pinyin-pro';
 
 import { api, TENANT_ID } from '../api/client';
@@ -734,7 +734,7 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
               )}
               {!isPlazaScope && (
                 <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => handleCreateAction('plaza')}>
-                  <IconTool className="size-[14px]" />
+                  <Copy />
                   引用广场工具
                 </DropdownMenuItem>
               )}

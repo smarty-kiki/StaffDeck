@@ -19,6 +19,7 @@ import {
 import type { HTMLAttributes, ReactNode } from 'react';
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
+import { Copy } from 'lucide-react';
 import { api, ApiError, TENANT_ID } from '../api/client';
 import { referencedResourceIdSet, replaceReferencedResources, unreferencePlazaResource } from '../api/agentResources';
 import { isEnterpriseAdmin, type EnterpriseAuthUser } from '../auth';
@@ -61,6 +62,7 @@ import {
 import { Button as UIButton } from '@/components/ui/button';
 import { notify } from '@/components/ui/app-toast';
 import { cn } from '@/lib/utils';
+import { saveBlob } from '@/lib/download';
 import { DIALOG_CANCEL_BUTTON_CLASS, DIALOG_FOOTER_CLASS, DIALOG_PRIMARY_BUTTON_CLASS, MENU_CONTENT_CLASS, MENU_ITEM_CLASS, MENU_ITEM_DANGER_CLASS, MOBILE_CARD_CLASS, OUTLINE_ACTION_BUTTON_CLASS, OUTLINE_ACTION_BUTTON_SM_CLASS, SEARCH_COMBO_BUTTON_CLASS, SEARCH_COMBO_CLASS, SEARCH_COMBO_INPUT_CLASS, SELECT_TRIGGER_CLASS } from '@/lib/enterprise-ui';
 import {
   clearSharedAgentScope,
@@ -640,15 +642,8 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       const blob = await api.blob(
         `/api/enterprise/knowledge-bases/${targetKnowledgeBase.id}/okf/export?tenant_id=${TENANT_ID}${suffix}`,
       );
-      const url = window.URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = `${targetKnowledgeBase.name || targetKnowledgeBase.id}-okf.zip`;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      window.URL.revokeObjectURL(url);
-      notify.success('已导出知识库备份包');
+      const outcome = await saveBlob(blob, `${targetKnowledgeBase.name || targetKnowledgeBase.id}-okf.zip`);
+      if (outcome.status !== 'cancelled') notify.success('已导出知识库备份包');
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '导出知识库备份包失败');
     }
@@ -1104,7 +1099,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
               </DropdownMenuItem>
               {!isPlazaScope && (
                 <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => handleCreateAction('plaza')}>
-                  <DownloadOutlined />
+                  <Copy />
                   引用广场知识库
                 </DropdownMenuItem>
               )}

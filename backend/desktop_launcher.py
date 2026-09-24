@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import importlib
 import ipaddress
 import json
@@ -27,6 +29,22 @@ DEFAULT_PORT_RANGE_END = 5199
 _MACOS_DELEGATE_REF = None
 _MACOS_INSTANCE_LOCK_HANDLE = None
 _MACOS_WINDOW_CLASS = None
+_MACOS_UI_DELEGATE_CLASS = None
+# WKWebView 对 UIDelegate 是弱引用，模块级引用保证 JS 面板代理不被 GC 掉。
+_MACOS_UI_DELEGATE_REF = None
+
+# WKWebView 不认 <a download>：前端点下载时它会带着 download 意图去导航主框架，界面
+# 直接被文件内容顶掉。壳这边没法用 WKDownload（本机 WebKit 未暴露 downloadDelegate，
+# 拿不到落点），所以改由页面把字节推给原生、原生弹保存面板写盘。
+MACOS_DOWNLOAD_HANDLER_NAME = "staffdeckDownload"
+# 与前端 frontend-enterprise/src/lib/download.ts 的 NATIVE_CHUNK_BYTES 对应；必须是
+# 3 的倍数，这样每片 base64 都能独立解码（768KiB / 3 = 262144）。
+MACOS_DOWNLOAD_CHUNK_BYTES = 768 * 1024
+MACOS_DOWNLOAD_MAX_BYTES = 512 * 1024 * 1024
+MACOS_DOWNLOAD_MAX_PENDING = 4
+MACOS_DOWNLOAD_NAME_LIMIT = 180
+_MACOS_DOWNLOAD_HANDLER_CLASS = None
+
 MACOS_DRAG_REGION_LEFT_INSET = 360
 MACOS_DRAG_REGION_RIGHT_INSET = 260
 MACOS_DRAG_REGION_HEIGHT = 32
@@ -440,6 +458,321 @@ def preload_server_app(cfg: dict) -> None:
     cfg["app"] = getattr(module, attribute_name)
 
 
+def _macos_first_button_return(AppKit) -> int:
+    return getattr(AppKit, "NSAlertFirstButtonReturn", 1000)
+
+
+def _macos_message_panel(AppKit, message: object, buttons: tuple[str, ...]) -> int:
+    """Show a modal panel for a JS alert/confirm and return the clicked button constant."""
+    alert = AppKit.NSAlert.alloc().init()
+    alert.setMessageText_(APP_NAME)
+    # JS 允许空消息，NSAlert 空文案会渲染成一块空白，这里给个兜底。
+    alert.setInformativeText_(str(message) if message else APP_NAME)
+    for title in buttons:
+        alert.addButtonWithTitle_(title)
+    return alert.runModal()
+
+
+def _macos_text_input_panel(AppKit, prompt: object, default_text: object):
+    """Show a modal text field for window.prompt; None means the user cancelled."""
+    alert = AppKit.NSAlert.alloc().init()
+    alert.setMessageText_(APP_NAME)
+    alert.setInformativeText_(str(prompt) if prompt else APP_NAME)
+    alert.addButtonWithTitle_("确定")
+    alert.addButtonWithTitle_("取消")
+    field = AppKit.NSTextField.alloc().initWithFrame_(AppKit.NSMakeRect(0, 0, 260, 24))
+    field.setStringValue_("" if default_text is None else str(default_text))
+    alert.setAccessoryView_(field)
+    alert.window().setInitialFirstResponder_(field)
+    if alert.runModal() != _macos_first_button_return(AppKit):
+        return None
+    return str(field.stringValue() or "")
+
+
+def _complete_js_dialog(completion_handler, *args) -> None:
+    if completion_handler is not None:
+        completion_handler(*args)
+
+
+def _macos_ui_delegate_class(AppKit):
+    """Build the WKUIDelegate that answers JS alert/confirm/prompt panels.
+
+    WebKit 只有在 WebView 带 UIDelegate 时才会回调面板请求，否则 request 会被
+    直接丢弃：window.confirm() 静默返回 false，前端表现为「点了确认毫无反应、
+    请求也没发出」。这里补齐三个面板回调，让打包态壳与浏览器行为一致。
+    """
+    global _MACOS_UI_DELEGATE_CLASS
+    if _MACOS_UI_DELEGATE_CLASS is not None:
+        return _MACOS_UI_DELEGATE_CLASS
+
+    class StaffDeckWebViewUIDelegate(AppKit.NSObject):
+        def webView_runJavaScriptAlertPanelWithMessage_initiatedByFrame_completionHandler_(  # noqa: N802
+            self,
+            _webview,
+            message,
+            _frame,
+            completion_handler,
+        ):
+            _macos_message_panel(AppKit, message, ("好",))
+            _complete_js_dialog(completion_handler)
+
+        def webView_runJavaScriptConfirmPanelWithMessage_initiatedByFrame_completionHandler_(  # noqa: N802
+            self,
+            _webview,
+            message,
+            _frame,
+            completion_handler,
+        ):
+            clicked = _macos_message_panel(AppKit, message, ("确定", "取消"))
+            _complete_js_dialog(completion_handler, clicked == _macos_first_button_return(AppKit))
+
+        def webView_runJavaScriptTextInputPanelWithPrompt_defaultText_initiatedByFrame_completionHandler_(  # noqa: N802
+            self,
+            _webview,
+            prompt,
+            default_text,
+            _frame,
+            completion_handler,
+        ):
+            _complete_js_dialog(
+                completion_handler,
+                _macos_text_input_panel(AppKit, prompt, default_text),
+            )
+
+    _MACOS_UI_DELEGATE_CLASS = StaffDeckWebViewUIDelegate
+    return _MACOS_UI_DELEGATE_CLASS
+
+
+def _sanitize_download_name(value: str) -> str:
+    """Turn a page-supplied download name into a bare, printable file name."""
+    name = str(value or "").replace("\\", "/").rsplit("/", 1)[-1]
+    name = "".join(char for char in name if char.isprintable()).strip()
+    name = name.lstrip(".").strip()
+    return name[:MACOS_DOWNLOAD_NAME_LIMIT] or "download"
+
+
+def _decode_download_chunk(value: str) -> bytes:
+    """Decode one base64 chunk pushed by the page; raises ValueError when corrupt."""
+    try:
+        return base64.b64decode(str(value or "").encode("ascii"), validate=True)
+    except (UnicodeEncodeError, binascii.Error) as exc:
+        raise ValueError("invalid download chunk") from exc
+
+
+class _PendingDownload:
+    """One download being pushed from the page, before it can be written to disk."""
+
+    __slots__ = ("chunks", "name", "size")
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.chunks: list[bytes] = []
+        self.size = 0
+
+
+class _MacosDownloadTransfers:
+    """Collect the base64 chunks a page pushes before the file can be saved.
+
+    协议（页面 → 原生，共用同一个 id）：``begin`` 声明文件、若干 ``chunk`` 推字节、
+    ``end`` 表示推完。原生只在结束或出错时回一条结果，避免把整个文件塞进单条消息。
+    """
+
+    def __init__(
+        self,
+        max_bytes: int = MACOS_DOWNLOAD_MAX_BYTES,
+        max_pending: int = MACOS_DOWNLOAD_MAX_PENDING,
+    ) -> None:
+        self._max_bytes = max_bytes
+        self._max_pending = max_pending
+        self._pending: dict[str, _PendingDownload] = {}
+
+    @property
+    def max_megabytes(self) -> int:
+        return self._max_bytes // (1024 * 1024)
+
+    def begin(self, transfer_id: str, name: str, size: object = None) -> str:
+        """Register a new transfer; returns an error message for the page, else ''."""
+        self._pending.pop(transfer_id, None)
+        if len(self._pending) >= self._max_pending:
+            return "同时保存的文件过多，请稍后再试"
+        if isinstance(size, (int, float)) and size > self._max_bytes:
+            return f"文件超过 {self.max_megabytes} MB，暂不支持保存"
+        self._pending[transfer_id] = _PendingDownload(_sanitize_download_name(name))
+        return ""
+
+    def append(self, transfer_id: str, data: str) -> str:
+        """Store one chunk; returns an error message for the page, else ''."""
+        transfer = self._pending.get(transfer_id)
+        if transfer is None:
+            return "保存会话已失效，请重新点击下载"
+        try:
+            chunk = _decode_download_chunk(data)
+        except ValueError:
+            self.abort(transfer_id)
+            return "下载数据损坏，请重试"
+        if transfer.size + len(chunk) > self._max_bytes:
+            self.abort(transfer_id)
+            return f"文件超过 {self.max_megabytes} MB，暂不支持保存"
+        transfer.chunks.append(chunk)
+        transfer.size += len(chunk)
+        return ""
+
+    def take(self, transfer_id: str) -> tuple[str, bytes] | None:
+        """Pop a finished transfer as ``(name, payload)``; None when unknown."""
+        transfer = self._pending.pop(transfer_id, None)
+        if transfer is None:
+            return None
+        return transfer.name, b"".join(transfer.chunks)
+
+    def abort(self, transfer_id: str) -> None:
+        self._pending.pop(transfer_id, None)
+
+    def pending_count(self) -> int:
+        return len(self._pending)
+
+
+def _macos_choose_download_path(AppKit, suggested_name: str) -> str | None:
+    """Ask the user where to save a download; None means the save panel was cancelled."""
+    panel = AppKit.NSSavePanel.savePanel()
+    panel.setTitle_(f"{APP_NAME} 保存文件")
+    panel.setNameFieldStringValue_(suggested_name)
+    panel.setCanCreateDirectories_(True)
+    if panel.runModal() != AppKit.NSModalResponseOK:
+        return None
+    url = panel.URL()
+    path = str(url.path()) if url is not None else ""
+    return path or None
+
+
+def _macos_write_download(path: str, payload: bytes) -> None:
+    """Write a finished download to the path the user picked in the save panel."""
+    with open(path, "wb") as handle:
+        handle.write(payload)
+
+
+def _macos_download_payload(body) -> dict:
+    """Normalize a WKScriptMessage body into a plain dict.
+
+    WebKit 交过来的 JS 对象是 ObjC 的 NSMutableDictionary 代理，既不是 Python dict，
+    也不能只用 ``isinstance`` 判断；字符串字段同样是 ObjC 代理，所以取值时统一 str()。
+    """
+    if isinstance(body, dict):
+        return body
+    try:
+        return dict(body)
+    except (TypeError, ValueError):
+        return {}
+
+
+def _macos_download_reply_script(payload: dict) -> str:
+    """Build the evaluation script that hands a save result back to the page."""
+    return (
+        "window.__staffdeckDownloadResult && window.__staffdeckDownloadResult("
+        f"{json.dumps(payload, ensure_ascii=True)})"
+    )
+
+
+def _macos_download_message_handler_class(AppKit) -> type | None:
+    """Build the WKScriptMessageHandler subclass that saves page downloads to disk."""
+    global _MACOS_DOWNLOAD_HANDLER_CLASS
+    if _MACOS_DOWNLOAD_HANDLER_CLASS is not None:
+        return _MACOS_DOWNLOAD_HANDLER_CLASS
+    if not hasattr(AppKit, "NSObject"):
+        return None
+
+    transfers = _MacosDownloadTransfers()
+
+    class StaffDeckDownloadHandler(AppKit.NSObject):
+        def userContentController_didReceiveScriptMessage_(self, _controller, message):  # noqa: N802
+            payload = _macos_download_payload(message.body())
+            transfer_id = str(payload.get("id") or "")
+            phase = str(payload.get("phase") or "")
+            if not transfer_id:
+                return
+            if phase == "begin":
+                error = transfers.begin(
+                    transfer_id, str(payload.get("name") or ""), payload.get("size")
+                )
+            elif phase == "chunk":
+                error = transfers.append(transfer_id, str(payload.get("data") or ""))
+            elif phase == "end":
+                self._save_download(message.webView(), transfer_id)
+                return
+            else:
+                return
+            if error:
+                self._reply_to_page(
+                    message.webView(),
+                    {"id": transfer_id, "status": "error", "message": error},
+                )
+
+        def _save_download(self, webview, transfer_id: str) -> None:
+            taken = transfers.take(transfer_id)
+            if taken is None:
+                self._reply_to_page(
+                    webview,
+                    {
+                        "id": transfer_id,
+                        "status": "error",
+                        "message": "保存会话已失效，请重新点击下载",
+                    },
+                )
+                return
+            name, payload = taken
+            target = _macos_choose_download_path(AppKit, name)
+            if target is None:
+                self._reply_to_page(webview, {"id": transfer_id, "status": "cancelled"})
+                return
+            try:
+                _macos_write_download(target, payload)
+            except OSError as exc:
+                self._reply_to_page(
+                    webview,
+                    {
+                        "id": transfer_id,
+                        "status": "error",
+                        "message": f"写入文件失败：{exc}",
+                    },
+                )
+                return
+            self._reply_to_page(webview, {"id": transfer_id, "status": "saved", "path": target})
+
+        def _reply_to_page(self, webview, payload: dict) -> None:
+            if webview is None:
+                return
+            webview.evaluateJavaScript_completionHandler_(
+                _macos_download_reply_script(payload), None
+            )
+
+    _MACOS_DOWNLOAD_HANDLER_CLASS = StaffDeckDownloadHandler
+    return StaffDeckDownloadHandler
+
+
+def _create_macos_webview_configuration(WebKit, download_handler) -> object | None:
+    """Attach the download bridge to a WKWebViewConfiguration, when available."""
+    controller_class = getattr(WebKit, "WKUserContentController", None)
+    configuration_class = getattr(WebKit, "WKWebViewConfiguration", None)
+    if download_handler is None or controller_class is None or configuration_class is None:
+        return None
+    controller = controller_class.alloc().init()
+    controller.addScriptMessageHandler_name_(download_handler, MACOS_DOWNLOAD_HANDLER_NAME)
+    configuration = configuration_class.alloc().init()
+    configuration.setUserContentController_(controller)
+    return configuration
+
+
+def _create_macos_webview(AppKit, WebKit, window):
+    """Build the WKWebView that hosts the UI, wiring in the download bridge."""
+    frame = window.contentView().bounds()
+    handler_class = _macos_download_message_handler_class(AppKit)
+    download_handler = handler_class.alloc().init() if handler_class is not None else None
+    configuration = _create_macos_webview_configuration(WebKit, download_handler)
+    initializer = getattr(WebKit.WKWebView, "initWithFrame_configuration_", None)
+    if configuration is None or initializer is None:
+        return WebKit.WKWebView.alloc().initWithFrame_(frame)
+    return WebKit.WKWebView.alloc().initWithFrame_configuration_(frame, configuration)
+
+
 def _create_macos_webview_window(AppKit, Foundation, WebKit, target: str):
     """Create the native macOS window used by both arm64 and x86_64 bundles."""
     try:
@@ -453,6 +786,7 @@ def _create_macos_webview_window(AppKit, Foundation, WebKit, target: str):
     )
 
     global _MACOS_WINDOW_CLASS
+    global _MACOS_UI_DELEGATE_REF
     if _MACOS_WINDOW_CLASS is None:
 
         class StaffDeckWindow(AppKit.NSWindow):
@@ -502,8 +836,11 @@ def _create_macos_webview_window(AppKit, Foundation, WebKit, target: str):
     window.setReleasedWhenClosed_(False)
     window.center()
 
-    webview = WebKit.WKWebView.alloc().initWithFrame_(window.contentView().bounds())
+    webview = _create_macos_webview(AppKit, WebKit, window)
     webview.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
+    # 缺 UIDelegate 时 JS 的 alert/confirm/prompt 会被 WebKit 静默丢弃。
+    _MACOS_UI_DELEGATE_REF = _macos_ui_delegate_class(AppKit).alloc().init()
+    webview.setUIDelegate_(_MACOS_UI_DELEGATE_REF)
     page_url = Foundation.NSURL.URLWithString_(target)
     if page_url is None:
         raise RuntimeError(f"Invalid StaffDeck window URL: {target!r}")

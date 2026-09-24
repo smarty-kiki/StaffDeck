@@ -11,7 +11,7 @@ import {
 import type { ChangeEvent, DragEvent, HTMLAttributes, ReactNode } from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { Ban, ChevronRight, CircleCheck, Eye, EyeOff, FilePlus2, FolderPlus } from 'lucide-react';
+import { Ban, ChevronRight, CircleCheck, Copy, Eye, EyeOff, FilePlus2, FolderPlus } from 'lucide-react';
 import { ContextMenu } from 'radix-ui';
 
 import { api, streamPost, TENANT_ID } from '../api/client';
@@ -2461,7 +2461,7 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
         <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => requestImport('folder')}>选择文件夹</DropdownMenuItem>
         {!isPlazaScope && (
           <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => openReferenceDialog()}>
-            <IconSkill />
+            <Copy />
             引用广场技能
           </DropdownMenuItem>
         )}

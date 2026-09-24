@@ -1,3 +1,6 @@
+import base64
+import json
+
 import pytest
 
 import desktop_launcher
@@ -367,6 +370,9 @@ def test_macos_window_embeds_local_ui() -> None:
         def setAutoresizingMask_(self, mask):
             events["autoresizing_mask"] = mask
 
+        def setUIDelegate_(self, delegate):
+            events["ui_delegate"] = delegate
+
         def bounds(self):
             return type(
                 "Bounds",
@@ -387,8 +393,18 @@ def test_macos_window_embeds_local_ui() -> None:
         def requestWithURL_(url):
             return f"request:{url}"
 
+    class FakeNSObject:
+        @classmethod
+        def alloc(cls):
+            return cls()
+
+        def init(self):
+            return self
+
     class FakeAppKit:
         NSWindow = FakeWindow
+        NSObject = FakeNSObject
+        NSAlertFirstButtonReturn = 1000
         NSEventTypeLeftMouseDown = 1
         NSWindowStyleMaskTitled = 1
         NSWindowStyleMaskClosable = 2
@@ -417,7 +433,11 @@ def test_macos_window_embeds_local_ui() -> None:
         WKWebView = FakeWebView
 
     original_window_class = desktop_launcher._MACOS_WINDOW_CLASS
+    original_ui_delegate_class = desktop_launcher._MACOS_UI_DELEGATE_CLASS
+    original_ui_delegate_ref = desktop_launcher._MACOS_UI_DELEGATE_REF
     desktop_launcher._MACOS_WINDOW_CLASS = None
+    desktop_launcher._MACOS_UI_DELEGATE_CLASS = None
+    desktop_launcher._MACOS_UI_DELEGATE_REF = None
     try:
         window, webview = desktop_launcher._create_macos_webview_window(
             FakeAppKit,
@@ -433,6 +453,10 @@ def test_macos_window_embeds_local_ui() -> None:
     assert webview is events["content_view"]
     assert events["request"] == "request:url:http://127.0.0.1:5173/chat/"
     assert events["title"] == "StaffDeck"
+    assert isinstance(events["ui_delegate"], FakeNSObject)
+    assert events["ui_delegate"] is desktop_launcher._MACOS_UI_DELEGATE_REF
+    desktop_launcher._MACOS_UI_DELEGATE_CLASS = original_ui_delegate_class
+    desktop_launcher._MACOS_UI_DELEGATE_REF = original_ui_delegate_ref
     assert events["window_init"][1] & FakeAppKit.NSWindowStyleMaskFullSizeContentView
     assert events["title_visibility"] == FakeAppKit.NSWindowTitleHidden
     assert events["titlebar_transparent"] is True
@@ -478,6 +502,446 @@ def test_macos_window_embeds_local_ui() -> None:
     )()
     window.sendEvent_(web_event)
     assert events["forwarded_event"] is web_event
+
+
+class _FakeDownloadMessage:
+    """Minimal WKScriptMessage stand-in: an ObjC-dictionary-like body plus its webview."""
+
+    def __init__(self, payload, webview, body_override=None):
+        self._payload = payload
+        self._webview = webview
+        self._body_override = body_override
+
+    def body(self):
+        if self._body_override is not None:
+            return self._body_override
+        # WebKit 交给 Python 的是 ObjC 字典代理，用自定义映射模拟「不是 dict」这一点。
+        return _ObjCDictionaryLike(self._payload)
+
+    def webView(self):
+        return self._webview
+
+
+class _ObjCDictionaryLike:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def __iter__(self):
+        return iter(self._payload)
+
+    def __getitem__(self, key):
+        if key not in self._payload:
+            raise KeyError(key)
+        return self._payload[key]
+
+    def keys(self):
+        return self._payload.keys()
+
+
+class _FakeDownloadWebView:
+    def __init__(self):
+        self.scripts: list[str] = []
+
+    def evaluateJavaScript_completionHandler_(self, script, handler):
+        self.scripts.append(script)
+        if handler is not None:
+            handler(script, None)
+
+
+class _FakeDownloadHandlerAppKit:
+    """Fake AppKit whose NSObject is enough for PyObjC-less handler construction."""
+
+    class NSObject:
+        @classmethod
+        def alloc(cls):
+            return cls()
+
+        def init(self):
+            return self
+
+    NSSavePanel = None
+    NSModalResponseOK = 1
+
+
+@pytest.fixture
+def download_handler(monkeypatch):
+    monkeypatch.setattr(desktop_launcher, "_MACOS_DOWNLOAD_HANDLER_CLASS", None)
+    handler_class = desktop_launcher._macos_download_message_handler_class(
+        _FakeDownloadHandlerAppKit
+    )
+    assert handler_class is not None
+    return handler_class.alloc().init()
+
+
+def _drive_download(handler, webview, transfer_id="t1", name="报告.xlsx", chunks=()):
+    handler.userContentController_didReceiveScriptMessage_(
+        None, _FakeDownloadMessage({"phase": "begin", "id": transfer_id, "name": name, "size": 0}, webview)
+    )
+    for chunk in chunks:
+        handler.userContentController_didReceiveScriptMessage_(
+            None, _FakeDownloadMessage({"phase": "chunk", "id": transfer_id, "data": chunk}, webview)
+        )
+    handler.userContentController_didReceiveScriptMessage_(
+        None, _FakeDownloadMessage({"phase": "end", "id": transfer_id}, webview)
+    )
+
+
+def _reply_payloads(webview) -> list[dict]:
+    replies = []
+    for script in webview.scripts:
+        json_start = script.find("(")
+        replies.append(json.loads(script[json_start + 1 :].rstrip(")")))
+    return replies
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("报告.xlsx", "报告.xlsx"),
+        ("../../etc/passwd", "passwd"),
+        ("..\\..\\windows\\system32\\cmd.exe", "cmd.exe"),
+        ("hidden\u0001 name.bin", "hidden name.bin"),
+        (".bashrc", "bashrc"),
+        ("", "download"),
+        ("/", "download"),
+        ("x" * 400, "x" * desktop_launcher.MACOS_DOWNLOAD_NAME_LIMIT),
+    ],
+)
+def test_download_name_sanitizing(raw: str, expected: str) -> None:
+    assert desktop_launcher._sanitize_download_name(raw) == expected
+
+
+def test_download_chunk_size_decodes_standalone() -> None:
+    # 前端按固定字节数切片；每片 base64 都要能独立解码，因此必须是 3 的倍数。
+    assert desktop_launcher.MACOS_DOWNLOAD_CHUNK_BYTES % 3 == 0
+
+
+def test_download_transfers_reassemble_chunks() -> None:
+    transfers = desktop_launcher._MacosDownloadTransfers()
+
+    assert transfers.begin("t1", "报告.bin", 3) == ""
+    assert transfers.append("t1", base64.b64encode(b"abc").decode()) == ""
+    assert transfers.append("t1", base64.b64encode(b"def").decode()) == ""
+    assert transfers.take("t1") == ("报告.bin", b"abcdef")
+    assert transfers.pending_count() == 0
+
+
+def test_download_transfers_reject_unknown_and_corrupt_input() -> None:
+    transfers = desktop_launcher._MacosDownloadTransfers()
+
+    assert "失效" in transfers.append("missing", base64.b64encode(b"x").decode())
+    assert transfers.begin("t2", "x.bin", 1) == ""
+    assert "损坏" in transfers.append("t2", "not-base64!!")
+    # 数据损坏的传输会被丢弃，避免半个文件落到磁盘上
+    assert transfers.take("t2") is None
+
+
+def test_download_transfers_reject_declared_oversize() -> None:
+    transfers = desktop_launcher._MacosDownloadTransfers(max_bytes=8)
+
+    assert "超过" in transfers.begin("big", "x.bin", 9)
+    assert transfers.pending_count() == 0
+
+
+def test_download_transfers_reject_actual_oversize() -> None:
+    transfers = desktop_launcher._MacosDownloadTransfers(max_bytes=8)
+
+    assert transfers.begin("big", "x.bin", 4) == ""
+    assert "超过" in transfers.append("big", base64.b64encode(b"123456789").decode())
+    assert transfers.take("big") is None
+
+
+def test_download_transfers_limit_concurrent_saves() -> None:
+    transfers = desktop_launcher._MacosDownloadTransfers(max_pending=1)
+
+    assert transfers.begin("first", "a.bin", 1) == ""
+    assert "过多" in transfers.begin("second", "b.bin", 1)
+    assert transfers.pending_count() == 1
+
+
+def test_download_transfers_restart_reused_transfer_id() -> None:
+    transfers = desktop_launcher._MacosDownloadTransfers()
+
+    assert transfers.begin("t1", "first.bin", 0) == ""
+    assert transfers.append("t1", base64.b64encode(b"first").decode()) == ""
+    assert transfers.begin("t1", "second.bin", 0) == ""
+    assert transfers.append("t1", base64.b64encode(b"second").decode()) == ""
+    assert transfers.take("t1") == ("second.bin", b"second")
+
+
+def test_download_message_payload_handles_objc_dictionary() -> None:
+    body = _ObjCDictionaryLike({"phase": "begin", "id": "x"})
+
+    assert desktop_launcher._macos_download_payload(body) == {"phase": "begin", "id": "x"}
+    assert desktop_launcher._macos_download_payload({"phase": "end"}) == {"phase": "end"}
+    assert desktop_launcher._macos_download_payload("nope") == {}
+
+
+def test_download_reply_script_escapes_payload() -> None:
+    script = desktop_launcher._macos_download_reply_script(
+        {"id": "t1", "status": "saved", "path": "/tmp/报告.xlsx"}
+    )
+
+    assert script.startswith("window.__staffdeckDownloadResult && window.__staffdeckDownloadResult(")
+    assert "\\u62a5\\u544a" in script
+    assert _reply_payloads(type("W", (), {"scripts": [script]})())[0]["status"] == "saved"
+
+
+def _fake_save_panel_appkit(response, path="/tmp/out.bin"):
+    events: dict[str, object] = {}
+
+    class FakePanel:
+        def setTitle_(self, title):
+            events["title"] = title
+
+        def setNameFieldStringValue_(self, name):
+            events["name"] = name
+
+        def setCanCreateDirectories_(self, value):
+            events["can_create_directories"] = value
+
+        def runModal(self):
+            return response
+
+        def URL(self):
+            return None if path is None else type("URL", (), {"path": lambda self: path})()
+
+    class FakeSavePanel:
+        @staticmethod
+        def savePanel():
+            return FakePanel()
+
+    class FakeAppKit:
+        NSModalResponseOK = 1
+        NSSavePanel = FakeSavePanel
+
+    return FakeAppKit, events
+
+
+def test_save_panel_returns_chosen_path() -> None:
+    appkit, events = _fake_save_panel_appkit(1, "/tmp/chosen/报告.xlsx")
+
+    assert desktop_launcher._macos_choose_download_path(appkit, "报告.xlsx") == "/tmp/chosen/报告.xlsx"
+    assert events["name"] == "报告.xlsx"
+    assert events["can_create_directories"] is True
+    assert "StaffDeck" in str(events["title"])
+
+
+def test_save_panel_cancel_and_missing_url_return_none() -> None:
+    cancelled, _ = _fake_save_panel_appkit(0)
+    empty_url, _ = _fake_save_panel_appkit(1, None)
+
+    assert desktop_launcher._macos_choose_download_path(cancelled, "x.bin") is None
+    assert desktop_launcher._macos_choose_download_path(empty_url, "x.bin") is None
+
+
+def test_download_handler_writes_file_and_reports_saved(download_handler, monkeypatch, tmp_path) -> None:
+    target = tmp_path / "报告.xlsx"
+    monkeypatch.setattr(
+        desktop_launcher, "_macos_choose_download_path", lambda _appkit, _name: str(target)
+    )
+    webview = _FakeDownloadWebView()
+
+    _drive_download(
+        download_handler,
+        webview,
+        chunks=[base64.b64encode(b"hello ").decode(), base64.b64encode(b"world").decode()],
+    )
+
+    assert target.read_bytes() == b"hello world"
+    assert _reply_payloads(webview) == [
+        {"id": "t1", "status": "saved", "path": str(target)},
+    ]
+
+
+def test_download_handler_reports_cancelled_without_writing(download_handler, monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(desktop_launcher, "_macos_choose_download_path", lambda _appkit, _name: None)
+    webview = _FakeDownloadWebView()
+
+    _drive_download(download_handler, webview, chunks=[base64.b64encode(b"data").decode()])
+
+    assert list(tmp_path.iterdir()) == []
+    assert _reply_payloads(webview) == [{"id": "t1", "status": "cancelled"}]
+
+
+def test_download_handler_reports_write_failure(download_handler, monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        desktop_launcher,
+        "_macos_choose_download_path",
+        lambda _appkit, _name: str(tmp_path / "missing" / "out.bin"),
+    )
+    webview = _FakeDownloadWebView()
+
+    _drive_download(download_handler, webview, chunks=[base64.b64encode(b"data").decode()])
+
+    [reply] = _reply_payloads(webview)
+    assert reply["status"] == "error"
+    assert "写入文件失败" in reply["message"]
+
+
+def test_download_handler_answers_unknown_transfer_and_bad_payload(download_handler) -> None:
+    webview = _FakeDownloadWebView()
+
+    download_handler.userContentController_didReceiveScriptMessage_(
+        None, _FakeDownloadMessage({"phase": "end", "id": "ghost"}, webview)
+    )
+    download_handler.userContentController_didReceiveScriptMessage_(
+        None, _FakeDownloadMessage(None, webview, body_override="not-a-dictionary")
+    )
+    download_handler.userContentController_didReceiveScriptMessage_(
+        None, _FakeDownloadMessage({"phase": "begin", "name": "no-id.bin"}, webview)
+    )
+
+    [reply] = _reply_payloads(webview)
+    assert reply["id"] == "ghost"
+    assert reply["status"] == "error"
+
+
+def test_download_handler_ignores_unknown_phase(download_handler) -> None:
+    webview = _FakeDownloadWebView()
+
+    download_handler.userContentController_didReceiveScriptMessage_(
+        None, _FakeDownloadMessage({"phase": "junk", "id": "t1"}, webview)
+    )
+
+    assert webview.scripts == []
+
+
+def test_download_handler_class_requires_nsobject(monkeypatch) -> None:
+    class NoNSObjectAppKit:
+        pass
+
+    monkeypatch.setattr(desktop_launcher, "_MACOS_DOWNLOAD_HANDLER_CLASS", None)
+
+    assert desktop_launcher._macos_download_message_handler_class(NoNSObjectAppKit) is None
+
+
+def test_webview_configuration_registers_download_bridge() -> None:
+    events: dict[str, object] = {}
+
+    class FakeController:
+        @classmethod
+        def alloc(cls):
+            return cls()
+
+        def init(self):
+            return self
+
+        def addScriptMessageHandler_name_(self, handler, name):
+            events["handler"] = handler
+            events["handler_name"] = name
+
+    class FakeConfiguration:
+        @classmethod
+        def alloc(cls):
+            return cls()
+
+        def init(self):
+            return self
+
+        def setUserContentController_(self, controller):
+            events["controller"] = controller
+
+    class FakeWebKit:
+        WKUserContentController = FakeController
+        WKWebViewConfiguration = FakeConfiguration
+
+    handler = object()
+    configuration = desktop_launcher._create_macos_webview_configuration(FakeWebKit, handler)
+
+    assert isinstance(configuration, FakeConfiguration)
+    assert events["handler"] is handler
+    assert events["handler_name"] == desktop_launcher.MACOS_DOWNLOAD_HANDLER_NAME
+    assert isinstance(events["controller"], FakeController)
+
+
+def test_webview_configuration_is_skipped_without_handler_or_classes() -> None:
+    class FakeWebKit:
+        pass
+
+    assert desktop_launcher._create_macos_webview_configuration(FakeWebKit, object()) is None
+    assert desktop_launcher._create_macos_webview_configuration(_FakeDownloadHandlerAppKit, None) is None
+
+
+def _webview_fakes(*, with_configuration: bool):
+    events: dict[str, object] = {}
+
+    class FakeContentView:
+        def bounds(self):
+            return (0, 0, 1280, 800)
+
+    class FakeWindow:
+        def contentView(self):
+            return FakeContentView()
+
+    class FakeWebView:
+        @classmethod
+        def alloc(cls):
+            return cls()
+
+        def initWithFrame_configuration_(self, frame, configuration):
+            events["configured"] = (frame, configuration)
+            return self
+
+        def initWithFrame_(self, frame):
+            events["plain"] = frame
+            return self
+
+    class FakeController:
+        @classmethod
+        def alloc(cls):
+            return cls()
+
+        def init(self):
+            return self
+
+        def addScriptMessageHandler_name_(self, handler, name):
+            events["registered"] = (handler, name)
+
+    class FakeConfiguration:
+        @classmethod
+        def alloc(cls):
+            return cls()
+
+        def init(self):
+            return self
+
+        def setUserContentController_(self, controller):
+            events["controller"] = controller
+
+    class FakeWebKit:
+        WKWebView = FakeWebView
+
+    if with_configuration:
+        FakeWebKit.WKUserContentController = FakeController
+        FakeWebKit.WKWebViewConfiguration = FakeConfiguration
+
+    return FakeWindow(), FakeWebKit, events
+
+
+def test_macos_webview_uses_download_bridge_configuration() -> None:
+    window, webkit, events = _webview_fakes(with_configuration=True)
+
+    webview = desktop_launcher._create_macos_webview(
+        _FakeDownloadHandlerAppKit, webkit, window
+    )
+
+    frame, configuration = events["configured"]
+    assert frame == (0, 0, 1280, 800)
+    assert configuration is events["controller"] or configuration is not None
+    assert events["registered"][1] == desktop_launcher.MACOS_DOWNLOAD_HANDLER_NAME
+    assert "plain" not in events
+    _ = webview
+
+
+def test_macos_webview_falls_back_without_download_bridge() -> None:
+    window, webkit, events = _webview_fakes(with_configuration=False)
+
+    desktop_launcher._create_macos_webview(_FakeDownloadHandlerAppKit, webkit, window)
+
+    assert events["plain"] == (0, 0, 1280, 800)
+    assert "configured" not in events
+
 
 
 def test_macos_main_menu_routes_edit_shortcuts_through_responder_chain() -> None:
@@ -580,3 +1044,221 @@ def test_frozen_server_disables_api_access_logging(monkeypatch) -> None:
 
     assert calls[0][1]["access_log"] is False
     assert calls[0][1]["log_config"] is None
+
+
+class _FakeObjCObject:
+    """Minimal NSObject stand-in so delegate classes can be built without PyObjC."""
+
+    @classmethod
+    def alloc(cls):
+        return cls()
+
+    def init(self):
+        return self
+
+
+def _fake_dialog_appkit(events: dict) -> type:
+    """Fake AppKit surface used by the JS dialog panels (alert/confirm/prompt)."""
+
+    class FakeAlertWindow:
+        def __init__(self, alert):
+            self._alert = alert
+
+        def setInitialFirstResponder_(self, view):
+            self._alert.first_responder = view
+
+    class FakeAlert:
+        @classmethod
+        def alloc(cls):
+            return cls()
+
+        def init(self):
+            self.buttons: list[str] = []
+            self.accessory = None
+            self.first_responder = None
+            self.message = None
+            self.informative = None
+            events.setdefault("alerts", []).append(self)
+            return self
+
+        def setMessageText_(self, text):
+            self.message = text
+
+        def setInformativeText_(self, text):
+            self.informative = text
+
+        def addButtonWithTitle_(self, title):
+            self.buttons.append(title)
+
+        def setAccessoryView_(self, view):
+            self.accessory = view
+
+        def window(self):
+            return FakeAlertWindow(self)
+
+        def runModal(self):
+            return events["modal_result"]
+
+    class FakeTextField:
+        @classmethod
+        def alloc(cls):
+            return cls()
+
+        def initWithFrame_(self, frame):
+            self.frame = frame
+            self._value = ""
+            return self
+
+        def setStringValue_(self, value):
+            self._value = value
+
+        def stringValue(self):
+            return self._value
+
+    class FakeAppKit:
+        NSObject = _FakeObjCObject
+        NSAlert = FakeAlert
+        NSTextField = FakeTextField
+        NSAlertFirstButtonReturn = 1000
+        NSAlertSecondButtonReturn = 1001
+
+        @staticmethod
+        def NSMakeRect(x, y, width, height):
+            return (x, y, width, height)
+
+    return FakeAppKit
+
+
+def _build_macos_ui_delegate(monkeypatch, events: dict):
+    appkit = _fake_dialog_appkit(events)
+    monkeypatch.setattr(desktop_launcher, "_MACOS_UI_DELEGATE_CLASS", None)
+    delegate_class = desktop_launcher._macos_ui_delegate_class(appkit)
+    return appkit, delegate_class.alloc().init()
+
+
+def test_macos_js_confirm_panel_reports_confirm_click(monkeypatch) -> None:
+    events = {"modal_result": 1000}
+    _appkit, delegate = _build_macos_ui_delegate(monkeypatch, events)
+
+    answers: list[object] = []
+    delegate.webView_runJavaScriptConfirmPanelWithMessage_initiatedByFrame_completionHandler_(
+        None,
+        "确认归档该黑板条目？归档后不再展示。",
+        None,
+        answers.append,
+    )
+
+    assert answers == [True]
+    assert events["alerts"][0].buttons == ["确定", "取消"]
+    assert events["alerts"][0].message == "StaffDeck"
+    assert events["alerts"][0].informative == "确认归档该黑板条目？归档后不再展示。"
+
+
+def test_macos_js_confirm_panel_reports_cancel_click(monkeypatch) -> None:
+    events = {"modal_result": 1001}
+    _appkit, delegate = _build_macos_ui_delegate(monkeypatch, events)
+
+    answers: list[object] = []
+    delegate.webView_runJavaScriptConfirmPanelWithMessage_initiatedByFrame_completionHandler_(
+        None,
+        "确认？",
+        None,
+        answers.append,
+    )
+
+    assert answers == [False]
+
+
+def test_macos_js_alert_panel_completes_without_arguments(monkeypatch) -> None:
+    events = {"modal_result": 1000}
+    _appkit, delegate = _build_macos_ui_delegate(monkeypatch, events)
+
+    calls: list[tuple] = []
+    delegate.webView_runJavaScriptAlertPanelWithMessage_initiatedByFrame_completionHandler_(
+        None,
+        "注意：服务即将重启",
+        None,
+        lambda *args: calls.append(args),
+    )
+
+    assert calls == [()]
+    assert events["alerts"][0].buttons == ["好"]
+
+
+def test_macos_js_prompt_panel_returns_text_and_cancellation(monkeypatch) -> None:
+    events = {"modal_result": 1000}
+    _appkit, delegate = _build_macos_ui_delegate(monkeypatch, events)
+
+    answers: list[object] = []
+    delegate.webView_runJavaScriptTextInputPanelWithPrompt_defaultText_initiatedByFrame_completionHandler_(
+        None,
+        "请输入名称",
+        "默认值",
+        None,
+        answers.append,
+    )
+
+    alert = events["alerts"][0]
+    assert answers == ["默认值"]
+    assert alert.accessory.stringValue() == "默认值"
+    assert alert.first_responder is alert.accessory
+
+    events["modal_result"] = 1001
+    answers.clear()
+    delegate.webView_runJavaScriptTextInputPanelWithPrompt_defaultText_initiatedByFrame_completionHandler_(
+        None,
+        "请输入名称",
+        "",
+        None,
+        answers.append,
+    )
+    assert answers == [None]
+
+
+def test_macos_js_panel_falls_back_to_app_name_for_empty_message(monkeypatch) -> None:
+    events = {"modal_result": 1000}
+    _appkit, delegate = _build_macos_ui_delegate(monkeypatch, events)
+
+    delegate.webView_runJavaScriptConfirmPanelWithMessage_initiatedByFrame_completionHandler_(
+        None,
+        "",
+        None,
+        None,
+    )
+
+    assert events["alerts"][0].informative == "StaffDeck"
+
+
+def test_macos_js_panels_tolerate_missing_completion_handler(monkeypatch) -> None:
+    events = {"modal_result": 1000}
+    _appkit, delegate = _build_macos_ui_delegate(monkeypatch, events)
+
+    delegate.webView_runJavaScriptConfirmPanelWithMessage_initiatedByFrame_completionHandler_(
+        None, "确认？", None, None
+    )
+    delegate.webView_runJavaScriptTextInputPanelWithPrompt_defaultText_initiatedByFrame_completionHandler_(
+        None, "名称", None, None, None
+    )
+
+    assert len(events["alerts"]) == 2
+
+
+def test_macos_ui_delegate_registers_webkit_panel_selectors() -> None:
+    """PyObjC 只把能解析成 selector 的方法名注册给 ObjC，名字写错等于没修。"""
+    pytest.importorskip("AppKit")
+    pytest.importorskip("WebKit")
+    import AppKit
+
+    delegate_class = desktop_launcher._macos_ui_delegate_class(AppKit)
+    delegate = delegate_class.alloc().init()
+
+    for selector in (
+        b"webView:runJavaScriptAlertPanelWithMessage:initiatedByFrame:completionHandler:",
+        b"webView:runJavaScriptConfirmPanelWithMessage:initiatedByFrame:completionHandler:",
+        (
+            b"webView:runJavaScriptTextInputPanelWithPrompt:defaultText:initiatedByFrame:"
+            b"completionHandler:"
+        ),
+    ):
+        assert delegate.respondsToSelector_(selector)
+
