@@ -3,10 +3,10 @@ import pytest
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
-from app.agents.branching import ensure_open_gallery_binding
+from app.agents.branching import ensure_open_gallery_binding, reference_resource
 from app.core.capability_manifest import CapabilityManifestBuilder
 from app.core.harness_capability_invoker import HarnessCapabilityInvoker
-from app.db.models import AgentProfile, ChatSession, ModelConfig, Skill, Tenant, Tool
+from app.db.models import GALLERY_SCOPE, AgentProfile, ChatSession, ModelConfig, Skill, Tenant, Tool
 from app.skills.nesting import expand_sop_for_execution
 from app.skills.tool_authorization import current_sop_tool_authorization
 from app.tools.tool_executor import ToolExecutor
@@ -20,8 +20,8 @@ def setup_nested(monkeypatch, tmp_path):
     SQLModel.metadata.create_all(engine)
     with Session(engine) as db:
         db.add(Tenant(id="tenant", name="Tenant"))
-        db.add(AgentProfile(id="agent", tenant_id="tenant", name="Gallery", is_overall=True))
-        tool = Tool(
+        db.add(AgentProfile(owner_user_id="user_admin", id="agent", tenant_id="tenant", name="Gallery"))
+        tool = Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
             id="lookup",
             tenant_id="tenant",
             name="child.lookup",
@@ -33,8 +33,10 @@ def setup_nested(monkeypatch, tmp_path):
         db.add(tool)
         db.flush()
         ensure_open_gallery_binding(db, "tenant", "tool", tool.id)
+        # 广场工具要先被这个员工引用，才进入它的可见集（引用而非复制）。
+        reference_resource(db, "tenant", "agent", "tool", tool.id)
         db.commit()
-        child = Skill(
+        child = Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
             tenant_id="tenant",
             skill_id="child",
             name="Child",
@@ -52,7 +54,7 @@ def setup_nested(monkeypatch, tmp_path):
                 "edges": [],
             },
         )
-        parent = Skill(
+        parent = Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
             tenant_id="tenant",
             skill_id="parent",
             name="Parent",
@@ -193,7 +195,7 @@ def test_live_revocation_is_checked_before_nested_dispatch(setup_nested):
 @pytest.mark.parametrize("grant", ["parent", "child", "leaf"])
 def test_deep_nested_grants_reach_executor(setup_nested, monkeypatch, grant):
     db, tool, _ = setup_nested
-    leaf = Skill(
+    leaf = Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
         tenant_id="tenant",
         skill_id="leaf",
         name="Leaf",
@@ -211,7 +213,7 @@ def test_deep_nested_grants_reach_executor(setup_nested, monkeypatch, grant):
             "edges": [],
         },
     )
-    child = Skill(
+    child = Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
         tenant_id="tenant",
         skill_id="child",
         name="Child",
@@ -225,7 +227,7 @@ def test_deep_nested_grants_reach_executor(setup_nested, monkeypatch, grant):
             "edges": [],
         },
     )
-    parent = Skill(
+    parent = Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
         tenant_id="tenant",
         skill_id="parent",
         name="Parent",

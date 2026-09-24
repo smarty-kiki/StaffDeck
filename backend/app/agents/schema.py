@@ -11,13 +11,16 @@ AgentWorkRecordEventPhase = Literal["reply", "last_run", "next_run", "assigned"]
 
 
 class AgentProfileCreateRequest(BaseModel):
+    """新建数字员工。
+
+    没有 `copy_from_agent_id` —— 员工之间不复刻资源。新员工需要什么广场资源，
+    用引用端点挂上去（引用而非复制，作者更新则使用者实时可见）。
+    """
+
     tenant_id: str
     name: Optional[str] = None
     description: Optional[str] = None
     persona_prompt: Optional[str] = None
-    is_overall: bool = False
-    source_mode: Literal["copy", "blank"] = "copy"
-    copy_from_agent_id: Optional[str] = None
     harness_max_actions: int = Field(default=32, ge=1, le=100)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -32,14 +35,14 @@ class AgentProfileUpdateRequest(BaseModel):
     metadata: Optional[dict[str, Any]] = None
 
 
-class AgentResourceBindingRead(BaseModel):
+class AgentResourceReferenceRead(BaseModel):
+    """员工对广场资源的一条引用。没有 `status` / `metadata` —— 有行即启用，删行即取消。"""
+
     id: str
     tenant_id: str
     agent_id: str
     resource_type: AgentResourceType
     resource_id: str
-    status: str
-    metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: str
     updated_at: str
 
@@ -49,14 +52,18 @@ class AgentResourceBindingRead(BaseModel):
 class AgentProfileRead(BaseModel):
     id: str
     tenant_id: str
+    owner_user_id: str
+    owner_display_name: str = ""
     name: str
     description: Optional[str] = None
     persona_prompt: Optional[str] = None
-    is_overall: bool
+    is_published: bool = False
+    published_at: Optional[str] = None
+    published_by: Optional[str] = None
     status: str
     harness_max_actions: int = 32
     metadata: dict[str, Any] = Field(default_factory=dict)
-    resources: list[AgentResourceBindingRead] = Field(default_factory=list)
+    resources: list[AgentResourceReferenceRead] = Field(default_factory=list)
     created_at: str
     updated_at: str
 
@@ -90,23 +97,21 @@ class AgentWorkRecordRead(BaseModel):
     events: list[AgentWorkRecordEventRead] = Field(default_factory=list)
 
 
-class AgentResourceBindingInput(BaseModel):
+class AgentResourceReferenceInput(BaseModel):
+    """引用广场资源：只需指出引用哪一条资源。
+
+    没有 `metadata` —— 引用行的存在即状态，创建人由列派生。
+    """
+
     resource_type: AgentResourceType
     resource_id: str
-    status: Literal["active", "inactive"] = "active"
-    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentResourcesUpdateRequest(BaseModel):
-    tenant_id: str
-    resources: list[AgentResourceBindingInput] = Field(default_factory=list)
+    """整体覆盖该员工引用的广场资源集合。删行 = 取消引用。"""
 
-
-class AgentResourceImportRequest(BaseModel):
     tenant_id: str
-    source_agent_id: str
-    resource_type: AgentResourceType
-    resource_ids: list[str] = Field(default_factory=list)
+    resources: list[AgentResourceReferenceInput] = Field(default_factory=list)
 
 
 class AgentModelBindingInput(BaseModel):
@@ -123,11 +128,6 @@ class AgentModelBindingRead(BaseModel):
     role: str
     model_config_id: str
     effective: bool = False
-
-
-class AgentSkillRollbackRequest(BaseModel):
-    tenant_id: str
-    version: str
 
 
 class AgentAPICredentialCreateRequest(BaseModel):

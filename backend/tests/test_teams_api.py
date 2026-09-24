@@ -89,10 +89,10 @@ def _member_user() -> User:
 def _seed_agents(db: Session) -> None:
     db.add(Tenant(id="tenant_demo", name="Demo"))
     db.add(Tenant(id="tenant_other", name="Other"))
-    db.add(AgentProfile(id="agent_tl", tenant_id="tenant_demo", name="TL"))
-    db.add(AgentProfile(id="agent_worker", tenant_id="tenant_demo", name="Worker"))
-    db.add(AgentProfile(id="agent_worker2", tenant_id="tenant_demo", name="Worker2"))
-    db.add(AgentProfile(id="agent_outside", tenant_id="tenant_other", name="Outsider"))
+    db.add(AgentProfile(owner_user_id="user_admin", id="agent_tl", tenant_id="tenant_demo", name="TL"))
+    db.add(AgentProfile(owner_user_id="user_admin", id="agent_worker", tenant_id="tenant_demo", name="Worker"))
+    db.add(AgentProfile(owner_user_id="user_admin", id="agent_worker2", tenant_id="tenant_demo", name="Worker2"))
+    db.add(AgentProfile(owner_user_id="user_admin", id="agent_outside", tenant_id="tenant_other", name="Outsider"))
     db.commit()
 
 

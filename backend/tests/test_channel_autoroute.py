@@ -156,7 +156,7 @@ def _seed_binding(engine, *, auto_route=None, single_mount=False) -> str:
     with Session(engine) as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.add(
-            AgentProfile(
+            AgentProfile(owner_user_id="user_admin",
                 id="agent_xz",
                 tenant_id="tenant_demo",
                 name="行政",
@@ -165,7 +165,7 @@ def _seed_binding(engine, *, auto_route=None, single_mount=False) -> str:
             )
         )
         db.add(
-            AgentProfile(
+            AgentProfile(owner_user_id="user_admin",
                 id="agent_cw",
                 tenant_id="tenant_demo",
                 name="财务",
@@ -643,7 +643,7 @@ def _seed_api_users(engine) -> dict[str, User]:
         owner = User(id="user_owner", tenant_id="tenant_demo", username="owner", password_hash="x")
         db.add(owner)
         db.add(
-            AgentProfile(
+            AgentProfile(owner_user_id=owner.id,
                 id="agent_xz",
                 tenant_id="tenant_demo",
                 name="行政",

@@ -16,12 +16,12 @@ from app.core.capability_manifest import (
     RESERVED_HARNESS_CAPABILITY_NAMES,
     _lark_cli_descriptor,
 )
-from app.db.models import ChannelBinding, ChatSession, HarnessInvocationRecord, Skill
+from app.db.models import GALLERY_SCOPE, ChannelBinding, ChatSession, HarnessInvocationRecord, Skill
 from app.lark_cli import policy, runner, service
 
 
 def _submit_skill() -> Skill:
-    return Skill(
+    return Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
         tenant_id="t1",
         skill_id="sop-lark",
         name="飞书审批提交",
@@ -46,9 +46,7 @@ def _submit_skill() -> Skill:
 
 
 def test_policy_allows_read_and_marks_dry_run() -> None:
-    resolved = policy.resolve(
-        ["approval", "approvals", "search", "--data", '{"keyword":"报销"}']
-    )
+    resolved = policy.resolve(["approval", "approvals", "search", "--data", '{"keyword":"报销"}'])
     assert resolved.rule.action == "read"
     assert not resolved.is_side_effect_write
 
@@ -146,9 +144,7 @@ def test_submission_digest_is_encoding_agnostic() -> None:
 
 
 def test_wire_submission_data_serializes_form_to_string() -> None:
-    wire = policy.wire_submission_data(
-        {"approval_code": "A", "form": [{"id": "w1", "value": "x"}]}
-    )
+    wire = policy.wire_submission_data({"approval_code": "A", "form": [{"id": "w1", "value": "x"}]})
     assert isinstance(wire["form"], str)
     assert json.loads(wire["form"]) == [{"id": "w1", "value": "x"}]
 
@@ -171,9 +167,7 @@ def test_wire_form_dates_normalized_to_rfc3339() -> None:
     ]
     wire = policy.wire_submission_data({"approval_code": "A", "form": form})
     sent = json.loads(wire["form"])[0]["value"]
-    expected = (
-        datetime.fromisoformat("2026-08-27 00:00").astimezone().isoformat(timespec="seconds")
-    )
+    expected = datetime.fromisoformat("2026-08-27 00:00").astimezone().isoformat(timespec="seconds")
     assert sent[1]["value"] == expected
     assert "T" in expected and expected != "2026-08-27 00:00"
     # 非日期控件不动；原始输入不被就地修改。
@@ -254,12 +248,7 @@ def test_logical_signature_only_for_real_submission() -> None:
     submit = ["approval", "instances", "create", "--data", '{"approval_code":"A"}']
     assert policy.logical_write_signature({"args": submit}) is not None
     assert policy.logical_write_signature({"args": [*submit, "--dry-run"]}) is None
-    assert (
-        policy.logical_write_signature(
-            {"args": ["auth", "login", "--device-code", "d"]}
-        )
-        is None
-    )
+    assert policy.logical_write_signature({"args": ["auth", "login", "--device-code", "d"]}) is None
     assert policy.logical_write_signature({"args": ["auth", "status"]}) is None
     # --help 视为只读，不产生防重放签名。
     assert policy.logical_write_signature({"args": [*submit, "--help"]}) is None
@@ -295,7 +284,7 @@ def test_user_home_dir_isolated_per_user(monkeypatch, tmp_path: Path) -> None:
 # service (fake binary end-to-end)
 # ---------------------------------------------------------------------------
 
-_FAKE_BINARY = r'''#!/usr/bin/env python3
+_FAKE_BINARY = r"""#!/usr/bin/env python3
 import json, os, sys
 
 args = sys.argv[1:]
@@ -357,7 +346,7 @@ if any("trigger_error" in item for item in args):
     }))
     sys.exit(0)
 print(json.dumps({"ok": True, "argv": args, "env_ci": os.environ.get("CI", "")}))
-'''
+"""
 
 
 @pytest.fixture()
@@ -377,9 +366,7 @@ def lark_env(monkeypatch, tmp_path: Path, db: Session):
     binary.write_text(_FAKE_BINARY, encoding="utf-8")
     binary.chmod(0o755)
     monkeypatch.setattr(service, "ensure_lark_cli", lambda: binary)
-    monkeypatch.setattr(
-        service, "get_settings", lambda: Settings(lark_cli_enabled=True)
-    )
+    monkeypatch.setattr(service, "get_settings", lambda: Settings(lark_cli_enabled=True))
     chat = ChatSession(id="sess-1", tenant_id="t1", user_id="u1", agent_id="agent-1")
     binding = ChannelBinding(
         tenant_id="t1",
@@ -405,9 +392,7 @@ def lark_env_unbound(monkeypatch, tmp_path: Path, db: Session):
     binary.write_text(_FAKE_BINARY, encoding="utf-8")
     binary.chmod(0o755)
     monkeypatch.setattr(service, "ensure_lark_cli", lambda: binary)
-    monkeypatch.setattr(
-        service, "get_settings", lambda: Settings(lark_cli_enabled=True)
-    )
+    monkeypatch.setattr(service, "get_settings", lambda: Settings(lark_cli_enabled=True))
     chat = ChatSession(id="sess-1", tenant_id="t1", user_id="u1", agent_id="agent-1")
     db.add(chat)
     db.commit()
@@ -429,9 +414,7 @@ def _invoke(env, arguments, *, active_skill=None, active_step_id=None):
 
 
 def test_service_disabled_returns_precondition(monkeypatch, db: Session) -> None:
-    monkeypatch.setattr(
-        service, "get_settings", lambda: Settings(lark_cli_enabled=False)
-    )
+    monkeypatch.setattr(service, "get_settings", lambda: Settings(lark_cli_enabled=False))
     chat = ChatSession(id="sess-0", tenant_id="t1", user_id="u1")
     result = service.invoke_lark_cli(
         db,
@@ -468,8 +451,12 @@ def test_service_conversational_config_works_without_binding(
         lark_env_unbound,
         {
             "args": [
-                "config", "init", "--app-id", "cli_chat_app",
-                "--app-secret", "chat-secret",
+                "config",
+                "init",
+                "--app-id",
+                "cli_chat_app",
+                "--app-secret",
+                "chat-secret",
             ]
         },
     )
@@ -480,9 +467,7 @@ def test_service_conversational_config_works_without_binding(
     status = _invoke(lark_env_unbound, {"args": ["auth", "status"]})
     assert status["success"] is True
     # secret 经 stdin 注入，不得出现在任何返回结果里。
-    assert "chat-secret" not in json.dumps(
-        [configured, status], ensure_ascii=False
-    )
+    assert "chat-secret" not in json.dumps([configured, status], ensure_ascii=False)
 
 
 def test_service_read_command_runs_and_configures_home(lark_env) -> None:
@@ -510,9 +495,7 @@ def test_service_allows_help_and_auth_scopes(lark_env) -> None:
     helped = _invoke(lark_env, {"args": ["auth", "login", "--help"]})
     assert helped["success"] is True
     # --help 时不触发提交闸：即便是 gated_write 前缀也按只读处理。
-    create_help = _invoke(
-        lark_env, {"args": ["approval", "instances", "create", "--help"]}
-    )
+    create_help = _invoke(lark_env, {"args": ["approval", "instances", "create", "--help"]})
     assert create_help["success"] is True
     scopes = _invoke(lark_env, {"args": ["auth", "scopes", "--json"]})
     assert scopes["success"] is True
@@ -830,9 +813,7 @@ def test_service_submit_digest_path_accepts_cross_frame_preview(lark_env) -> Non
 
     data = '{"approval_code":"A","form":"[]"}'
     digest = policy.submission_digest(json.loads(data))
-    _add_preview_record(
-        lark_env, digest=digest, canonical=None, task_id="frame-other"
-    )
+    _add_preview_record(lark_env, digest=digest, canonical=None, task_id="frame-other")
     result = _invoke(
         lark_env,
         {
@@ -848,9 +829,7 @@ def test_service_submit_digest_path_accepts_cross_frame_preview(lark_env) -> Non
 def test_logical_write_signature_covers_no_data_submit() -> None:
     """零参数提交也要有防重放签名（帧内重试命中重放缓存而非重复提交）。"""
 
-    signature = policy.logical_write_signature(
-        {"args": ["approval", "instances", "create"]}
-    )
+    signature = policy.logical_write_signature({"args": ["approval", "instances", "create"]})
     assert signature is not None
     # 与显式 --data 的提交签名不同：空内容摘要 vs 实际内容摘要。
     explicit = policy.logical_write_signature(
@@ -903,9 +882,7 @@ def test_validate_form_catches_real_failure_modes() -> None:
         {
             "id": "widgetLeaveGroupV2",
             "type": "leaveGroupV2",
-            "value": [
-                {"id": "widgetLeaveGroupType", "type": "radioV2", "value": "事假"}
-            ],
+            "value": [{"id": "widgetLeaveGroupType", "type": "radioV2", "value": "事假"}],
         }
     ]
     errors = policy.validate_form_against_definition(text_not_key, _LEAVE_DEFINITION)
@@ -1037,9 +1014,7 @@ def test_service_dynamic_read_allowed_by_cli_risk(lark_env) -> None:
 def test_service_dynamic_write_denied_by_cli_risk(lark_env) -> None:
     """未登记的写命令（审批处置等）即便探测也不放行，需显式登记。"""
 
-    result = _invoke(
-        lark_env, {"args": ["approval", "tasks", "approve", "--data", "{}"]}
-    )
+    result = _invoke(lark_env, {"args": ["approval", "tasks", "approve", "--data", "{}"]})
     assert result["success"] is False
     assert result["error"]["subcode"] == "LARK_CLI_COMMAND_BLOCKED"
     assert "策略表" in result["error"]["message"]
@@ -1070,9 +1045,7 @@ def test_policy_safe_write_allowlist_is_local_state_only() -> None:
 
 
 def test_policy_config_init_rules() -> None:
-    resolved = policy.resolve(
-        ["config", "init", "--app-id", "cli_x", "--app-secret", "s3cret"]
-    )
+    resolved = policy.resolve(["config", "init", "--app-id", "cli_x", "--app-secret", "s3cret"])
     assert resolved.rule.action == "write" and not resolved.is_help
     assert policy.resolve(["config", "init", "--new"]).rule.prefix == ("config", "init")
     # config 域其余子命令与危险 flag 保持封禁；--help 放行。
@@ -1141,9 +1114,7 @@ def test_audit_arguments_redact_secret_flag_values() -> None:
     audited = _audit_arguments(
         {"args": ["config", "init", "--app-id", "cli_x", "--app-secret", "s3cret"]}
     )
-    assert audited["args"] == [
-        "config", "init", "--app-id", "cli_x", "--app-secret", "<redacted>"
-    ]
+    assert audited["args"] == ["config", "init", "--app-id", "cli_x", "--app-secret", "<redacted>"]
     # 普通 argv 不受影响。
     assert _audit_arguments({"args": ["auth", "status"]})["args"] == ["auth", "status"]
 
@@ -1186,21 +1157,17 @@ def test_sample_sop_card_is_valid_and_authorizes_submission() -> None:
     from app.core.task_request_compiler import current_step_capability_refs
     from app.skills.skill_schema import SkillCard
 
-    card_path = (
-        Path(__file__).resolve().parents[2] / "docs" / "lark-cli-approval-sop.json"
-    )
+    card_path = Path(__file__).resolve().parents[2] / "docs" / "lark-cli-approval-sop.json"
     card = SkillCard.model_validate(json.loads(card_path.read_text(encoding="utf-8")))
     # 鉴权必须先于任何飞书调用：收集节点本身要检索审批定义（需登录态），
     # 起点若排在它之后，未登录用户必然先撞一次 TOKEN_MISSING（真实案例）。
     assert card.start_node_id == "n_auth_check"
-    edges = {
-        (edge.source_node_id, edge.next_node_id) for edge in card.edges
-    }
+    edges = {(edge.source_node_id, edge.next_node_id) for edge in card.edges}
     assert ("n_auth_check", "n_collect") in edges
     assert ("n_auth_complete", "n_collect") in edges
     assert ("n_collect", "n_preview") in edges
 
-    skill = Skill(
+    skill = Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
         tenant_id="t1",
         skill_id=card.skill_id,
         name=card.name,
@@ -1212,9 +1179,7 @@ def test_sample_sop_card_is_valid_and_authorizes_submission() -> None:
     # 预览节点不得持有提交授权：用户确认前模型在该节点无法真实提交。
     assert service._step_authorizes_submission(skill, "n_preview") is False
     # 确认节点（n_preview）声明了必须等待的用户信息 → awaiting_user 流程闸成立。
-    preview_node = next(
-        node for node in card.nodes if node.node_id == "n_preview"
-    )
+    preview_node = next(node for node in card.nodes if node.node_id == "n_preview")
     assert preview_node.expected_user_info
 
 
@@ -1222,9 +1187,7 @@ def test_gallery_seed_fixture_matches_docs_card() -> None:
     """扩展种子里的审批 SOP 必须与 docs 样例卡逐字节一致，防止双份漂移。"""
 
     root = Path(__file__).resolve().parents[2]
-    card = json.loads(
-        (root / "docs" / "lark-cli-approval-sop.json").read_text(encoding="utf-8")
-    )
+    card = json.loads((root / "docs" / "lark-cli-approval-sop.json").read_text(encoding="utf-8"))
     fixture = json.loads(
         (
             root
@@ -1235,41 +1198,33 @@ def test_gallery_seed_fixture_matches_docs_card() -> None:
             / "staffdeck_expanded_gallery_seed.json"
         ).read_text(encoding="utf-8")
     )
-    skill_rows = [
-        row
-        for row in fixture["skills"]
-        if row.get("skill_id") == card["skill_id"]
-    ]
+    skill_rows = [row for row in fixture["skills"] if row.get("skill_id") == card["skill_id"]]
     assert len(skill_rows) == 1
     assert skill_rows[0]["content_json"] == card
     assert skill_rows[0]["status"] == "published"
     version_rows = [
-        row
-        for row in fixture["skill_versions"]
-        if row.get("skill_id") == card["skill_id"]
+        row for row in fixture["skill_versions"] if row.get("skill_id") == card["skill_id"]
     ]
     assert len(version_rows) == 1 and version_rows[0]["content_json"] == card
     bindings = [
         row
-        for row in fixture["agent_resource_bindings"]
+        for row in fixture["agent_resource_references"]
         if row.get("resource_id") == skill_rows[0]["id"]
     ]
     assert len(bindings) == 1
     assert bindings[0]["resource_type"] == "skill"
-    assert bindings[0]["status"] == "active"
+    # 引用行不再带 status —— 「存在即生效」，取消引用直接删行。
+    assert "status" not in bindings[0]
+    assert "metadata_json" not in bindings[0]
 
 
 def test_manifest_descriptor_gating(monkeypatch, db: Session) -> None:
     import app.core.capability_manifest as manifest_module
 
-    monkeypatch.setattr(
-        "app.config.get_settings", lambda: Settings(lark_cli_enabled=False)
-    )
+    monkeypatch.setattr("app.config.get_settings", lambda: Settings(lark_cli_enabled=False))
     assert manifest_module._lark_cli_descriptor(db, "t1", None) is None
 
-    monkeypatch.setattr(
-        "app.config.get_settings", lambda: Settings(lark_cli_enabled=True)
-    )
+    monkeypatch.setattr("app.config.get_settings", lambda: Settings(lark_cli_enabled=True))
     # 凭据可在对话内建立（config init），因此开启即视为可用，无需预检凭据。
     descriptor = _lark_cli_descriptor(db, "t1", None)
     assert descriptor is not None and descriptor.available is True

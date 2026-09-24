@@ -12,7 +12,6 @@ import {
   clearEnterpriseAuthSession,
   getEnterpriseAuthSession,
   isEnterpriseAdmin,
-  isGalleryEmployee,
   setEnterpriseAuthSession,
   type EnterpriseAuthSession,
   type EnterpriseAuthUser,
@@ -29,11 +28,9 @@ import { SidebarProvider } from "@/components/ui/sidebar";
 import { EnterpriseRoute } from "./enums/routes";
 import {
   employeeBlankMetadata,
-  canAccessEmployeeAgent,
   canManageEmployeeAgent,
   canSelectCurrentEmployeeAgent,
   employeeDisplayName,
-  employeeDisplayNameWithCreator,
   employeeProfile,
   preferredEmployeeAgent,
 } from "./employee";
@@ -76,11 +73,6 @@ import {
   DialogContent,
   DialogTitle,
   Input,
-  Select as UISelect,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
   Textarea,
 } from "@/components/ui";
 import { Button as UIButton } from "@/components/ui/button";
@@ -97,7 +89,6 @@ import {
 } from "@/lib/agent-scope-storage";
 import { cn } from "@/lib/utils";
 import {
-  SELECT_TRIGGER_CLASS,
   DIALOG_CANCEL_BUTTON_CLASS,
   DIALOG_FOOTER_CLASS,
   DIALOG_PRIMARY_BUTTON_CLASS,
@@ -107,22 +98,18 @@ import { useI18n } from "./i18n";
 
 const ENTERPRISE_SIDEBAR_STORAGE_KEY = "ultrarag_enterprise_sidebar_expanded";
 const MODEL_CONFIGS_UPDATED_EVENT = "ultrarag-enterprise-model-configs-updated";
-type AgentCreateMode = "copy" | "blank";
-
 type AgentCreateFormState = {
   name: string;
   description: string;
   roleName: string;
-  sourceMode: AgentCreateMode;
-  copyFromAgentId: string;
 };
 
+// 归属化模型下，数字员工只能被「引用」不能被复制：新建一律从空白开始，
+// 想要广场上的某个员工直接用（或引用）即可，不再有「从广场复制」这条链路。
 const EMPTY_AGENT_FORM: AgentCreateFormState = {
   name: "",
   description: "",
   roleName: "",
-  sourceMode: "copy",
-  copyFromAgentId: "",
 };
 
 function Shell({
@@ -388,31 +375,21 @@ function Shell({
     "/enterprise/skills",
     "/enterprise/tools",
   ];
-  const hasEmployees = scopeAgents.some((item) => !item.is_overall);
+  // 广场不是一条「员工」记录，scopeAgents 里每一行都是一个真实数字员工。
+  const hasEmployees = scopeAgents.length > 0;
   const isEmployeeScopedRoute = EMPLOYEE_SCOPED_PREFIXES.some((prefix) =>
     location.pathname.startsWith(prefix),
   );
   const showEmployeeEmptyState =
     agentsLoaded && !hasEmployees && isEmployeeScopedRoute;
-  const sourceAgents = agents.filter((item) =>
-    canAccessEmployeeAgent(item, auth.user, {
-      activeOnly: true,
-      includeOverall: isAdmin,
-    }),
-  );
   const selectedAgentName = selectedAgent
     ? employeeDisplayName(selectedAgent)
     : "未选择";
   const selectedAgentCaption = selectedAgent
-    ? selectedAgent.is_overall
-      ? "开放广场"
-      : employeeProfile(selectedAgent).roleName
+    ? employeeProfile(selectedAgent).roleName
     : "-";
   function openCreateAgentModal() {
-    setAgentForm({
-      ...EMPTY_AGENT_FORM,
-      copyFromAgentId: (isTeamScope(selectedAgentId) ? "" : selectedAgentId) || sourceAgents[0]?.id || "",
-    });
+    setAgentForm({ ...EMPTY_AGENT_FORM });
     setAgentCreateOpen(true);
   }
 
@@ -422,29 +399,9 @@ function Shell({
       notify.error("请填写数字员工姓名");
       return;
     }
-    const isBlankOnboarding = agentForm.sourceMode === "blank";
-    const sourceAgent = agentForm.copyFromAgentId
-      ? sourceAgents.find((item) => item.id === agentForm.copyFromAgentId)
-      : undefined;
-    const sourceMetadata =
-      !isBlankOnboarding && sourceAgent?.metadata ? sourceAgent.metadata : {};
-    const sourceRoleName =
-      sourceAgent && !sourceAgent.is_overall
-        ? employeeProfile(sourceAgent).roleName
-        : "";
-    const roleName =
-      agentForm.roleName.trim() ||
-      (!isBlankOnboarding ? sourceRoleName : "") ||
-      "待补充职位";
-    const description =
-      agentForm.description.trim() ||
-      (!isBlankOnboarding
-        ? sourceAgent?.description ||
-          String(sourceMetadata.system_prompt_summary || "")
-        : "") ||
-      "";
+    const roleName = agentForm.roleName.trim() || "待补充职位";
+    const description = agentForm.description.trim();
     const baseMetadata = {
-      ...sourceMetadata,
       system_prompt_summary: description,
       owner_user_id: auth.user.id,
       owner_username: auth.user.username,
@@ -457,7 +414,6 @@ function Shell({
       role_key: "",
       role_name: roleName,
       onboarded_at: new Date().toISOString().slice(0, 10),
-      blank_onboarding: isBlankOnboarding,
     };
     try {
       const created = await api.post<AgentProfileRead>(
@@ -466,14 +422,7 @@ function Shell({
           tenant_id: TENANT_ID,
           name,
           description,
-          source_mode: agentForm.sourceMode,
-          copy_from_agent_id:
-            agentForm.sourceMode === "copy"
-              ? agentForm.copyFromAgentId || undefined
-              : undefined,
-          metadata: isBlankOnboarding
-            ? employeeBlankMetadata(baseMetadata)
-            : baseMetadata,
+          metadata: employeeBlankMetadata(baseMetadata),
         },
       );
       await loadAgents();
@@ -833,36 +782,9 @@ function Shell({
             新建数字员工
           </DialogTitle>
           <div className="agent-editor-form min-h-0 flex-1 overflow-y-auto px-[24px] pb-[16px]">
-            <label>
-              创建方式
-              <div className="inline-flex w-fit gap-[4px] rounded-[10px] border border-border p-[2px]">
-                {[
-                  { label: "从广场复制", value: "copy" as const },
-                  { label: "从空白开始", value: "blank" as const },
-                ].map((option) => (
-                  <button
-                    key={option.value}
-                    type="button"
-                    className={cn(
-                      "rounded-[8px] px-[14px] py-[5px] text-[13px] font-medium transition-colors",
-                      agentForm.sourceMode === option.value
-                        ? "bg-[#18181a] text-white"
-                        : "text-[#5b6273] hover:text-foreground",
-                    )}
-                    onClick={() =>
-                      setAgentForm((prev) => ({
-                        ...prev,
-                        sourceMode: option.value,
-                        copyFromAgentId:
-                          option.value === "blank" ? "" : prev.copyFromAgentId,
-                      }))
-                    }
-                  >
-                    {option.label}
-                  </button>
-                ))}
-              </div>
-            </label>
+            <div className="agent-definition-note">
+              新建的数字员工从空白开始，不继承任何已有配置。要使用员工广场上的数字员工，直接在员工广场里选它即可。
+            </div>
             <label>
               职位
               <Input
@@ -876,50 +798,6 @@ function Shell({
                 placeholder="例如 研发工程师、财务助理"
               />
             </label>
-            <div className="grid content-start gap-[6px]">
-            {agentForm.sourceMode === "copy" && (
-              <label>
-                复制来源
-                <UISelect
-                  value={agentForm.copyFromAgentId || undefined}
-                  onValueChange={(value) =>
-                    setAgentForm((prev) => {
-                      const nextSource = sourceAgents.find(
-                        (item) => item.id === value,
-                      );
-                      return {
-                        ...prev,
-                        copyFromAgentId: value,
-                        roleName:
-                          prev.roleName ||
-                          (nextSource && !nextSource.is_overall
-                            ? employeeProfile(nextSource).roleName
-                            : ""),
-                      };
-                    })
-                  }
-                >
-                  <SelectTrigger className={cn(SELECT_TRIGGER_CLASS, "w-full")}>
-                    <SelectValue placeholder="选择复制来源" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {sourceAgents.map((agent) => (
-                      <SelectItem key={agent.id} value={agent.id}>
-                        {agent.is_overall
-                          ? "开放广场"
-                          : `${employeeDisplayNameWithCreator(agent)} · ${employeeProfile(agent).roleName}${isGalleryEmployee(agent) ? " · 广场" : ""}`}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </UISelect>
-              </label>
-            )}
-            {agentForm.sourceMode === "blank" && (
-              <div className="agent-definition-note">
-                从空白开始创建，不继承任何已有配置。
-              </div>
-            )}
-            </div>
             <label>
               数字员工姓名
               <Input

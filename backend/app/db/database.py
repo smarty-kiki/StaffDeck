@@ -9,7 +9,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.config import get_settings
 from app.db.database_path import normalize_database_url
-from app.db.models import new_id, utc_now
+from app.db.models import AGENT_SCOPE, GALLERY_SCOPE, new_id, utc_now
 
 
 def _normalize_database_url(url: str) -> str:
@@ -50,6 +50,31 @@ _CHANNEL_SCOPE_REBUILD_MIGRATION_ID = "20260719_channel_scope_rebuild"
 _CHANNEL_BINDINGS_MULTI_MIGRATION_ID = "20260721_channel_bindings_multi"
 _CHANNEL_ACCOUNT_KEY_MIGRATION_ID = "20260723_channel_account_key_v1"
 _FEISHU_CHANNEL_SCHEMA_MIGRATION_ID = "20260724_feishu_channel_schema_v1"
+_RESOURCE_OWNERSHIP_MIGRATION_ID = "20260924_resource_ownership_v1"
+_DROP_OVERALL_AGENT_MIGRATION_ID = "20260924_drop_overall_agent_v1"
+# 迁移是**历史快照**：这里写死的 DDL 是「改造完成时」的库结构，
+# 不跟随 models.py 继续漂移；索引集则从模型元数据派生（索引是约束的机械派生物）。
+_RESOURCE_OWNERSHIP_SCOPED_TABLES: tuple[tuple[str, str, str, str | None], ...] = (
+    # (resource_type, table, 业务键列, metadata 列) —— skills/tools 没有 metadata 列，
+    # 它们的归属只能从分支表与绑定表推断。
+    ("skill", "skills", "skill_id", None),
+    ("general_skill", "general_skills", "slug", "metadata_json"),
+    ("knowledge_base", "knowledge_bases", "name", "metadata_json"),
+    ("tool", "tools", "name", None),
+)
+_RESOURCE_OWNERSHIP_LEGACY_BRANCH_TABLES = (
+    "agent_skill_branches",
+    "agent_skill_branch_versions",
+    "agent_knowledge_branches",
+)
+# 改造前归属藏在 metadata_json 里（branching.py 的 open_gallery_metadata /
+# _agent_private_metadata_for 写入）。迁移后这些键失效，必须清掉，否则两处真相。
+_RESOURCE_OWNERSHIP_STATE_METADATA_KEYS = (
+    "scope",
+    "visibility",
+    "owner_agent_id",
+)
+_RESOURCE_OWNERSHIP_AGENT_STATE_METADATA_KEYS = ("published_to_gallery",)
 _CAPABILITY_SCOPE_TABLES = (
     "general_skills",
     "tools",
@@ -591,6 +616,11 @@ def _migrate_sqlite_skill_schema() -> None:
                 conn.execute(text("UPDATE general_skills SET metadata_json = '{}' WHERE metadata_json IS NULL"))
 
         _migrate_knowledge_base_schema(conn, inspector, tables)
+        # 归属化迁移必须排在所有「加列型」迁移之后：表重建要把最终列全集一次性搬过去。
+        _migrate_resource_ownership(conn, inspector, tables)
+        # 紧跟在归属化之后：它要读归属化刚用过的 `is_overall` 列，读完就把列删掉。
+        _migrate_drop_overall_agent(conn, tables)
+        _purge_legacy_agent_model_bindings(conn, tables)
         _seed_default_agents(conn, tables)
 
         if legacy_table in tables and "skills" in tables:
@@ -631,16 +661,21 @@ def _migrate_sqlite_skill_schema() -> None:
                         },
                     )
                     continue
+                extra_columns, extra_values = _gallery_scope_insert_columns(conn, "skills")
                 conn.execute(
                     text(
                         """
                         INSERT INTO skills (
                             id, tenant_id, skill_id, version, name, business_domain,
-                            description, content_json, status, created_at, updated_at
+                            description, content_json, status, created_at, updated_at"""
+                        + extra_columns
+                        + """
                         )
                         VALUES (
                             :id, :tenant_id, :skill_id, :version, :name, :business_domain,
-                            :description, :content_json, :status, :created_at, :updated_at
+                            :description, :content_json, :status, :created_at, :updated_at"""
+                        + extra_values
+                        + """
                         )
                         """
                     ),
@@ -663,8 +698,6 @@ def _migrate_sqlite_skill_schema() -> None:
             if "skill_versions" in tables:
                 _normalize_existing_skill_version_rows(conn, legacy_id_prefix)
                 _seed_skill_versions(conn)
-            _normalize_agent_branch_rows(conn, tables)
-            _seed_agent_branch_state(conn, inspector, tables)
             _sync_explicit_skill_tool_bindings(conn, tables)
 
 
@@ -2233,16 +2266,23 @@ def _migrate_knowledge_base_schema(conn, inspector, tables: set[str]) -> None:
                 {"id": default_id},
             ).first()
             if not existing:
+                extra_columns, extra_values = _gallery_scope_insert_columns(
+                    conn, "knowledge_bases"
+                )
                 conn.execute(
                     text(
                         """
                         INSERT INTO knowledge_bases (
                             id, tenant_id, name, description, status, capability_scope,
-                            metadata_json, created_at, updated_at
+                            metadata_json, created_at, updated_at"""
+                        + extra_columns
+                        + """
                         )
                         VALUES (
                             :id, :tenant_id, :name, :description, 'active', 'general',
-                            '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                            '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP"""
+                        + extra_values
+                        + """
                         )
                         """
                     ),
@@ -2443,16 +2483,23 @@ def _split_document_backed_knowledge_bases(conn, tables: set[str]) -> None:
                 }
             )
             if not target:
+                extra_columns, extra_values = _gallery_scope_insert_columns(
+                    conn, "knowledge_bases"
+                )
                 conn.execute(
                     text(
                         """
                         INSERT INTO knowledge_bases (
                             id, tenant_id, name, description, status, capability_scope,
-                            metadata_json, created_at, updated_at
+                            metadata_json, created_at, updated_at"""
+                        + extra_columns
+                        + """
                         )
                         VALUES (
                             :id, :tenant_id, :name, :description, :status, :capability_scope,
-                            :metadata_json, :created_at, CURRENT_TIMESTAMP
+                            :metadata_json, :created_at, CURRENT_TIMESTAMP"""
+                        + extra_values
+                        + """
                         )
                         """
                     ),
@@ -2625,44 +2672,875 @@ def _unique_migrated_knowledge_base_name(
         index += 1
 
 
+# ---------------------------------------------------------------------------
+# 资源归属化迁移（_RESOURCE_OWNERSHIP_MIGRATION_ID）
+# ---------------------------------------------------------------------------
+# 目标：资源自带 scope/owner_agent_id，广场不再依赖「is_overall 孪生 agent」，
+# 「启用广场资源」不再是绑定表上的 status，而是引用行的存在与否。
+
+_RESOURCE_OWNERSHIP_LEGACY_PRIVATE_SCOPE = "agent_private"
+_RESOURCE_OWNERSHIP_LEGACY_GALLERY_SCOPE = "open_gallery"
+
+_RESOURCE_OWNERSHIP_SCOPE_CHECK = (
+    f"(scope = '{AGENT_SCOPE}' AND owner_agent_id IS NOT NULL) "
+    f"OR (scope = '{GALLERY_SCOPE}' AND owner_agent_id IS NULL)"
+)
+
+# 表重建 DDL 是**改造完成时的历史快照**，不跟随 models.py 继续漂移。
+_RESOURCE_OWNERSHIP_REBUILD: dict[str, tuple[str, tuple[str, ...]]] = {
+    "skills": (
+        f"""
+        CREATE TABLE "__TABLE__" (
+            id VARCHAR NOT NULL,
+            tenant_id VARCHAR NOT NULL,
+            skill_id VARCHAR NOT NULL,
+            scope VARCHAR NOT NULL,
+            owner_agent_id VARCHAR,
+            created_by_user_id VARCHAR,
+            version VARCHAR NOT NULL,
+            name VARCHAR NOT NULL,
+            business_domain VARCHAR,
+            description VARCHAR,
+            content_json JSON NOT NULL,
+            status VARCHAR NOT NULL,
+            created_at DATETIME NOT NULL,
+            updated_at DATETIME NOT NULL,
+            PRIMARY KEY (id),
+            CONSTRAINT ck_skills_scope_owner CHECK ({_RESOURCE_OWNERSHIP_SCOPE_CHECK})
+        )
+        """,
+        (
+            "id",
+            "tenant_id",
+            "skill_id",
+            "scope",
+            "owner_agent_id",
+            "created_by_user_id",
+            "version",
+            "name",
+            "business_domain",
+            "description",
+            "content_json",
+            "status",
+            "created_at",
+            "updated_at",
+        ),
+    ),
+    "general_skills": (
+        f"""
+        CREATE TABLE "__TABLE__" (
+            id VARCHAR NOT NULL,
+            tenant_id VARCHAR NOT NULL,
+            slug VARCHAR NOT NULL,
+            scope VARCHAR NOT NULL,
+            owner_agent_id VARCHAR,
+            created_by_user_id VARCHAR,
+            name VARCHAR NOT NULL,
+            description VARCHAR,
+            homepage VARCHAR,
+            skill_markdown VARCHAR NOT NULL,
+            skill_files_json JSON NOT NULL,
+            metadata_json JSON NOT NULL,
+            status VARCHAR NOT NULL,
+            capability_scope VARCHAR NOT NULL,
+            permissions_json JSON NOT NULL,
+            runtime_config_json JSON NOT NULL,
+            created_at DATETIME NOT NULL,
+            updated_at DATETIME NOT NULL,
+            PRIMARY KEY (id),
+            CONSTRAINT ck_general_skills_scope_owner CHECK ({_RESOURCE_OWNERSHIP_SCOPE_CHECK})
+        )
+        """,
+        (
+            "id",
+            "tenant_id",
+            "slug",
+            "scope",
+            "owner_agent_id",
+            "created_by_user_id",
+            "name",
+            "description",
+            "homepage",
+            "skill_markdown",
+            "skill_files_json",
+            "metadata_json",
+            "status",
+            "capability_scope",
+            "permissions_json",
+            "runtime_config_json",
+            "created_at",
+            "updated_at",
+        ),
+    ),
+    "knowledge_bases": (
+        f"""
+        CREATE TABLE "__TABLE__" (
+            id VARCHAR NOT NULL,
+            tenant_id VARCHAR NOT NULL,
+            scope VARCHAR NOT NULL,
+            owner_agent_id VARCHAR,
+            created_by_user_id VARCHAR,
+            name VARCHAR NOT NULL,
+            description VARCHAR,
+            status VARCHAR NOT NULL,
+            capability_scope VARCHAR NOT NULL,
+            metadata_json JSON NOT NULL,
+            created_at DATETIME NOT NULL,
+            updated_at DATETIME NOT NULL,
+            PRIMARY KEY (id),
+            CONSTRAINT ck_knowledge_bases_scope_owner CHECK ({_RESOURCE_OWNERSHIP_SCOPE_CHECK})
+        )
+        """,
+        (
+            "id",
+            "tenant_id",
+            "scope",
+            "owner_agent_id",
+            "created_by_user_id",
+            "name",
+            "description",
+            "status",
+            "capability_scope",
+            "metadata_json",
+            "created_at",
+            "updated_at",
+        ),
+    ),
+    "tools": (
+        f"""
+        CREATE TABLE "__TABLE__" (
+            id VARCHAR NOT NULL,
+            tenant_id VARCHAR NOT NULL,
+            name VARCHAR NOT NULL,
+            scope VARCHAR NOT NULL,
+            owner_agent_id VARCHAR,
+            created_by_user_id VARCHAR,
+            display_name VARCHAR,
+            description VARCHAR,
+            bucket VARCHAR NOT NULL,
+            tool_type VARCHAR NOT NULL,
+            method VARCHAR NOT NULL,
+            url VARCHAR NOT NULL,
+            headers_json JSON NOT NULL,
+            auth_json JSON NOT NULL,
+            config_json JSON NOT NULL,
+            input_schema JSON NOT NULL,
+            output_schema JSON NOT NULL,
+            allowed_skills_json JSON NOT NULL,
+            mcp_server_id VARCHAR,
+            capability_scope VARCHAR NOT NULL,
+            capability_scope_inherited BOOLEAN NOT NULL,
+            enabled BOOLEAN NOT NULL,
+            created_at DATETIME NOT NULL,
+            updated_at DATETIME NOT NULL,
+            PRIMARY KEY (id),
+            CONSTRAINT ck_tools_scope_owner CHECK ({_RESOURCE_OWNERSHIP_SCOPE_CHECK})
+        )
+        """,
+        (
+            "id",
+            "tenant_id",
+            "name",
+            "scope",
+            "owner_agent_id",
+            "created_by_user_id",
+            "display_name",
+            "description",
+            "bucket",
+            "tool_type",
+            "method",
+            "url",
+            "headers_json",
+            "auth_json",
+            "config_json",
+            "input_schema",
+            "output_schema",
+            "allowed_skills_json",
+            "mcp_server_id",
+            "capability_scope",
+            "capability_scope_inherited",
+            "enabled",
+            "created_at",
+            "updated_at",
+        ),
+    ),
+    "agent_profiles": (
+        """
+        CREATE TABLE "__TABLE__" (
+            id VARCHAR NOT NULL,
+            tenant_id VARCHAR NOT NULL,
+            owner_user_id VARCHAR NOT NULL,
+            name VARCHAR NOT NULL,
+            description VARCHAR,
+            persona_prompt VARCHAR,
+            is_overall BOOLEAN NOT NULL,
+            is_published BOOLEAN NOT NULL,
+            published_at DATETIME,
+            published_by VARCHAR,
+            status VARCHAR NOT NULL,
+            harness_max_actions INTEGER NOT NULL,
+            metadata_json JSON NOT NULL,
+            created_at DATETIME NOT NULL,
+            updated_at DATETIME NOT NULL,
+            PRIMARY KEY (id),
+            CONSTRAINT uq_agent_profile_tenant_owner_name UNIQUE (tenant_id, owner_user_id, name)
+        )
+        """,
+        (
+            "id",
+            "tenant_id",
+            "owner_user_id",
+            "name",
+            "description",
+            "persona_prompt",
+            "is_overall",
+            "is_published",
+            "published_at",
+            "published_by",
+            "status",
+            "harness_max_actions",
+            "metadata_json",
+            "created_at",
+            "updated_at",
+        ),
+    ),
+    "agent_resource_references": (
+        """
+        CREATE TABLE "__TABLE__" (
+            id VARCHAR NOT NULL,
+            tenant_id VARCHAR NOT NULL,
+            agent_id VARCHAR NOT NULL,
+            resource_type VARCHAR NOT NULL,
+            resource_id VARCHAR NOT NULL,
+            created_by_user_id VARCHAR,
+            created_at DATETIME NOT NULL,
+            updated_at DATETIME NOT NULL,
+            PRIMARY KEY (id),
+            CONSTRAINT uq_agent_resource_reference
+                UNIQUE (tenant_id, agent_id, resource_type, resource_id)
+        )
+        """,
+        (
+            "id",
+            "tenant_id",
+            "agent_id",
+            "resource_type",
+            "resource_id",
+            "created_by_user_id",
+            "created_at",
+            "updated_at",
+        ),
+    ),
+}
+
+
+def _table_columns(conn, table_name: str) -> list[str]:
+    """现读表结构：表重建后 inspector 缓存即失效，必须直接问 SQLite。"""
+    rows = conn.execute(text(f'PRAGMA table_info("{table_name}")')).all()
+    return [str(row[1]) for row in rows]
+
+
+def _table_column_info(conn, table_name: str) -> dict[str, bool]:
+    """列名 → 是否 NOT NULL。判断外键「置空还是删行」要看列自己的可空性。"""
+    rows = conn.execute(text(f'PRAGMA table_info("{table_name}")')).all()
+    return {str(row[1]): bool(row[3]) for row in rows}
+
+
+def _gallery_scope_insert_columns(conn, table_name: str) -> tuple[str, str]:
+    """归属化改造后，四张资源表多了 `scope` / `owner_agent_id` 两个 NOT NULL/索引列。
+
+    迁移里的「补数据」INSERT 是给老库兜底用的；老库若已重建出这两列，就必须显式写入
+    广场归属，否则会撞 `scope` 的 NOT NULL 约束。列还不存在时返回空串，SQL 保持原样。
+    """
+    existing = set(_table_columns(conn, table_name))
+    names: list[str] = []
+    values: list[str] = []
+    if "scope" in existing:
+        names.append("scope")
+        values.append("'gallery'")
+    if "owner_agent_id" in existing:
+        names.append("owner_agent_id")
+        values.append("NULL")
+    if not names:
+        return "", ""
+    return ", " + ", ".join(names), ", " + ", ".join(values)
+
+
+def _add_columns_if_missing(conn, table_name: str, additions: dict[str, str]) -> None:
+    existing = set(_table_columns(conn, table_name))
+    for column_name, ddl in additions.items():
+        if column_name not in existing:
+            conn.execute(text(f'ALTER TABLE "{table_name}" ADD COLUMN {column_name} {ddl}'))
+
+
+def _rebuild_table(
+    conn,
+    table_name: str,
+    create_sql: str,
+    columns: tuple[str, ...],
+    *,
+    source_table: str | None = None,
+) -> None:
+    """SQLite 表重建核心四步：建新表 → 搬运交集列 → 删旧表 → 改名。
+
+    重建是 SQLite 下**唯一**能改 CHECK 约束与表级唯一约束的手段（`ALTER TABLE`
+    既不能改既有约束，也不能加带 CHECK 的列）。调用方必须先把新列 `ADD COLUMN`
+    出来并完成回填 —— 否则搬运时 NOT NULL / CHECK 会直接拒绝旧行。
+    """
+    source = source_table or table_name
+    temp_name = f"{table_name}__rebuild"
+    existing_columns = set(_table_columns(conn, source))
+    conn.execute(text(f'DROP TABLE IF EXISTS "{temp_name}"'))
+    conn.execute(text(create_sql.replace("__TABLE__", temp_name, 1)))
+    copy_columns = [name for name in columns if name in existing_columns]
+    column_list = ", ".join(f'"{name}"' for name in copy_columns)
+    conn.execute(
+        text(
+            f'INSERT INTO "{temp_name}" ({column_list}) '
+            f'SELECT {column_list} FROM "{source}"'
+        )
+    )
+    conn.execute(text(f'DROP TABLE "{source}"'))
+    conn.execute(text(f'ALTER TABLE "{temp_name}" RENAME TO "{table_name}"'))
+
+
+def _create_model_indexes(conn, table_name: str) -> None:
+    """索引集从 models.py 元数据派生 —— 索引是约束的机械派生物，不该在迁移里手抄一份。"""
+    from sqlalchemy.dialects import sqlite as sqlite_dialect
+    from sqlalchemy.schema import CreateIndex
+
+    import app.db.models  # noqa: F401  确保元数据已注册
+
+    dialect = sqlite_dialect.dialect()
+    for index in SQLModel.metadata.tables[table_name].indexes:
+        conn.execute(text(str(CreateIndex(index).compile(dialect=dialect))))
+
+
+def _resource_ownership_migration_needed(conn, tables: set[str]) -> bool:
+    """新库不能跑重建：`create_all` 已建出目标结构，重建只会拿空表覆盖自己。"""
+    if "agent_resource_bindings" in tables:
+        return True
+    if any(name in tables for name in _RESOURCE_OWNERSHIP_LEGACY_BRANCH_TABLES):
+        return True
+    if "agent_profiles" in tables and "is_published" not in _table_columns(conn, "agent_profiles"):
+        return True
+    return False
+
+
+def _migration_owner_user_id(conn, tables: set[str], tenant_id: str) -> str:
+    """老数据缺归属时落到该租户的管理员账号，保证 owner_user_id 非空（新结构是 NOT NULL）。"""
+    if "users" in tables:
+        row = conn.execute(
+            text(
+                "SELECT id FROM users WHERE tenant_id = :tenant_id "
+                "ORDER BY (role = 'admin') DESC, created_at ASC LIMIT 1"
+            ),
+            {"tenant_id": tenant_id},
+        ).first()
+        if row and row[0]:
+            return str(row[0])
+    return "admin"
+
+
+def _backfill_agent_ownership(conn, tables: set[str]) -> None:
+    """员工归属：metadata_json.owner_user_id 进列；published_to_gallery 进 is_published。"""
+    if "agent_profiles" not in tables:
+        return
+    _add_columns_if_missing(
+        conn,
+        "agent_profiles",
+        {
+            "owner_user_id": "VARCHAR",
+            "is_published": "BOOLEAN NOT NULL DEFAULT 0",
+            "published_at": "DATETIME",
+            "published_by": "VARCHAR",
+        },
+    )
+    fallback_owners: dict[str, str] = {}
+    rows = conn.execute(
+        text("SELECT id, tenant_id, metadata_json FROM agent_profiles")
+    ).mappings().all()
+    for row in rows:
+        tenant_id = str(row.get("tenant_id") or "")
+        metadata = _json_object(row.get("metadata_json"))
+        owner_user_id = str(
+            metadata.get("owner_user_id") or metadata.get("created_by_user_id") or ""
+        ).strip()
+        if not owner_user_id:
+            if tenant_id not in fallback_owners:
+                fallback_owners[tenant_id] = _migration_owner_user_id(conn, tables, tenant_id)
+            owner_user_id = fallback_owners[tenant_id]
+        published = metadata.get("published_to_gallery") in (True, 1, "1", "true", "True")
+        conn.execute(
+            text(
+                """
+                UPDATE agent_profiles
+                SET owner_user_id = :owner_user_id,
+                    is_published = :is_published,
+                    published_at = CASE
+                        WHEN :is_published = 1 THEN COALESCE(published_at, updated_at)
+                        ELSE published_at
+                    END,
+                    published_by = CASE
+                        WHEN :is_published = 1 THEN COALESCE(published_by, :owner_user_id)
+                        ELSE published_by
+                    END
+                WHERE id = :id
+                """
+            ),
+            {
+                "owner_user_id": owner_user_id,
+                "is_published": 1 if published else 0,
+                "id": row["id"],
+            },
+        )
+
+
+def _legacy_branch_owners(conn, tables: set[str]) -> dict[tuple[str, str], str]:
+    """分支表记录「某 agent 持有私有副本」这一事实：{("skill", id): agent_id}。"""
+    owners: dict[tuple[str, str], str] = {}
+    branch_sources = (
+        ("agent_skill_branches", "skill", "skill_id"),
+        ("agent_knowledge_branches", "knowledge_base", "knowledge_base_id"),
+    )
+    for table_name, resource_type, column_name in branch_sources:
+        if table_name not in tables:
+            continue
+        rows = conn.execute(
+            text(f'SELECT agent_id, "{column_name}" AS resource_id FROM "{table_name}"')
+        ).mappings().all()
+        for row in rows:
+            resource_id = str(row.get("resource_id") or "")
+            agent_id = str(row.get("agent_id") or "")
+            if resource_id and agent_id:
+                owners.setdefault((resource_type, resource_id), agent_id)
+    return owners
+
+
+def _legacy_binding_facts(conn, tables: set[str]) -> tuple[dict[tuple[str, str], str], set[tuple[str, str]]]:
+    """老绑定表蕴含两件事：绑到整体智能体 = 广场资源；绑到普通员工 = 私有归属。"""
+    if "agent_resource_bindings" not in tables or "agent_profiles" not in tables:
+        return {}, set()
+    overall_agents = {
+        str(row[0])
+        for row in conn.execute(
+            text("SELECT id FROM agent_profiles WHERE is_overall = 1")
+        ).all()
+        if row[0]
+    }
+    private_owners: dict[tuple[str, str], str] = {}
+    gallery_keys: set[tuple[str, str]] = set()
+    rows = conn.execute(
+        text("SELECT agent_id, resource_type, resource_id, status FROM agent_resource_bindings")
+    ).mappings().all()
+    for row in rows:
+        if str(row.get("status") or "") == "deleted":
+            continue
+        resource_type = str(row.get("resource_type") or "")
+        resource_id = str(row.get("resource_id") or "")
+        if not resource_type or not resource_id:
+            continue
+        key = (resource_type, resource_id)
+        agent_id = str(row.get("agent_id") or "")
+        if agent_id in overall_agents:
+            gallery_keys.add(key)
+        elif agent_id:
+            private_owners.setdefault(key, agent_id)
+    return private_owners, gallery_keys
+
+
+def _legacy_owner_agent_id(
+    metadata: dict[str, object],
+    key: tuple[str, str],
+    branch_owners: dict[tuple[str, str], str],
+    binding_owners: dict[tuple[str, str], str],
+    gallery_keys: set[tuple[str, str]],
+) -> str | None:
+    """归属判定优先级：metadata 最显式 → 分支表 → 绑定表 → 兜底归广场。
+
+    兜底选广场而非私有：广场是管理员可写，无主资源留在广场最不容易变成孤儿。
+    """
+    legacy_scope = str(metadata.get("scope") or metadata.get("visibility") or "").strip()
+    if legacy_scope == _RESOURCE_OWNERSHIP_LEGACY_PRIVATE_SCOPE:
+        owner_agent_id = str(metadata.get("owner_agent_id") or "").strip()
+        if owner_agent_id:
+            return owner_agent_id
+    elif legacy_scope == _RESOURCE_OWNERSHIP_LEGACY_GALLERY_SCOPE:
+        return None
+    if key in gallery_keys:
+        return None
+    return branch_owners.get(key) or binding_owners.get(key)
+
+
+def _backfill_resource_ownership(conn, tables: set[str]) -> None:
+    """四张资源表：把藏在 metadata_json / 分支表 / 绑定表里的归属落到 scope + owner_agent_id。"""
+    branch_owners = _legacy_branch_owners(conn, tables)
+    binding_owners, gallery_keys = _legacy_binding_facts(conn, tables)
+    for resource_type, table_name, _, metadata_column in _RESOURCE_OWNERSHIP_SCOPED_TABLES:
+        if table_name not in tables:
+            continue
+        _add_columns_if_missing(
+            conn,
+            table_name,
+            {
+                "scope": f"VARCHAR NOT NULL DEFAULT '{AGENT_SCOPE}'",
+                "owner_agent_id": "VARCHAR",
+                "created_by_user_id": "VARCHAR",
+            },
+        )
+        columns = ["id"] + ([metadata_column] if metadata_column else [])
+        rows = conn.execute(
+            text(f'SELECT {", ".join(columns)} FROM "{table_name}"')
+        ).mappings().all()
+        for row in rows:
+            metadata = _json_object(row.get(metadata_column)) if metadata_column else {}
+            key = (resource_type, str(row["id"]))
+            owner_agent_id = _legacy_owner_agent_id(
+                metadata, key, branch_owners, binding_owners, gallery_keys
+            )
+            created_by_user_id = str(
+                metadata.get("owner_user_id") or metadata.get("created_by_user_id") or ""
+            ).strip()
+            conn.execute(
+                text(
+                    f'UPDATE "{table_name}" '
+                    "SET scope = :scope, owner_agent_id = :owner_agent_id, "
+                    "created_by_user_id = :created_by_user_id "
+                    "WHERE id = :id"
+                ),
+                {
+                    "scope": AGENT_SCOPE if owner_agent_id else GALLERY_SCOPE,
+                    "owner_agent_id": owner_agent_id,
+                    "created_by_user_id": created_by_user_id or None,
+                    "id": row["id"],
+                },
+            )
+
+
+def _dedupe_owned_keys(
+    conn,
+    table_name: str,
+    key_column: str,
+    *,
+    owner_column: str,
+    scope: str | None,
+) -> None:
+    """同 (tenant_id, owner, 业务键) 重名才消歧 —— 保留最早，其余加序号后缀。"""
+    scope_filter = " AND scope = :scope" if scope else ""
+    parameters: dict[str, object] = {"scope": scope} if scope else {}
+    groups = conn.execute(
+        text(
+            f'SELECT tenant_id, {owner_column} AS owner_id, "{key_column}" AS key_value '
+            f'FROM "{table_name}" WHERE {owner_column} IS NOT NULL{scope_filter} '
+            f'GROUP BY tenant_id, {owner_column}, "{key_column}" HAVING COUNT(*) > 1'
+        ),
+        parameters,
+    ).mappings().all()
+    for group in groups:
+        rows = conn.execute(
+            text(
+                f'SELECT id, "{key_column}" AS key_value FROM "{table_name}" '
+                f"WHERE tenant_id = :tenant_id AND {owner_column} = :owner_id "
+                f'AND "{key_column}" = :key_value{scope_filter} '
+                "ORDER BY created_at ASC, id ASC"
+            ),
+            {
+                "tenant_id": group["tenant_id"],
+                "owner_id": group["owner_id"],
+                "key_value": group["key_value"],
+                **parameters,
+            },
+        ).mappings().all()
+        for position, row in enumerate(rows[1:], start=2):
+            conn.execute(
+                text(f'UPDATE "{table_name}" SET "{key_column}" = :key_value WHERE id = :id'),
+                {"key_value": f'{row["key_value"]}-{position}', "id": row["id"]},
+            )
+
+
+def _resolve_ownership_name_collisions(conn, tables: set[str]) -> None:
+    """老约束是租户级（比新约束更严），同 owner 重名理论上不存在；留着兜手工数据。"""
+    for _, table_name, key_column, _ in _RESOURCE_OWNERSHIP_SCOPED_TABLES:
+        if table_name not in tables:
+            continue
+        _dedupe_owned_keys(
+            conn, table_name, key_column, owner_column="owner_agent_id", scope=AGENT_SCOPE
+        )
+    if "agent_profiles" in tables:
+        _dedupe_owned_keys(
+            conn, "agent_profiles", "name", owner_column="owner_user_id", scope=None
+        )
+
+
+def _rebuild_ownership_tables(conn, tables: set[str]) -> None:
+    """装 CHECK 与新的唯一约束 —— 只能靠表重建，且必须在回填完成之后。"""
+    for table_name in (
+        "skills",
+        "general_skills",
+        "knowledge_bases",
+        "tools",
+        "agent_profiles",
+    ):
+        if table_name not in tables:
+            continue
+        create_sql, columns = _RESOURCE_OWNERSHIP_REBUILD[table_name]
+        _rebuild_table(conn, table_name, create_sql, columns)
+        _create_model_indexes(conn, table_name)
+
+
+def _migrate_agent_resource_references(conn, tables: set[str]) -> None:
+    """绑定表 → 纯引用表：只留「指向广场资源、且当时处于启用状态、且不是整体智能体自己」的行。
+
+    私有资源「归属即生效」，引用行对它是噪音；反向保留还会把别人的私有资源暴露给引用者。
+    status='inactive' 表示迁移前就没启用；新模型用「行是否存在」表达开关，这类行直接丢弃。
+    """
+    create_sql, _ = _RESOURCE_OWNERSHIP_REBUILD["agent_resource_references"]
+    if "agent_resource_bindings" in tables:
+        conn.execute(text('DROP TABLE IF EXISTS "agent_resource_references"'))
+        conn.execute(text(create_sql.replace("__TABLE__", "agent_resource_references", 1)))
+        conn.execute(
+            text(
+                """
+                INSERT INTO agent_resource_references (
+                    id, tenant_id, agent_id, resource_type, resource_id, created_at, updated_at
+                )
+                SELECT b.id, b.tenant_id, b.agent_id, b.resource_type, b.resource_id,
+                       b.created_at, b.updated_at
+                FROM agent_resource_bindings AS b
+                WHERE b.status != 'deleted'
+                  AND EXISTS (
+                      SELECT 1 FROM agent_resource_bindings AS owner_binding
+                      JOIN agent_profiles AS overall_agent
+                        ON overall_agent.id = owner_binding.agent_id
+                       AND overall_agent.is_overall = 1
+                      WHERE owner_binding.resource_type = b.resource_type
+                        AND owner_binding.resource_id = b.resource_id
+                        AND owner_binding.status != 'deleted'
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM agent_profiles AS binding_agent
+                      WHERE binding_agent.id = b.agent_id
+                        AND binding_agent.is_overall = 1
+                  )
+                """
+            )
+        )
+        conn.execute(text('DROP TABLE "agent_resource_bindings"'))
+    _create_model_indexes(conn, "agent_resource_references")
+
+
+def _drop_legacy_branch_tables(conn) -> None:
+    for table_name in _RESOURCE_OWNERSHIP_LEGACY_BRANCH_TABLES:
+        conn.execute(text(f'DROP TABLE IF EXISTS "{table_name}"'))
+
+
+def _strip_ownership_metadata(conn, tables: set[str]) -> None:
+    """清掉已由列承载的状态键，避免「列 + metadata」两处真相。
+
+    只清**状态**键：`owner_user_id` / `owner_username` / `owner_display_name` 是创建者
+    署名（UI 用它做同名消歧），列里没有对应字段，必须留下。
+    """
+    targets = [
+        (table_name, _RESOURCE_OWNERSHIP_STATE_METADATA_KEYS)
+        for _, table_name, _, metadata_column in _RESOURCE_OWNERSHIP_SCOPED_TABLES
+        if metadata_column
+    ]
+    targets.append(("agent_profiles", _RESOURCE_OWNERSHIP_AGENT_STATE_METADATA_KEYS))
+    for table_name, keys in targets:
+        if table_name not in tables:
+            continue
+        rows = conn.execute(
+            text(f'SELECT id, metadata_json FROM "{table_name}"')
+        ).mappings().all()
+        for row in rows:
+            metadata = _json_object(row.get("metadata_json"))
+            if not any(key in metadata for key in keys):
+                continue
+            for key in keys:
+                metadata.pop(key, None)
+            conn.execute(
+                text(f'UPDATE "{table_name}" SET metadata_json = :metadata_json WHERE id = :id'),
+                {
+                    "metadata_json": json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+                    "id": row["id"],
+                },
+            )
+
+
+def _migration_already_applied(conn, migration_id: str) -> bool:
+    """迁移登记表是「跑过没有」的唯一判据；建表与查询都在这里收口。"""
+    conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS app_data_migrations (
+                id VARCHAR PRIMARY KEY,
+                applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+    )
+    applied = conn.execute(
+        text("SELECT id FROM app_data_migrations WHERE id = :id"),
+        {"id": migration_id},
+    ).first()
+    return bool(applied)
+
+
+def _record_migration(conn, migration_id: str) -> None:
+    conn.execute(
+        text("INSERT INTO app_data_migrations (id) VALUES (:id)"),
+        {"id": migration_id},
+    )
+
+
+def _migrate_resource_ownership(conn, inspector, tables: set[str]) -> None:
+    """把「广场 = 一条 is_overall 员工记录」换成「资源自带 scope/owner」。
+
+    顺序本身即正确性，不可调换：
+      1. ADD COLUMN 出新列（不带 CHECK —— SQLite 不允许）
+      2. 回填归属
+      3. 同归属重名消歧
+      4. 表重建，装上 CHECK 与新的唯一约束
+      5. 绑定表重建为纯引用表
+      6. 删三张分支表
+      7. 清掉失效的 metadata 状态键
+
+    本迁移**必须**保留 `is_overall` 列：第 5 步要靠它区分「老绑定表里哪些行是广场
+    绑定」。列本身的删除交给随后的一次性迁移 `_migrate_drop_overall_agent`。
+    """
+    if not _resource_ownership_migration_needed(conn, tables):
+        return
+    if _migration_already_applied(conn, _RESOURCE_OWNERSHIP_MIGRATION_ID):
+        return
+
+    _backfill_agent_ownership(conn, tables)
+    _backfill_resource_ownership(conn, tables)
+    _resolve_ownership_name_collisions(conn, tables)
+    _rebuild_ownership_tables(conn, tables)
+    _migrate_agent_resource_references(conn, tables)
+    _drop_legacy_branch_tables(conn)
+    _strip_ownership_metadata(conn, tables)
+    _record_migration(conn, _RESOURCE_OWNERSHIP_MIGRATION_ID)
+
+
+# 「整体智能体」删除后的 agent_profiles 快照。`_rebuild_table` 只搬运新旧列的交集，
+# 所以列元组里没有 `is_overall` 就等于把它砍掉。
+_AGENT_PROFILES_TABLE_DDL = (
+    """
+    CREATE TABLE "__TABLE__" (
+        id VARCHAR NOT NULL,
+        tenant_id VARCHAR NOT NULL,
+        owner_user_id VARCHAR NOT NULL,
+        name VARCHAR NOT NULL,
+        description VARCHAR,
+        persona_prompt VARCHAR,
+        is_published BOOLEAN NOT NULL,
+        published_at DATETIME,
+        published_by VARCHAR,
+        status VARCHAR NOT NULL,
+        harness_max_actions INTEGER NOT NULL,
+        metadata_json JSON NOT NULL,
+        created_at DATETIME NOT NULL,
+        updated_at DATETIME NOT NULL,
+        PRIMARY KEY (id),
+        CONSTRAINT uq_agent_profile_tenant_owner_name UNIQUE (tenant_id, owner_user_id, name)
+    )
+    """,
+    (
+        "id",
+        "tenant_id",
+        "owner_user_id",
+        "name",
+        "description",
+        "persona_prompt",
+        "is_published",
+        "published_at",
+        "published_by",
+        "status",
+        "harness_max_actions",
+        "metadata_json",
+        "created_at",
+        "updated_at",
+    ),
+)
+
+
+def _purge_agent_dependents(conn, tables: set[str], agent_ids: list[str]) -> None:
+    """清掉指向这批员工的其它表数据：可空外键置空，非空外键删行。
+
+    判定依据是**列自己的可空性**，而不是手抄一张「哪些表指向员工」的清单：
+    `agent_id` 可空说明这行不依赖该员工，断开链接即可；非空说明这行的存在意义
+    就是它，只能删。新增表也不会漏。
+    """
+    if not agent_ids:
+        return
+    placeholders = ", ".join(f":agent_{index}" for index in range(len(agent_ids)))
+    params = {f"agent_{index}": value for index, value in enumerate(agent_ids)}
+    for table_name in sorted(tables):
+        if table_name == "agent_profiles":
+            continue
+        columns = _table_column_info(conn, table_name)
+        if "agent_id" not in columns:
+            continue
+        if columns["agent_id"]:
+            sql = f'DELETE FROM "{table_name}" WHERE agent_id IN ({placeholders})'
+        else:
+            sql = f'UPDATE "{table_name}" SET agent_id = NULL WHERE agent_id IN ({placeholders})'
+        conn.execute(text(sql), params)
+
+
+def _migrate_drop_overall_agent(conn, tables: set[str]) -> None:
+    """删掉「整体智能体」孪生记录，以及它赖以存在的 `is_overall` 列。
+
+    广场资源早已由资源表自己的 `scope='gallery'` 表达，那条孪生记录唯一剩下的作用
+    是把「广场视角」伪装成一个员工 —— 于是它同时占着一个员工名、又要被每个权限判定
+    特判。清掉它之后，`agent_profiles` 里每一行都是某个人的真实员工，系统里不再有
+    「不是员工的员工」。
+
+    先按外键清理依赖，再删行，最后重建表去掉列。列不存在时整个迁移是空操作 ——
+    新库由 `create_all` 直接从模型建表，本就没有这一列。
+    """
+    if "agent_profiles" not in tables:
+        return
+    if "is_overall" not in _table_columns(conn, "agent_profiles"):
+        return
+    if _migration_already_applied(conn, _DROP_OVERALL_AGENT_MIGRATION_ID):
+        return
+
+    overall_ids = [
+        str(row[0])
+        for row in conn.execute(
+            text("SELECT id FROM agent_profiles WHERE is_overall = 1")
+        ).all()
+        if row[0]
+    ]
+    _purge_agent_dependents(conn, tables, overall_ids)
+    for agent_id in overall_ids:
+        conn.execute(text("DELETE FROM agent_profiles WHERE id = :id"), {"id": agent_id})
+
+    create_sql, columns = _AGENT_PROFILES_TABLE_DDL
+    _rebuild_table(conn, "agent_profiles", create_sql, columns)
+    _create_model_indexes(conn, "agent_profiles")
+    _record_migration(conn, _DROP_OVERALL_AGENT_MIGRATION_ID)
+
+
+def _purge_legacy_agent_model_bindings(conn, tables: set[str]) -> None:
+    """员工级模型选择已退役。启动时清掉历史行，避免老库/老客户端把员工钉在过期模型上。"""
+    if "agent_model_bindings" in tables:
+        conn.execute(text("DELETE FROM agent_model_bindings"))
+
+
 def _seed_default_agents(conn, tables: set[str]) -> None:
     if "agent_profiles" not in tables:
         return
-    tenant_ids = _tenant_ids(conn, tables)
-    for tenant_id in tenant_ids:
-        for agent_id, name, is_overall in (
-            (_overall_agent_id(tenant_id), "整体智能体", True),
-        ):
-            existing = conn.execute(text("SELECT id FROM agent_profiles WHERE id = :id"), {"id": agent_id}).first()
-            if existing:
-                continue
-            conn.execute(
-                text(
-                    """
-                    INSERT INTO agent_profiles (
-                        id, tenant_id, name, description, persona_prompt, is_overall,
-                        harness_max_actions, status, metadata_json, created_at, updated_at
-                    )
-                    VALUES (
-                        :id, :tenant_id, :name, :description, NULL, :is_overall,
-                        32, 'active', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-                    )
-                    """
-                ),
-                {
-                    "id": agent_id,
-                    "tenant_id": tenant_id,
-                    "name": name,
-                    "description": "全局资源池" if is_overall else "默认对话可见域",
-                    "is_overall": 1 if is_overall else 0,
-                },
-            )
+    for tenant_id in _tenant_ids(conn, tables):
         _archive_default_agent(conn, tenant_id)
-        if "agent_resource_bindings" in tables:
+        if "agent_resource_references" in tables:
             _seed_default_agent_bindings(conn, tenant_id)
 
 
 def _seed_default_agent_bindings(conn, tenant_id: str) -> None:
+    """默认员工引用本租户的全部广场资源（私有资源「归属即生效」，不需要引用行）。"""
     default_agent = _default_agent_id(tenant_id)
     active_default = conn.execute(
         text(
@@ -2676,9 +3554,9 @@ def _seed_default_agent_bindings(conn, tenant_id: str) -> None:
     if not active_default:
         return
     resource_queries = (
-        ("skill", "SELECT id, status FROM skills WHERE tenant_id = :tenant_id AND status != 'deleted'"),
-        ("general_skill", "SELECT id, status FROM general_skills WHERE tenant_id = :tenant_id AND status != 'deleted'"),
-        ("knowledge_base", "SELECT id, status FROM knowledge_bases WHERE tenant_id = :tenant_id AND status != 'deleted'"),
+        ("skill", f"SELECT id FROM skills WHERE tenant_id = :tenant_id AND status != 'deleted' AND scope = '{GALLERY_SCOPE}'"),
+        ("general_skill", f"SELECT id FROM general_skills WHERE tenant_id = :tenant_id AND status != 'deleted' AND scope = '{GALLERY_SCOPE}'"),
+        ("knowledge_base", f"SELECT id FROM knowledge_bases WHERE tenant_id = :tenant_id AND status != 'deleted' AND scope = '{GALLERY_SCOPE}'"),
     )
     for resource_type, sql in resource_queries:
         rows = conn.execute(text(sql), {"tenant_id": tenant_id}).mappings().all()
@@ -2686,11 +3564,10 @@ def _seed_default_agent_bindings(conn, tenant_id: str) -> None:
             resource_id = str(row.get("id") or "")
             if not resource_id:
                 continue
-            binding_status = "active" if str(row.get("status") or "") in {"active", "published"} else "inactive"
             existing = conn.execute(
                 text(
                     """
-                    SELECT id FROM agent_resource_bindings
+                    SELECT id FROM agent_resource_references
                     WHERE tenant_id = :tenant_id AND agent_id = :agent_id
                       AND resource_type = :resource_type AND resource_id = :resource_id
                     """
@@ -2707,13 +3584,13 @@ def _seed_default_agent_bindings(conn, tenant_id: str) -> None:
             conn.execute(
                 text(
                     """
-                    INSERT INTO agent_resource_bindings (
-                        id, tenant_id, agent_id, resource_type, resource_id, status,
-                        metadata_json, created_at, updated_at
+                    INSERT INTO agent_resource_references (
+                        id, tenant_id, agent_id, resource_type, resource_id,
+                        created_at, updated_at
                     )
                     VALUES (
-                        :id, :tenant_id, :agent_id, :resource_type, :resource_id, :status,
-                        '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                        :id, :tenant_id, :agent_id, :resource_type, :resource_id,
+                        CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
                     )
                     """
                 ),
@@ -2723,7 +3600,6 @@ def _seed_default_agent_bindings(conn, tenant_id: str) -> None:
                     "agent_id": default_agent,
                     "resource_type": resource_type,
                     "resource_id": resource_id,
-                    "status": binding_status,
                 },
             )
 
@@ -2734,7 +3610,7 @@ def _archive_default_agent(conn, tenant_id: str) -> None:
         text(
             """
             SELECT metadata_json FROM agent_profiles
-            WHERE id = :id AND tenant_id = :tenant_id AND is_overall = 0
+            WHERE id = :id AND tenant_id = :tenant_id
             """
         ),
         {"id": default_agent, "tenant_id": tenant_id},
@@ -2784,112 +3660,6 @@ def _archive_default_agent(conn, tenant_id: str) -> None:
     )
 
 
-def _seed_agent_branch_state(conn, inspector, tables: set[str]) -> None:
-    if "agent_profiles" not in tables:
-        return
-    if "agent_skill_branches" in tables and "skills" in tables:
-        agents = conn.execute(
-            text("SELECT id, tenant_id FROM agent_profiles WHERE is_overall = 0 AND status != 'archived'")
-        ).mappings().all()
-        for agent in agents:
-            tenant_id = str(agent["tenant_id"])
-            agent_id = str(agent["id"])
-            _seed_default_agent_bindings(conn, tenant_id)
-            rows = conn.execute(
-                text(
-                    """
-                    SELECT s.*
-                    FROM skills s
-                    JOIN agent_resource_bindings b
-                      ON b.resource_id = s.id
-                     AND b.resource_type = 'skill'
-                     AND b.tenant_id = s.tenant_id
-                    WHERE s.tenant_id = :tenant_id
-                      AND b.agent_id = :agent_id
-                      AND s.status != 'deleted'
-                    """
-                ),
-                {"tenant_id": tenant_id, "agent_id": agent_id},
-            ).mappings().all()
-            for row in rows:
-                _seed_agent_skill_branch(conn, agent_id, row)
-
-    if "agent_knowledge_branches" in tables and "knowledge_bases" in tables:
-        agents = conn.execute(
-            text("SELECT id, tenant_id FROM agent_profiles WHERE is_overall = 0 AND status != 'archived'")
-        ).mappings().all()
-        for agent in agents:
-            tenant_id = str(agent["tenant_id"])
-            agent_id = str(agent["id"])
-            rows = conn.execute(
-                text(
-                    """
-                    SELECT kb.*
-                    FROM knowledge_bases kb
-                    JOIN agent_resource_bindings b
-                      ON b.resource_id = kb.id
-                     AND b.resource_type = 'knowledge_base'
-                     AND b.tenant_id = kb.tenant_id
-                    WHERE kb.tenant_id = :tenant_id
-                      AND b.agent_id = :agent_id
-                      AND kb.status != 'deleted'
-                    """
-                ),
-                {"tenant_id": tenant_id, "agent_id": agent_id},
-            ).mappings().all()
-            for row in rows:
-                _seed_agent_knowledge_branch(conn, agent_id, row)
-
-    if "agent_model_bindings" in tables:
-        # Employee-level model selection has been retired. Clearing legacy rows during startup
-        # prevents older databases or clients from silently pinning employees to stale models.
-        conn.execute(text("DELETE FROM agent_model_bindings"))
-
-
-def _normalize_agent_branch_rows(conn, tables: set[str]) -> None:
-    if "agent_resource_bindings" in tables:
-        _normalize_canonical_ids(
-            conn,
-            table="agent_resource_bindings",
-            select_columns=("id", "tenant_id", "agent_id", "resource_type", "resource_id"),
-            key_columns=("tenant_id", "agent_id", "resource_type", "resource_id"),
-            id_factory=lambda row: _agent_resource_binding_id(
-                str(row["tenant_id"]),
-                str(row["agent_id"]),
-                str(row["resource_type"]),
-                str(row["resource_id"]),
-            ),
-        )
-    if "agent_skill_branches" in tables:
-        _normalize_canonical_ids(
-            conn,
-            table="agent_skill_branches",
-            select_columns=("id", "tenant_id", "agent_id", "skill_id"),
-            key_columns=("tenant_id", "agent_id", "skill_id"),
-            id_factory=lambda row: _agent_skill_branch_id(str(row["agent_id"]), str(row["skill_id"])),
-        )
-    if "agent_skill_branch_versions" in tables:
-        _normalize_canonical_ids(
-            conn,
-            table="agent_skill_branch_versions",
-            select_columns=("id", "tenant_id", "agent_id", "skill_id", "version"),
-            key_columns=("tenant_id", "agent_id", "skill_id", "version"),
-            id_factory=lambda row: _agent_skill_branch_version_id(
-                str(row["agent_id"]),
-                str(row["skill_id"]),
-                str(row["version"]),
-            ),
-        )
-    if "agent_knowledge_branches" in tables:
-        _normalize_canonical_ids(
-            conn,
-            table="agent_knowledge_branches",
-            select_columns=("id", "tenant_id", "agent_id", "knowledge_base_id"),
-            key_columns=("tenant_id", "agent_id", "knowledge_base_id"),
-            id_factory=lambda row: _agent_knowledge_branch_id(str(row["agent_id"]), str(row["knowledge_base_id"])),
-        )
-
-
 def _normalize_canonical_ids(
     conn,
     *,
@@ -2919,104 +3689,6 @@ def _normalize_canonical_ids(
         conn.execute(text(f"UPDATE {table} SET id = :target_id WHERE id = :id"), {"target_id": target_id, "id": row_id})
 
 
-def _seed_agent_skill_branch(conn, agent_id: str, row) -> None:
-    branch_id = _agent_skill_branch_id(agent_id, str(row["skill_id"]))
-    existing = conn.execute(text("SELECT id FROM agent_skill_branches WHERE id = :id"), {"id": branch_id}).first()
-    if existing:
-        return
-    version = row.get("version") or "1.0.0"
-    content_json = row.get("content_json") or "{}"
-    branch_status = "active" if str(row.get("status") or "") == "published" else "inactive"
-    conn.execute(
-        text(
-            """
-            INSERT INTO agent_skill_branches (
-                id, tenant_id, agent_id, skill_id, source_skill_id, base_version, head_version,
-                content_json, status, sync_state, metadata_json, created_at, updated_at
-            )
-            VALUES (
-                :id, :tenant_id, :agent_id, :skill_id, :source_skill_id, :base_version, :head_version,
-                :content_json, :status, 'synced', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-            )
-            """
-        ),
-        {
-            "id": branch_id,
-            "tenant_id": row["tenant_id"],
-            "agent_id": agent_id,
-            "skill_id": row["skill_id"],
-            "source_skill_id": row["id"],
-            "base_version": version,
-            "head_version": version,
-            "content_json": content_json,
-            "status": branch_status,
-        },
-    )
-    if "agent_skill_branch_versions" not in {table for table in inspect(engine).get_table_names()}:
-        return
-    branch_version_id = _agent_skill_branch_version_id(agent_id, str(row["skill_id"]), version)
-    existing_version = conn.execute(
-        text("SELECT id FROM agent_skill_branch_versions WHERE id = :id"),
-        {"id": branch_version_id},
-    ).first()
-    if existing_version:
-        return
-    conn.execute(
-        text(
-            """
-            INSERT INTO agent_skill_branch_versions (
-                id, tenant_id, agent_id, skill_id, source_skill_id, version, base_version,
-                content_json, status, sync_state, change_summary, created_at, updated_at
-            )
-            VALUES (
-                :id, :tenant_id, :agent_id, :skill_id, :source_skill_id, :version, :base_version,
-                :content_json, :status, 'synced', '初始化分支', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-            )
-            """
-        ),
-        {
-            "id": branch_version_id,
-            "tenant_id": row["tenant_id"],
-            "agent_id": agent_id,
-            "skill_id": row["skill_id"],
-            "source_skill_id": row["id"],
-            "version": version,
-            "base_version": version,
-            "content_json": content_json,
-            "status": branch_status,
-        },
-    )
-
-
-def _seed_agent_knowledge_branch(conn, agent_id: str, row) -> None:
-    branch_id = _agent_knowledge_branch_id(agent_id, str(row["id"]))
-    existing = conn.execute(text("SELECT id FROM agent_knowledge_branches WHERE id = :id"), {"id": branch_id}).first()
-    if existing:
-        return
-    branch_status = "active" if str(row.get("status") or "") == "active" else "inactive"
-    conn.execute(
-        text(
-            """
-            INSERT INTO agent_knowledge_branches (
-                id, tenant_id, agent_id, knowledge_base_id, base_version, head_version,
-                status, sync_state, metadata_json, created_at, updated_at
-            )
-            VALUES (
-                :id, :tenant_id, :agent_id, :knowledge_base_id, '1.0.0', '1.0.0',
-                :status, 'synced', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-            )
-            """
-        ),
-        {
-            "id": branch_id,
-            "tenant_id": row["tenant_id"],
-            "agent_id": agent_id,
-            "knowledge_base_id": row["id"],
-            "status": branch_status,
-        },
-    )
-
-
 def _tenant_ids(conn, tables: set[str]) -> list[str]:
     ids: set[str] = set()
     if "tenants" in tables:
@@ -3032,29 +3704,12 @@ def _default_knowledge_base_id(tenant_id: str) -> str:
     return f"kb_{tenant_id}_default"
 
 
-def _overall_agent_id(tenant_id: str) -> str:
-    return f"agent_{tenant_id}_overall"
-
-
 def _default_agent_id(tenant_id: str) -> str:
     return f"agent_{tenant_id}_default"
 
 
 def _knowledge_base_version_id(knowledge_base_id: str, version: str) -> str:
     return f"kbver_{knowledge_base_id}_{version.replace('.', '_').replace('-', '_')}"
-
-
-def _agent_skill_branch_id(agent_id: str, skill_id: str) -> str:
-    return f"agentbranch_{agent_id}_{skill_id}"
-
-
-def _agent_skill_branch_version_id(agent_id: str, skill_id: str, version: str) -> str:
-    safe_version = version.replace(".", "_").replace("-", "_")
-    return f"agentbranchver_{agent_id}_{skill_id}_{safe_version}"
-
-
-def _agent_knowledge_branch_id(agent_id: str, knowledge_base_id: str) -> str:
-    return f"agentkb_{agent_id}_{knowledge_base_id}"
 
 
 def _agent_resource_binding_id(tenant_id: str, agent_id: str, resource_type: str, resource_id: str) -> str:

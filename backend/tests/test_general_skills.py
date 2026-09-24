@@ -12,7 +12,10 @@ from fastapi import HTTPException
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from app.agents.branching import ensure_open_gallery_binding
+from app.agents.branching import (
+    reference_resource,
+    unreference_resource,
+)
 from app.api.general_skills import (
     archive_general_skill,
     delete_general_skill,
@@ -22,14 +25,15 @@ from app.api.general_skills import (
     import_general_skill_package,
     list_general_skills,
     publish_general_skill,
-    publish_general_skill_to_gallery,
     run_general_skill,
     run_general_skill_stream,
 )
 from app.db.models import (
+    AGENT_SCOPE,
+    GALLERY_SCOPE,
     AgentEvent,
     AgentProfile,
-    AgentResourceBinding,
+    AgentResourceReference,
     ChatSession,
     GeneralSkill,
     Message,
@@ -252,11 +256,6 @@ def _admin_user() -> User:
 def test_import_general_skill_uses_user_supplied_metadata() -> None:
     with _test_session() as db:
         _seed_minimal_tenant(db)
-        db.add(
-            AgentProfile(
-                id="agent_overall", tenant_id="tenant_demo", name="整体智能体", is_overall=True
-            )
-        )
         db.commit()
 
         first = import_general_skill(
@@ -315,11 +314,6 @@ def test_import_general_skill_uses_user_supplied_metadata() -> None:
 def test_import_general_skill_without_original_slug_does_not_overwrite_existing() -> None:
     with _test_session() as db:
         _seed_minimal_tenant(db)
-        db.add(
-            AgentProfile(
-                id="agent_overall", tenant_id="tenant_demo", name="整体智能体", is_overall=True
-            )
-        )
         db.commit()
 
         first = import_general_skill(
@@ -356,12 +350,23 @@ def test_import_general_skill_without_original_slug_does_not_overwrite_existing(
         assert rows[0].skill_markdown == WEATHER_SKILL_MD.strip()
 
 
-def test_deleted_open_gallery_general_skill_binding_is_not_restored_by_ensure() -> None:
+def test_deleted_gallery_general_skill_is_purged_from_references() -> None:
     with _test_session() as db:
         _seed_minimal_tenant(db)
         db.add(
             AgentProfile(
-                id="agent_overall", tenant_id="tenant_demo", name="整体智能体", is_overall=True
+                owner_user_id="user_member",
+                id="agent_member",
+                tenant_id="tenant_demo",
+                name="研发员工",
+            )
+        )
+        db.add(
+            User(
+                id="user_member",
+                tenant_id="tenant_demo",
+                username="member",
+                password_hash="x",
             )
         )
         db.commit()
@@ -376,42 +381,46 @@ def test_deleted_open_gallery_general_skill_binding_is_not_restored_by_ensure() 
             db,
             _admin_user(),
         )
+        # 广场技能：成员员工引用它之后才在自己的可见集里出现。
+        assert reference_resource(
+            db, "tenant_demo", "agent_member", "general_skill", imported.id, "user_member"
+        )
+        db.commit()
+        assert [
+            row.id for row in list_general_skills("tenant_demo", db, agent_id="agent_member")
+        ] == [imported.id]
 
         deleted = delete_general_skill(
             imported.slug,
             "tenant_demo",
             db,
-            agent_id="agent_overall",
+            agent_id=None,
             current_user=_admin_user(),
         )
-        assert deleted == {"status": "hidden", "slug": "weather-zh"}
-
-        ensure_open_gallery_binding(db, "tenant_demo", "general_skill", imported.id, "active")
-        db.commit()
-
-        binding = db.exec(
-            select(AgentResourceBinding).where(
-                AgentResourceBinding.tenant_id == "tenant_demo",
-                AgentResourceBinding.agent_id == "agent_overall",
-                AgentResourceBinding.resource_type == "general_skill",
-                AgentResourceBinding.resource_id == imported.id,
-            )
-        ).one()
-        assert binding.status == "deleted"
+        # 真删：资源行消失，引用行一并清掉。
+        assert deleted == {"status": "deleted", "slug": "weather-zh"}
+        assert db.get(GeneralSkill, imported.id) is None
+        assert (
+            db.exec(
+                select(AgentResourceReference).where(
+                    AgentResourceReference.resource_id == imported.id
+                )
+            ).all()
+            == []
+        )
+        assert list_general_skills("tenant_demo", db, agent_id="agent_member") == []
         assert list_general_skills("tenant_demo", db) == []
 
 
-def test_reimport_restores_deleted_private_skill_binding() -> None:
+def test_reimport_updates_private_skill_in_place() -> None:
     with _test_session() as db:
         _seed_minimal_tenant(db)
         db.add(
             AgentProfile(
-                id="agent_overall", tenant_id="tenant_demo", name="整体智能体", is_overall=True
-            )
-        )
-        db.add(
-            AgentProfile(
-                id="agent_branch", tenant_id="tenant_demo", name="研发员工", is_overall=False
+                owner_user_id="user_admin",
+                id="agent_branch",
+                tenant_id="tenant_demo",
+                name="研发员工",
             )
         )
         db.commit()
@@ -427,53 +436,58 @@ def test_reimport_restores_deleted_private_skill_binding() -> None:
             db,
             _admin_user(),
         )
-        delete_general_skill(
-            imported.slug,
-            "tenant_demo",
-            db,
-            agent_id="agent_branch",
-            current_user=_admin_user(),
-        )
+        private_row = db.exec(select(GeneralSkill)).one()
+        assert private_row.scope == AGENT_SCOPE
+        assert private_row.owner_agent_id == "agent_branch"
 
-        restored = import_general_skill(
+        updated = import_general_skill(
             GeneralSkillImportRequest(
                 tenant_id="tenant_demo",
                 agent_id="agent_branch",
                 name="更新后的天气技能",
                 slug="weather-zh",
+                original_slug="weather-zh",
                 markdown=WEATHER_SKILL_MD.replace("中国城市天气查询工具", "更新后的天气工具"),
             ),
             db,
             _admin_user(),
         )
 
-        assert restored.id == imported.id
-        assert restored.slug == "weather-zh"
-        assert restored.name == "更新后的天气技能"
+        # 就地更新，绝不复制副本：id 稳定、库里只有一行。
+        assert updated.id == imported.id
+        assert updated.slug == "weather-zh"
+        assert updated.name == "更新后的天气技能"
+        assert len(db.exec(select(GeneralSkill)).all()) == 1
         assert [
             row.id for row in list_general_skills("tenant_demo", db, agent_id="agent_branch")
         ] == [imported.id]
 
 
-def test_private_skill_can_be_published_to_open_gallery() -> None:
+def test_admin_creates_gallery_general_skill_and_member_references_it() -> None:
     with _test_session() as db:
         _seed_minimal_tenant(db)
         db.add(
             AgentProfile(
-                id="agent_overall", tenant_id="tenant_demo", name="整体智能体", is_overall=True
+                owner_user_id="user_member",
+                id="agent_member",
+                tenant_id="tenant_demo",
+                name="研发员工",
             )
         )
         db.add(
-            AgentProfile(
-                id="agent_branch", tenant_id="tenant_demo", name="研发员工", is_overall=False
+            User(
+                id="user_member",
+                tenant_id="tenant_demo",
+                username="member",
+                password_hash="x",
             )
         )
         db.commit()
 
-        imported = import_general_skill(
+        # 广场资源由管理员直接创建，不属任何私人。
+        created = import_general_skill(
             GeneralSkillImportRequest(
                 tenant_id="tenant_demo",
-                agent_id="agent_branch",
                 name="天气技能",
                 slug="weather-zh",
                 markdown=WEATHER_SKILL_MD,
@@ -481,25 +495,28 @@ def test_private_skill_can_be_published_to_open_gallery() -> None:
             db,
             _admin_user(),
         )
-        published = publish_general_skill_to_gallery(
-            imported.slug,
-            "tenant_demo",
-            "agent_branch",
-            db,
-            _admin_user(),
-        )
+        gallery_row = db.exec(select(GeneralSkill)).one()
+        assert gallery_row.scope == GALLERY_SCOPE
+        assert gallery_row.owner_agent_id is None
+        assert list_general_skills("tenant_demo", db) == [created]
+        # 成员不引用就看不到广场技能。
+        assert list_general_skills("tenant_demo", db, agent_id="agent_member") == []
 
-        assert published.id == imported.id
-        assert list_general_skills("tenant_demo", db) == [published]
-        binding = db.exec(
-            select(AgentResourceBinding).where(
-                AgentResourceBinding.tenant_id == "tenant_demo",
-                AgentResourceBinding.agent_id == "agent_overall",
-                AgentResourceBinding.resource_type == "general_skill",
-                AgentResourceBinding.resource_id == imported.id,
-            )
-        ).one()
-        assert binding.status == "active"
+        # 引用 → 进入员工可见集；取消引用 → 消失，且广场技能本身还在。
+        assert reference_resource(
+            db, "tenant_demo", "agent_member", "general_skill", created.id, "user_member"
+        )
+        db.commit()
+        assert [
+            row.id for row in list_general_skills("tenant_demo", db, agent_id="agent_member")
+        ] == [created.id]
+
+        assert unreference_resource(
+            db, "tenant_demo", "agent_member", "general_skill", created.id
+        )
+        db.commit()
+        assert list_general_skills("tenant_demo", db, agent_id="agent_member") == []
+        assert db.get(GeneralSkill, created.id) is not None
 
 
 def test_import_general_skill_folder_reads_skill_md_metadata() -> None:
@@ -982,11 +999,6 @@ def test_general_skill_archive_publish_and_delete_api(monkeypatch) -> None:
     with _test_session() as db:
         _seed_minimal_tenant(db)
         db.add(
-            AgentProfile(
-                id="agent_overall", tenant_id="tenant_demo", name="开放广场", is_overall=True
-            )
-        )
-        db.add(
             ModelConfig(
                 id="model_selected",
                 tenant_id="tenant_demo",
@@ -1072,10 +1084,10 @@ def test_general_skill_archive_publish_and_delete_api(monkeypatch) -> None:
             imported.slug,
             "tenant_demo",
             db,
-            agent_id="agent_overall",
+            agent_id=None,
             current_user=_admin_user(),
         )
-        assert deleted == {"status": "hidden", "slug": "weather-zh"}
+        assert deleted == {"status": "deleted", "slug": "weather-zh"}
         assert list_general_skills("tenant_demo", db) == []
         try:
             get_general_skill(imported.slug, "tenant_demo", db)
@@ -1140,10 +1152,10 @@ async def test_general_skill_stream_executes_through_forced_harness_v2(monkeypat
         _seed_minimal_tenant(db)
         db.add(
             AgentProfile(
-                id="agent_overall",
+                owner_user_id="user_admin",
+                id="agent_demo",
                 tenant_id="tenant_demo",
-                name="开放广场",
-                is_overall=True,
+                name="研发员工",
             )
         )
         db.commit()
@@ -1158,11 +1170,16 @@ async def test_general_skill_stream_executes_through_forced_harness_v2(monkeypat
             db,
             _admin_user(),
         )
+        # 广场技能必须先被该员工引用，才进入它的可见集（引用而非复制）。
+        assert reference_resource(
+            db, "tenant_demo", "agent_demo", "general_skill", imported.id, "user_admin"
+        )
+        db.commit()
         response = run_general_skill_stream(
             imported.slug,
             GeneralSkillRunRequest(
                 tenant_id="tenant_demo",
-                agent_id="agent_overall",
+                agent_id="agent_demo",
                 user_id="user_demo",
                 query="北京天气",
             ),
@@ -1187,17 +1204,15 @@ async def test_general_skill_stream_executes_through_forced_harness_v2(monkeypat
     assert '"path": "weather.txt"' in body
 
 
-def test_non_overall_agent_delete_hides_general_skill_only_in_branch() -> None:
+def test_member_unreferencing_gallery_general_skill_keeps_it_in_gallery() -> None:
     with _test_session() as db:
         _seed_minimal_tenant(db)
         db.add(
             AgentProfile(
-                id="agent_overall", tenant_id="tenant_demo", name="整体智能体", is_overall=True
-            )
-        )
-        db.add(
-            AgentProfile(
-                id="agent_branch", tenant_id="tenant_demo", name="客服分支", is_overall=False
+                owner_user_id="user_admin",
+                id="agent_branch",
+                tenant_id="tenant_demo",
+                name="客服分支",
             )
         )
         imported = import_general_skill(
@@ -1212,7 +1227,16 @@ def test_non_overall_agent_delete_hides_general_skill_only_in_branch() -> None:
         )
         db.commit()
 
-        deleted = delete_general_skill(
+        # 先引用才看得到；停用 = 取消引用（删行），不改广场资源本身。
+        assert reference_resource(
+            db, "tenant_demo", "agent_branch", "general_skill", imported.id, "user_admin"
+        )
+        db.commit()
+        assert [
+            row.slug for row in list_general_skills("tenant_demo", db, agent_id="agent_branch")
+        ] == ["weather-zh"]
+
+        archived = archive_general_skill(
             imported.slug,
             "tenant_demo",
             db,
@@ -1220,12 +1244,11 @@ def test_non_overall_agent_delete_hides_general_skill_only_in_branch() -> None:
             current_user=_admin_user(),
         )
 
-        assert deleted == {"status": "hidden", "slug": "weather-zh"}
-        assert get_general_skill(imported.slug, "tenant_demo", db).slug == "weather-zh"
+        assert archived.slug == "weather-zh"
         assert list_general_skills("tenant_demo", db, agent_id="agent_branch") == []
-        assert (
-            list_general_skills("tenant_demo", db, agent_id="agent_overall")[0].slug == "weather-zh"
-        )
+        # 广场技能仍在，其他使用者不受影响：不带 agent_id 就是广场视角。
+        assert get_general_skill(imported.slug, "tenant_demo", db).slug == "weather-zh"
+        assert list_general_skills("tenant_demo", db)[0].slug == "weather-zh"
 
 
 def test_scene_layer_prompt_contract_mentions_general_skill_tools() -> None:

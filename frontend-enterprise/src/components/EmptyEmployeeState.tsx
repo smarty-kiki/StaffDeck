@@ -28,7 +28,7 @@ export default function EmptyEmployeeState({
         <p className="mt-[10px] text-[14px] leading-[22px] text-[#757f9c]">
           {isAdmin
             ? '创建你的第一位数字员工，为它配置知识库、技能与工具，即可开始接管对话与任务。'
-            : '当前还没有可管理的数字员工，创建一位或从开放广场复制已发布的配置作为起点。'}
+            : '当前还没有可管理的数字员工，创建一位，或前往开放广场选用已发布的员工。'}
         </p>
 
         <div className="mt-[28px] flex flex-wrap items-center justify-center gap-[12px]">

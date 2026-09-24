@@ -9,10 +9,9 @@ from app.api.agents import list_agents
 from app.api.knowledge_bases import list_knowledge_bases
 from app.db import staffdeck_seed
 from app.db.models import (
+    GALLERY_SCOPE,
     AgentProfile,
-    AgentResourceBinding,
-    AgentSkillBranch,
-    AgentSkillBranchVersion,
+    AgentResourceReference,
     KnowledgeBaseVersion,
     KnowledgeBucket,
     KnowledgeChunk,
@@ -77,11 +76,15 @@ def test_staffdeck_seed_reads_fixture_as_utf8(monkeypatch) -> None:
     monkeypatch.setattr(staffdeck_seed, "_seed_general_skills", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(staffdeck_seed, "_seed_tools", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(staffdeck_seed, "_seed_knowledge", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(staffdeck_seed, "_seed_agent_resource_bindings", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(staffdeck_seed, "_seed_skill_branches", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(staffdeck_seed, "_seed_knowledge_branches", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(staffdeck_seed, "_publish_gallery_resources", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(staffdeck_seed, "_sync_seed_agents_to_current_admin", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        staffdeck_seed, "_seed_agent_resource_references", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        staffdeck_seed, "_publish_gallery_resources", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        staffdeck_seed, "_sync_seed_agents_to_current_admin", lambda *_args, **_kwargs: None
+    )
 
     staffdeck_seed.seed_staffdeck_admin_gallery(_FlushOnlySession())
 
@@ -102,11 +105,6 @@ def test_expanded_staffdeck_skills_match_runtime_schema() -> None:
             len(EXPECTED_EXPANDED_EMPLOYEE_PROFILES) + len(curated_extra_skill_ids)
         )
         assert curated_extra_skill_ids <= {row["skill_id"] for row in rows}
-        for row in rows:
-            SkillCard.model_validate(row["content_json"])
-    for key in ("agent_skill_branches", "agent_skill_branch_versions"):
-        rows = data[key]
-        assert len(rows) == len(EXPECTED_EXPANDED_EMPLOYEE_PROFILES)
         for row in rows:
             SkillCard.model_validate(row["content_json"])
 
@@ -135,7 +133,7 @@ def test_staffdeck_seed_exposes_selected_agents_with_knowledge_bases() -> None:
             bound_count = sum(
                 1
                 for resource in agent.resources
-                if resource.resource_type == "knowledge_base" and resource.status == "active"
+                if resource.resource_type == "knowledge_base"
             )
             scoped_knowledge = list_knowledge_bases("tenant_demo", agent.id, db=db)
 
@@ -166,10 +164,9 @@ def test_staffdeck_seed_adds_expanded_employee_profiles_idempotently() -> None:
             assert row.metadata_json["managed_by_seed"] is True
 
             bindings = db.exec(
-                select(AgentResourceBinding).where(
-                    AgentResourceBinding.tenant_id == "tenant_demo",
-                    AgentResourceBinding.agent_id == row.id,
-                    AgentResourceBinding.status == "active",
+                select(AgentResourceReference).where(
+                    AgentResourceReference.tenant_id == "tenant_demo",
+                    AgentResourceReference.agent_id == row.id,
                 )
             ).all()
             assert sorted(binding.resource_type for binding in bindings) == [
@@ -185,43 +182,35 @@ def test_staffdeck_seed_adds_expanded_employee_profiles_idempotently() -> None:
             skill_id = next(
                 binding.resource_id for binding in bindings if binding.resource_type == "skill"
             )
-            assert len(
-                db.exec(
-                    select(KnowledgeBaseVersion).where(
-                        KnowledgeBaseVersion.knowledge_base_id == knowledge_base_id
-                    )
-                ).all()
-            ) == 1
+            assert (
+                len(
+                    db.exec(
+                        select(KnowledgeBaseVersion).where(
+                            KnowledgeBaseVersion.knowledge_base_id == knowledge_base_id
+                        )
+                    ).all()
+                )
+                == 1
+            )
             for model in (
                 KnowledgeDocument,
                 KnowledgeBucket,
                 KnowledgeChunk,
                 KnowledgeIngestJob,
             ):
-                assert len(
-                    db.exec(
-                        select(model).where(model.knowledge_base_id == knowledge_base_id)
-                    ).all()
-                ) == 1
+                assert (
+                    len(
+                        db.exec(
+                            select(model).where(model.knowledge_base_id == knowledge_base_id)
+                        ).all()
+                    )
+                    == 1
+                )
 
             skill = db.get(Skill, skill_id)
             assert skill is not None
-            assert len(
-                db.exec(
-                    select(AgentSkillBranch).where(
-                        AgentSkillBranch.agent_id == row.id,
-                        AgentSkillBranch.skill_id == skill.skill_id,
-                    )
-                ).all()
-            ) == 1
-            assert len(
-                db.exec(
-                    select(AgentSkillBranchVersion).where(
-                        AgentSkillBranchVersion.agent_id == row.id,
-                        AgentSkillBranchVersion.skill_id == skill.skill_id,
-                    )
-                ).all()
-            ) == 1
+            # 种子技能是广场共享资源：员工通过引用使用它，不复制副本、不建分支。
+            assert skill.scope == GALLERY_SCOPE
 
 
 def test_staffdeck_seed_applies_reliability_defaults_to_existing_rows() -> None:
@@ -276,9 +265,7 @@ def test_staffdeck_seed_uses_existing_admin_id_for_seeded_agents() -> None:
         ).all()
 
         assert len(rows) == len(EXPECTED_KNOWLEDGE_COUNTS)
-        assert {
-            row.metadata_json.get("owner_user_id") for row in rows
-        } == {"user_existing_admin"}
+        assert {row.metadata_json.get("owner_user_id") for row in rows} == {"user_existing_admin"}
 
 
 def test_staffdeck_seed_preserves_custom_avatar_on_restart() -> None:
@@ -331,13 +318,13 @@ def test_staffdeck_seed_does_not_overwrite_non_seed_employee_name_conflict() -> 
         )
         db.add(
             AgentProfile(
+                owner_user_id="user_custom",
                 id="agent_custom_it",
                 tenant_id="tenant_demo",
                 name="IT",
                 description="用户原有的 IT 员工",
                 status="active",
                 metadata_json={
-                    "owner_user_id": "user_custom",
                     "owner_username": "custom",
                     "created_by": "custom",
                 },
@@ -352,8 +339,18 @@ def test_staffdeck_seed_does_not_overwrite_non_seed_employee_name_conflict() -> 
 
         assert row is not None
         assert row.description == "用户原有的 IT 员工"
-        assert row.metadata_json.get("owner_user_id") == "user_custom"
+        # 归属是列：用户自建员工仍归 user_custom，种子不去改它。
+        assert row.owner_user_id == "user_custom"
         assert row.metadata_json.get("seed_source") is None
+
+        # 同名不再冲突：种子会另建一个归 admin 的 IT，两个 IT 并存。
+        it_rows = db.exec(
+            select(AgentProfile).where(
+                AgentProfile.tenant_id == "tenant_demo",
+                AgentProfile.name == "IT",
+            )
+        ).all()
+        assert {item.owner_user_id for item in it_rows} == {"user_custom", "admin"}
 
 
 def test_staffdeck_seed_archives_legacy_default_agent() -> None:
@@ -363,6 +360,7 @@ def test_staffdeck_seed_archives_legacy_default_agent() -> None:
         db.add(Tenant(id="tenant_demo", name="Demo Enterprise"))
         db.add(
             AgentProfile(
+                owner_user_id="admin",
                 id="agent_tenant_demo_default",
                 tenant_id="tenant_demo",
                 name="默认智能体",

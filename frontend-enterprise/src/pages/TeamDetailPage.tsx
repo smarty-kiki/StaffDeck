@@ -356,7 +356,7 @@ export default function TeamDetailPage({
 
   const candidateAgents = useMemo(() => {
     const memberIds = new Set((team?.members || []).map((member) => member.agent_id));
-    return agents.filter((agent) => !agent.is_overall && !memberIds.has(agent.id));
+    return agents.filter((agent) => !memberIds.has(agent.id));
   }, [agents, team]);
 
   async function addMember() {

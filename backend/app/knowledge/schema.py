@@ -24,12 +24,6 @@ class KnowledgeBaseUpdateRequest(BaseModel):
     metadata: Optional[dict[str, Any]] = None
 
 
-class KnowledgeBaseRollbackRequest(BaseModel):
-    tenant_id: str
-    agent_id: str
-    version: str
-
-
 class KnowledgeBaseRead(BaseModel):
     id: str
     tenant_id: str
@@ -38,9 +32,6 @@ class KnowledgeBaseRead(BaseModel):
     status: str
     capability_scope: CapabilityScope
     version: Optional[str] = None
-    branch_sync_state: Optional[str] = None
-    branch_base_version: Optional[str] = None
-    branch_head_version: Optional[str] = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     document_count: int = 0
     bucket_count: int = 0

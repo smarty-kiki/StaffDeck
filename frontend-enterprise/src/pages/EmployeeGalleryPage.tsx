@@ -17,6 +17,8 @@ import EmployeeProfileEditor from '../components/EmployeeProfileEditor';
 import TeamCard, { teamLeader } from '../components/TeamCard';
 import {
   canManageEmployeeAgent,
+  canPublishAgentToGallery,
+  canUnpublishAgent,
   employeeDisplayName,
   employeeDisplayNameWithCreator,
   employeeProfile,
@@ -180,20 +182,13 @@ export default function EmployeeGalleryPage({
 
   async function updateGalleryState(row: AgentProfileRead, published: boolean) {
     try {
-      const metadata: Record<string, unknown> = {
-        ...(row.metadata || {}),
-        published_to_gallery: published,
-        gallery_published_at: published ? new Date().toISOString() : undefined,
-        gallery_published_by: published ? currentUser?.username : undefined,
-      };
-      if (published) {
-        delete metadata.gallery_unpublished_at;
-        delete metadata.gallery_unpublished_by;
-      }
-      await api.put<AgentProfileRead>(`/api/enterprise/agents/${row.id}`, {
-        tenant_id: TENANT_ID,
-        metadata,
-      });
+      // 发布状态是 `agent_profiles.is_published` 这一列，改 metadata 不会再生效。
+      // 发布：仅归属人；下架：归属人或管理员。
+      const action = published ? 'gallery:publish' : 'gallery:unpublish';
+      await api.post<AgentProfileRead>(
+        `/api/enterprise/agents/${encodeURIComponent(row.id)}/${action}?tenant_id=${encodeURIComponent(TENANT_ID)}`,
+        {},
+      );
       notify.success(published ? '已发布到广场' : '已从广场下架');
       await load();
       window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));
@@ -314,8 +309,10 @@ export default function EmployeeGalleryPage({
               key={employee.id}
               employee={employee}
               busy={startingAgentId === employee.id}
+              // 编辑类操作限归属人；发布限归属人；下架归属人或管理员。
               canManage={canManageEmployeeAgent(employee, currentUser)}
-              showMenu={false}
+              canPublish={canPublishAgentToGallery(employee, currentUser)}
+              canUnpublish={canUnpublishAgent(employee, currentUser)}
               onOpen={() => void startEmployeeChat(employee)}
               onStatus={(status) => void updateStatus(employee, status)}
               onGallery={(published) => void updateGalleryState(employee, published)}
@@ -340,7 +337,6 @@ export default function EmployeeGalleryPage({
       <EmployeeProfileEditor
         agent={profileAgent}
         open={Boolean(profileAgent)}
-        currentUser={currentUser}
         onClose={() => setProfileAgent(null)}
         onSaved={updateAgentInList}
       />

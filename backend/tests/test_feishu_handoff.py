@@ -175,7 +175,7 @@ def test_assignee_prefers_step_assignee_user_id() -> None:
     engine = _test_engine()
     with Session(engine) as db:
         _seed_tenant(db)
-        db.add(AgentProfile(id="agent_demo", tenant_id="tenant_demo", name="IT"))
+        db.add(AgentProfile(owner_user_id="user_admin", id="agent_demo", tenant_id="tenant_demo", name="IT"))
         session = ChatSession(
             id="session_sop",
             tenant_id="tenant_demo",
@@ -208,7 +208,7 @@ def test_assignee_falls_back_to_binding_default() -> None:
     engine = _test_engine()
     with Session(engine) as db:
         _seed_tenant(db)
-        db.add(AgentProfile(id="agent_demo", tenant_id="tenant_demo", name="IT"))
+        db.add(AgentProfile(owner_user_id="user_admin", id="agent_demo", tenant_id="tenant_demo", name="IT"))
         session = ChatSession(
             id="session_binding",
             tenant_id="tenant_demo",
@@ -259,7 +259,7 @@ def test_assignee_skips_invalid_configured_users() -> None:
                 password_hash="x",
             )
         )
-        db.add(AgentProfile(id="agent_demo", tenant_id="tenant_demo", name="IT"))
+        db.add(AgentProfile(owner_user_id="user_admin", id="agent_demo", tenant_id="tenant_demo", name="IT"))
         session = ChatSession(
             id="session_invalid_assignee",
             tenant_id="tenant_demo",
@@ -296,7 +296,7 @@ def test_assignee_falls_back_to_owner_then_admin() -> None:
     engine = _test_engine()
     with Session(engine) as db:
         _seed_tenant(db)
-        db.add(AgentProfile(id="agent_demo", tenant_id="tenant_demo", name="IT"))
+        db.add(AgentProfile(owner_user_id="user_admin", id="agent_demo", tenant_id="tenant_demo", name="IT"))
         session = ChatSession(
             id="session_owner",
             tenant_id="tenant_demo",
@@ -329,7 +329,7 @@ def test_assignee_notify_channel_follows_selected_assignee() -> None:
     engine = _test_engine()
     with Session(engine) as db:
         _seed_tenant(db)
-        db.add(AgentProfile(id="agent_demo", tenant_id="tenant_demo", name="IT"))
+        db.add(AgentProfile(owner_user_id="user_admin", id="agent_demo", tenant_id="tenant_demo", name="IT"))
         db.commit()
 
         service = HumanHandoffService(db, FakeEvents())
@@ -401,7 +401,7 @@ def test_handoff_metadata_no_longer_contains_contact_target() -> None:
     engine = _test_engine()
     with Session(engine) as db:
         _seed_tenant(db)
-        db.add(AgentProfile(id="agent_demo", tenant_id="tenant_demo", name="IT"))
+        db.add(AgentProfile(owner_user_id="user_admin", id="agent_demo", tenant_id="tenant_demo", name="IT"))
         session = ChatSession(
             id="session_meta",
             tenant_id="tenant_demo",
@@ -1164,7 +1164,7 @@ def test_agent_loop_notify_routes_declared_channel_to_matching_binding() -> None
         wecom = _wecom_binding()
         db.add(feishu)
         db.add(wecom)
-        agent = AgentProfile(id="agent_demo", tenant_id="tenant_demo", name="demo", config_json={})
+        agent = AgentProfile(owner_user_id="user_admin", id="agent_demo", tenant_id="tenant_demo", name="demo", config_json={})
         db.add(agent)
         session = ChatSession(
             id="session_demo",
@@ -1207,7 +1207,7 @@ def test_agent_loop_notify_prefers_session_binding_when_channel_matches() -> Non
         wecom_other.external_account_key = "wecom:corp:10:corp_other:bot:5:bot_1"
         db.add(wecom_session)
         db.add(wecom_other)
-        agent = AgentProfile(id="agent_demo", tenant_id="tenant_demo", name="demo", config_json={})
+        agent = AgentProfile(owner_user_id="user_admin", id="agent_demo", tenant_id="tenant_demo", name="demo", config_json={})
         db.add(agent)
         session = ChatSession(
             id="session_demo",
@@ -1241,7 +1241,7 @@ def test_agent_loop_notify_skips_web_preference_and_missing_binding() -> None:
     engine = _test_engine()
     with Session(engine) as db:
         _seed_tenant(db)
-        agent = AgentProfile(id="agent_demo", tenant_id="tenant_demo", name="demo", config_json={})
+        agent = AgentProfile(owner_user_id="user_admin", id="agent_demo", tenant_id="tenant_demo", name="demo", config_json={})
         db.add(agent)
         session = ChatSession(
             id="session_demo",
@@ -1279,7 +1279,7 @@ def test_agent_loop_notify_default_uses_session_binding_when_supported() -> None
         _seed_tenant(db)
         wecom = _wecom_binding()
         db.add(wecom)
-        agent = AgentProfile(id="agent_demo", tenant_id="tenant_demo", name="demo", config_json={})
+        agent = AgentProfile(owner_user_id="user_admin", id="agent_demo", tenant_id="tenant_demo", name="demo", config_json={})
         db.add(agent)
         session = ChatSession(
             id="session_demo",
@@ -1764,7 +1764,7 @@ def test_process_inbound_quote_reply_without_prefix_answers_handoff(monkeypatch)
         binding = _feishu_binding()
         db.add(binding)
         db.add(_channel_identity(external_user_id="ou_assignee"))
-        db.add(AgentProfile(id="agent_demo", tenant_id="tenant_demo", name="数字员工A"))
+        db.add(AgentProfile(owner_user_id="user_admin", id="agent_demo", tenant_id="tenant_demo", name="数字员工A"))
         session = ChatSession(
             id="session_demo",
             tenant_id="tenant_demo",
@@ -1865,7 +1865,7 @@ def test_process_inbound_quote_reply_to_answered_notice_consumes_without_new_ses
         binding = _feishu_binding()
         db.add(binding)
         db.add(_channel_identity(external_user_id="ou_assignee"))
-        db.add(AgentProfile(id="agent_demo", tenant_id="tenant_demo", name="数字员工A"))
+        db.add(AgentProfile(owner_user_id="user_admin", id="agent_demo", tenant_id="tenant_demo", name="数字员工A"))
         session = ChatSession(
             id="session_demo",
             tenant_id="tenant_demo",

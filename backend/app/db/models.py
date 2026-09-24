@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Any, Optional
 from uuid import uuid4
 
-from sqlalchemy import JSON, Column, Index, Integer, UniqueConstraint
+from sqlalchemy import JSON, CheckConstraint, Column, Index, Integer, UniqueConstraint, text
 from sqlmodel import Field, SQLModel
 
 
@@ -14,6 +14,49 @@ def utc_now() -> datetime:
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex[:16]}"
+
+
+# ---------------------------------------------------------------------------
+# 资源归属模型常量
+# ---------------------------------------------------------------------------
+# 每个资源（skills / knowledge_bases / general_skills / tools）有且只有一个归属：
+#   scope='agent'   -> owner_agent_id 必填（私有资源，归属某数字员工）
+#   scope='gallery' -> owner_agent_id 为 NULL（广场共享资源，仅管理员可写）
+AGENT_SCOPE = "agent"
+GALLERY_SCOPE = "gallery"
+
+
+def _resource_scope_check(table_name: str) -> CheckConstraint:
+    """scope 与 owner_agent_id 是同一事实的两种表达，必须互锁。"""
+    return CheckConstraint(
+        "(scope = 'agent' AND owner_agent_id IS NOT NULL) "
+        "OR (scope = 'gallery' AND owner_agent_id IS NULL)",
+        name=f"ck_{table_name}_scope_owner",
+    )
+
+
+def _agent_resource_indexes(table_name: str, business_key: str) -> tuple[Index, Index]:
+    """私有资源按「员工内唯一」，广场资源按「租户内唯一」。
+
+    SQLite 中 NULL 互不相等，因此必须用 partial index 而非复合唯一约束。
+    """
+    return (
+        Index(
+            f"uq_{table_name}_tenant_owner_{business_key}",
+            "tenant_id",
+            "owner_agent_id",
+            business_key,
+            unique=True,
+            sqlite_where=text(f"scope = '{AGENT_SCOPE}'"),
+        ),
+        Index(
+            f"uq_{table_name}_tenant_gallery_{business_key}",
+            "tenant_id",
+            business_key,
+            unique=True,
+            sqlite_where=text(f"scope = '{GALLERY_SCOPE}'"),
+        ),
+    )
 
 
 class Tenant(SQLModel, table=True):
@@ -375,11 +418,17 @@ class APIAuditLog(SQLModel, table=True):
 
 class Skill(SQLModel, table=True):
     __tablename__ = "skills"
-    __table_args__ = (UniqueConstraint("tenant_id", "skill_id", name="uq_skill_tenant_skill_id"),)
+    __table_args__ = (
+        *_agent_resource_indexes("skills", "skill_id"),
+        _resource_scope_check("skills"),
+    )
 
     id: str = Field(default_factory=lambda: new_id("skill"), primary_key=True)
     tenant_id: str = Field(index=True)
     skill_id: str = Field(index=True)
+    scope: str = Field(default=AGENT_SCOPE)
+    owner_agent_id: Optional[str] = Field(default=None, index=True)
+    created_by_user_id: Optional[str] = Field(default=None)
     version: str = "1.0.0"
     name: str
     business_domain: Optional[str] = None
@@ -407,55 +456,25 @@ class SkillVersion(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
-class AgentSkillBranch(SQLModel, table=True):
-    __tablename__ = "agent_skill_branches"
-    __table_args__ = (
-        UniqueConstraint("tenant_id", "agent_id", "skill_id", name="uq_agent_skill_branch"),
-    )
-
-    id: str = Field(default_factory=lambda: new_id("agentbranch"), primary_key=True)
-    tenant_id: str = Field(index=True)
-    agent_id: str = Field(index=True)
-    skill_id: str = Field(index=True)
-    source_skill_id: str = Field(index=True)
-    base_version: str = "1.0.0"
-    head_version: str = "1.0.0"
-    content_json: dict[str, Any] = Field(sa_column=Column(JSON, nullable=False))
-    status: str = Field(default="active", index=True)
-    sync_state: str = Field(default="synced", index=True)
-    metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
-    created_at: datetime = Field(default_factory=utc_now)
-    updated_at: datetime = Field(default_factory=utc_now)
-
-
-class AgentSkillBranchVersion(SQLModel, table=True):
-    __tablename__ = "agent_skill_branch_versions"
-    __table_args__ = (
-        UniqueConstraint("tenant_id", "agent_id", "skill_id", "version", name="uq_agent_skill_branch_version"),
-    )
-
-    id: str = Field(default_factory=lambda: new_id("agentbranchver"), primary_key=True)
-    tenant_id: str = Field(index=True)
-    agent_id: str = Field(index=True)
-    skill_id: str = Field(index=True)
-    source_skill_id: str = Field(index=True)
-    version: str = Field(index=True)
-    base_version: str = "1.0.0"
-    content_json: dict[str, Any] = Field(sa_column=Column(JSON, nullable=False))
-    status: str = Field(default="active", index=True)
-    sync_state: str = Field(default="diverged", index=True)
-    change_summary: Optional[str] = None
-    created_at: datetime = Field(default_factory=utc_now)
-    updated_at: datetime = Field(default_factory=utc_now)
-
-
+# ---------------------------------------------------------------------------
+# 过渡期遗留表（第二阶段删除）
+# ---------------------------------------------------------------------------
+# 这三张表存在的唯一理由是「让共享资源能被每个员工独立改写」——即复制而非引用。
+# 新模型下资源有明确归属（scope/owner_agent_id），分支概念整体消失。
+# 保留表结构是为了让过渡期代码仍可 import；读路径已不再使用它们。
 class GeneralSkill(SQLModel, table=True):
     __tablename__ = "general_skills"
-    __table_args__ = (UniqueConstraint("tenant_id", "slug", name="uq_general_skill_tenant_slug"),)
+    __table_args__ = (
+        *_agent_resource_indexes("general_skills", "slug"),
+        _resource_scope_check("general_skills"),
+    )
 
     id: str = Field(default_factory=lambda: new_id("genskill"), primary_key=True)
     tenant_id: str = Field(index=True)
     slug: str = Field(index=True)
+    scope: str = Field(default=AGENT_SCOPE)
+    owner_agent_id: Optional[str] = Field(default=None, index=True)
+    created_by_user_id: Optional[str] = Field(default=None)
     name: str
     description: Optional[str] = None
     homepage: Optional[str] = None
@@ -472,10 +491,16 @@ class GeneralSkill(SQLModel, table=True):
 
 class KnowledgeBase(SQLModel, table=True):
     __tablename__ = "knowledge_bases"
-    __table_args__ = (UniqueConstraint("tenant_id", "name", name="uq_knowledge_base_tenant_name"),)
+    __table_args__ = (
+        *_agent_resource_indexes("knowledge_bases", "name"),
+        _resource_scope_check("knowledge_bases"),
+    )
 
     id: str = Field(default_factory=lambda: new_id("kb"), primary_key=True)
     tenant_id: str = Field(index=True)
+    scope: str = Field(default=AGENT_SCOPE)
+    owner_agent_id: Optional[str] = Field(default=None, index=True)
+    created_by_user_id: Optional[str] = Field(default=None)
     name: str
     description: Optional[str] = None
     status: str = Field(default="active", index=True)
@@ -499,25 +524,6 @@ class KnowledgeBaseVersion(SQLModel, table=True):
     description: Optional[str] = None
     status: str = Field(default="active", index=True)
     capability_scope: str = Field(default="general", index=True)
-    metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
-    created_at: datetime = Field(default_factory=utc_now)
-    updated_at: datetime = Field(default_factory=utc_now)
-
-
-class AgentKnowledgeBranch(SQLModel, table=True):
-    __tablename__ = "agent_knowledge_branches"
-    __table_args__ = (
-        UniqueConstraint("tenant_id", "agent_id", "knowledge_base_id", name="uq_agent_knowledge_branch"),
-    )
-
-    id: str = Field(default_factory=lambda: new_id("agentkb"), primary_key=True)
-    tenant_id: str = Field(index=True)
-    agent_id: str = Field(index=True)
-    knowledge_base_id: str = Field(index=True)
-    base_version: str = "1.0.0"
-    head_version: str = "1.0.0"
-    status: str = Field(default="active", index=True)
-    sync_state: str = Field(default="synced", index=True)
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
@@ -718,15 +724,33 @@ class UIConfig(SQLModel, table=True):
 
 
 class AgentProfile(SQLModel, table=True):
+    """数字员工。
+
+    员工名按 owner_user_id 唯一 —— 不同作者可建同名员工（广场里靠创建人区分）；
+    `is_published` 表达「已发布到广场」。
+
+    这里**没有**「广场孪生员工」：广场资源由资源表自己的 `scope='gallery'` 表达
+    （见 AGENT_SCOPE / GALLERY_SCOPE），一张 agent_profiles 里的记录永远是某个人
+    的真实员工，`owner_user_id` 必非空。
+    """
+
     __tablename__ = "agent_profiles"
-    __table_args__ = (UniqueConstraint("tenant_id", "name", name="uq_agent_profile_tenant_name"),)
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "owner_user_id", "name", name="uq_agent_profile_tenant_owner_name"
+        ),
+        Index("ix_agent_profiles_tenant_published", "tenant_id", "is_published"),
+    )
 
     id: str = Field(default_factory=lambda: new_id("agent"), primary_key=True)
     tenant_id: str = Field(index=True)
+    owner_user_id: str = Field(index=True)
     name: str
     description: Optional[str] = None
     persona_prompt: Optional[str] = None
-    is_overall: bool = Field(default=False, index=True)
+    is_published: bool = Field(default=False)
+    published_at: Optional[datetime] = None
+    published_by: Optional[str] = None
     status: str = Field(default="active", index=True)
     harness_max_actions: int = Field(default=32)
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
@@ -764,30 +788,53 @@ class AgentModelBinding(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
-class AgentResourceBinding(SQLModel, table=True):
-    __tablename__ = "agent_resource_bindings"
+class AgentResourceReference(SQLModel, table=True):
+    """员工对「广场共享资源」的引用。
+
+    语义：引用 = 插入一行；取消引用 = 删除该行。没有 status，没有中间状态。
+    只对 scope='gallery' 的资源建行 —— 私有资源「归属即生效」，不产生引用行。
+    """
+
+    __tablename__ = "agent_resource_references"
     __table_args__ = (
-        UniqueConstraint("tenant_id", "agent_id", "resource_type", "resource_id", name="uq_agent_resource"),
+        UniqueConstraint(
+            "tenant_id",
+            "agent_id",
+            "resource_type",
+            "resource_id",
+            name="uq_agent_resource_reference",
+        ),
+        Index(
+            "ix_agent_resource_references_resource",
+            "tenant_id",
+            "resource_type",
+            "resource_id",
+        ),
     )
 
-    id: str = Field(default_factory=lambda: new_id("agentres"), primary_key=True)
+    id: str = Field(default_factory=lambda: new_id("agentref"), primary_key=True)
     tenant_id: str = Field(index=True)
     agent_id: str = Field(index=True)
     resource_type: str = Field(index=True)
     resource_id: str = Field(index=True)
-    status: str = Field(default="active", index=True)
-    metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    created_by_user_id: Optional[str] = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
 
 class Tool(SQLModel, table=True):
     __tablename__ = "tools"
-    __table_args__ = (UniqueConstraint("tenant_id", "name", name="uq_tool_tenant_name"),)
+    __table_args__ = (
+        *_agent_resource_indexes("tools", "name"),
+        _resource_scope_check("tools"),
+    )
 
     id: str = Field(default_factory=lambda: new_id("tool"), primary_key=True)
     tenant_id: str = Field(index=True)
     name: str = Field(index=True)
+    scope: str = Field(default=AGENT_SCOPE)
+    owner_agent_id: Optional[str] = Field(default=None, index=True)
+    created_by_user_id: Optional[str] = Field(default=None)
     display_name: Optional[str] = None
     description: Optional[str] = None
     bucket: str = Field(default="未分桶", index=True)

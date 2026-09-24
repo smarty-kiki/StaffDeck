@@ -9,8 +9,9 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Res
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
+from app.api.agents import purge_agent
 from app.db import get_session
-from app.db.models import APIClient, APICredential, User, UserAvatar, utc_now
+from app.db.models import APIClient, APICredential, AgentProfile, User, UserAvatar, utc_now
 from app.public_api.auth import generate_api_key
 from app.public_api.credential_profiles import USER_FULL_ACCESS_SCOPES
 from app.security.auth import (
@@ -22,6 +23,7 @@ from app.security.auth import (
 )
 from app.security.permissions import MEMBER_ROLE, is_admin_user
 from app.security.tenant import ensure_tenant
+from app.session.cleanup import remove_chat_session_workspace
 
 logger = logging.getLogger(__name__)
 
@@ -463,8 +465,20 @@ def delete_user(
     avatar = db.get(UserAvatar, user_id)
     if avatar:
         db.delete(avatar)
+    # 归属级联:账号注销 → 其创建的全部数字员工一并删除,员工的私有资源(知识库/
+    # 技能/SOP/工具)随之清理。广场共享资源 `owner_agent_id IS NULL`,不受影响。
+    workspace_keys: list[tuple[str, str]] = []
+    for agent in db.exec(
+        select(AgentProfile).where(
+            AgentProfile.tenant_id == tenant_id,
+            AgentProfile.owner_user_id == user.id,
+        )
+    ).all():
+        workspace_keys.extend(purge_agent(db, tenant_id, agent))
     db.delete(user)
     db.commit()
+    for session_tenant_id, session_id in workspace_keys:
+        remove_chat_session_workspace(tenant_id=session_tenant_id, session_id=session_id, db=db)
     return {"ok": True}
 
 

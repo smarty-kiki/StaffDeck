@@ -2629,7 +2629,7 @@ def _ensure_chat_agent_available(
         raise HTTPException(status_code=400, detail="Agent is required")
     ensure_tenant(db, tenant_id)
     row = db.get(AgentProfile, agent_id)
-    if not row or row.tenant_id != tenant_id or row.status != "active" or row.is_overall:
+    if not row or row.tenant_id != tenant_id or row.status != "active":
         raise HTTPException(status_code=404, detail="Agent not available")
     if not _chat_agent_visible_to_user(row, current_user):
         raise HTTPException(status_code=403, detail="Agent not available")
@@ -3376,8 +3376,8 @@ def _ensure_request_tenant(tenant_id: str, current_user: User) -> None:
 def _chat_agent_visible_to_user(row: AgentProfile, user: User) -> bool:
     if is_admin_user(user):
         return True
-    metadata = row.metadata_json or {}
-    return agent_owned_by_user(row, user) or metadata.get("published_to_gallery") is True
+    # 发布状态已进列：`is_published` 取代 metadata_json.published_to_gallery。
+    return agent_owned_by_user(row, user) or bool(row.is_published)
 
 
 def _normalize_title(value: str | None) -> str | None:

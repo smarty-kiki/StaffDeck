@@ -8,7 +8,7 @@ import pytest
 from app.agents.branching import ensure_private_resource_binding
 from app.tools.tool_executor import ToolExecutor
 from app.tools.tool_schema import ToolCall
-from app.db.models import A2ATaskEvent, A2ATaskRun, AgentProfile, MCPServer, Tenant, Tool
+from app.db.models import GALLERY_SCOPE, A2ATaskEvent, A2ATaskRun, AgentProfile, MCPServer, Tenant, Tool
 from app.security.internal_service import INTERNAL_SERVICE_HEADER, internal_service_token
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
@@ -94,9 +94,9 @@ def test_internal_mock_request_adds_service_token_only_for_configured_origin() -
 def test_execute_rejects_tool_not_bound_to_current_employee() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        owner = AgentProfile(id="agent_owner", tenant_id="tenant_demo", name="员工 A")
-        other = AgentProfile(id="agent_other", tenant_id="tenant_demo", name="员工 B")
-        tool = Tool(
+        owner = AgentProfile(owner_user_id="user_admin", id="agent_owner", tenant_id="tenant_demo", name="员工 A")
+        other = AgentProfile(owner_user_id="user_admin", id="agent_other", tenant_id="tenant_demo", name="员工 B")
+        tool = Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
             id="tool_private",
             tenant_id="tenant_demo",
             name="private.lookup",
@@ -131,7 +131,7 @@ def test_execute_builtin_mcp_tool_success() -> None:
             )
         )
         db.add(
-            Tool(
+            Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
                 tenant_id="tenant_demo",
                 name="mcp.demo_echo",
                 display_name="MCP Demo Echo",
@@ -160,14 +160,14 @@ def test_execution_policy_uses_tool_timeout_and_falls_back_for_invalid_values() 
     executor = object.__new__(ToolExecutor)
     executor.settings = type("Settings", (), {"tool_timeout_seconds": 8.0})()
 
-    configured = Tool(
+    configured = Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
         tenant_id="tenant_demo",
         name="slow.lookup",
         method="POST",
         url="https://example.test/slow",
         config_json={"execution": {"timeout_seconds": 20}},
     )
-    invalid = Tool(
+    invalid = Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
         tenant_id="tenant_demo",
         name="bad.lookup",
         method="POST",
@@ -206,7 +206,7 @@ def test_execute_http_tool_passes_configured_timeout_to_client(monkeypatch) -> N
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.add(
-            Tool(
+            Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
                 tenant_id="tenant_demo",
                 name="slow.lookup",
                 method="POST",
@@ -250,7 +250,7 @@ def test_execute_a2a_tool_sends_standard_send_message_request(monkeypatch) -> No
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.add(
-            Tool(
+            Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
                 tenant_id="tenant_demo",
                 name="a2a.finance",
                 tool_type="a2a",
@@ -338,7 +338,7 @@ def test_execute_a2a_waits_for_working_task_and_persists_lifecycle(monkeypatch) 
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.add(
-            Tool(
+            Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
                 id="tool_a2a_wait",
                 tenant_id="tenant_demo",
                 name="a2a.wait",
@@ -410,7 +410,7 @@ def test_execute_a2a_same_invocation_returns_persisted_result_without_resending(
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.add(
-            Tool(
+            Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
                 id="tool_a2a_idempotent",
                 tenant_id="tenant_demo",
                 name="a2a.idempotent",
@@ -474,7 +474,7 @@ def test_execute_a2a_same_invocation_resumes_remote_working_task(monkeypatch) ->
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.add(
-            Tool(
+            Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
                 id="tool_a2a_recover",
                 tenant_id="tenant_demo",
                 name="a2a.recover",
@@ -562,7 +562,7 @@ def test_execute_a2a_continues_input_required_task_in_same_session(monkeypatch) 
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.add(
-            Tool(
+            Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
                 id="tool_a2a_continue",
                 tenant_id="tenant_demo",
                 name="a2a.continue",
@@ -666,7 +666,7 @@ def test_execute_a2a_stream_merges_artifact_before_terminal_status(monkeypatch) 
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.add(
-            Tool(
+            Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
                 tenant_id="tenant_demo",
                 name="a2a.stream",
                 tool_type="a2a",
@@ -704,7 +704,7 @@ def test_execute_mcp_tool_passes_configured_timeout(monkeypatch) -> None:
             )
         )
         db.add(
-            Tool(
+            Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
                 tenant_id="tenant_demo",
                 name="mcp.timeout.echo",
                 tool_type="mcp",
@@ -737,7 +737,7 @@ def test_execute_builtin_mcp_tool_unknown_config_returns_error() -> None:
             )
         )
         db.add(
-            Tool(
+            Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
                 tenant_id="tenant_demo",
                 name="mcp.bad",
                 display_name="Bad MCP",
@@ -775,7 +775,7 @@ def test_execute_stdio_mcp_tool_success() -> None:
             )
         )
         db.add(
-            Tool(
+            Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
                 tenant_id="tenant_demo",
                 name="mcp.real_echo",
                 display_name="Real MCP Echo",
@@ -814,7 +814,7 @@ def test_execute_stdio_mcp_tool_error_is_stable() -> None:
             )
         )
         db.add(
-            Tool(
+            Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
                 tenant_id="tenant_demo",
                 name="mcp.real_sum",
                 display_name="Real MCP Sum",
@@ -864,7 +864,7 @@ def test_execute_get_tool_preserves_query_string_when_arguments_empty(monkeypatc
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.add(
-            Tool(
+            Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
                 tenant_id="tenant_demo",
                 name="weather.forecast",
                 display_name="天气查询",

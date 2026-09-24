@@ -332,9 +332,6 @@ def _can_view_all_agent_sessions(
     agent = db.get(AgentProfile, agent_id)
     if not agent or agent.tenant_id != tenant_id:
         raise HTTPException(status_code=404, detail="Agent not found")
-    if agent.is_overall:
-        # is_overall 员工只有 admin 可看全部，创建者永不匹配
-        return False
     return agent_owned_by_user(agent, current_user)
 
 
@@ -354,7 +351,6 @@ def _get_visible_chat_session(
     if (
         agent
         and agent.tenant_id == tenant_id
-        and not agent.is_overall
         and agent_owned_by_user(agent, current_user)
     ):
         return row

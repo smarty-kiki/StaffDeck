@@ -15,6 +15,7 @@ from app.api.external_business_tasks import (
     get_external_business_task,
 )
 from app.db.models import (
+    GALLERY_SCOPE,
     ChatSession,
     ExternalBusinessTask,
     ExternalBusinessTaskEvent,
@@ -543,7 +544,7 @@ def _seed(db: Session) -> tuple[User, Tool]:
     user = User(
         id="user_owner", tenant_id="tenant_demo", username="owner", password_hash="x"
     )
-    tool = Tool(
+    tool = Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
         id="tool_detached",
         tenant_id="tenant_demo",
         name="orders.submit",

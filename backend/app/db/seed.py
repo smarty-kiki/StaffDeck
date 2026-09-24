@@ -9,6 +9,7 @@ from app import paths
 from app.agents.branching import ensure_open_gallery_binding
 from app.config import get_settings
 from app.db.models import (
+    GALLERY_SCOPE,
     AgentProfile,
     GeneralSkill,
     MCPServer,
@@ -20,10 +21,9 @@ from app.db.models import (
     User,
     utc_now,
 )
-from app.security.encryption import encrypt_secret
-from app.security.auth import hash_password
 from app.db.staffdeck_seed import seed_staffdeck_admin_gallery
-
+from app.security.auth import hash_password
+from app.security.encryption import encrypt_secret
 
 ADAPTIVE_FLOW_RULE = (
     "步骤是可自适应推进的目标，不是固定问答脚本；已由当前用户消息、历史信息或路由意图满足的内容"
@@ -903,7 +903,9 @@ def _seed_mcp_servers(session: Session) -> None:
                 "enabled": True,
             }
             if not tool:
-                session.add(Tool(tenant_id="tenant_demo", name=scoped_name, **payload))
+                session.add(
+                    Tool(tenant_id="tenant_demo", scope=GALLERY_SCOPE, name=scoped_name, **payload)
+                )
             else:
                 for key, value in payload.items():
                     setattr(tool, key, value)
@@ -955,8 +957,6 @@ def seed_demo_data(session: Session) -> None:
         admin_user.updated_at = utc_now()
         session.add(admin_user)
 
-    _ensure_seed_agents(session)
-
     for raw_content in (
         REFUND_SKILL,
         EXCHANGE_SKILL,
@@ -974,6 +974,7 @@ def seed_demo_data(session: Session) -> None:
             session.add(
                 Skill(
                     tenant_id="tenant_demo",
+                    scope=GALLERY_SCOPE,
                     skill_id=content["skill_id"],
                     version=content["version"],
                     name=content["name"],
@@ -992,7 +993,7 @@ def seed_demo_data(session: Session) -> None:
             select(Tool).where(Tool.tenant_id == "tenant_demo", Tool.name == tool_config["name"])
         ).first()
         if not tool:
-            session.add(Tool(tenant_id="tenant_demo", **tool_config))
+            session.add(Tool(tenant_id="tenant_demo", scope=GALLERY_SCOPE, **tool_config))
         else:
             tool.bucket = tool_config.get("bucket") or tool.bucket or "未分桶"
             tool.display_name = tool_config.get("display_name") or tool.display_name
@@ -1061,11 +1062,6 @@ def _publish_seeded_system_resources(session: Session) -> None:
     tenant_id = "tenant_demo"
     creator_metadata = _system_seed_metadata()
 
-    overall = session.get(AgentProfile, f"agent_{tenant_id}_overall")
-    if overall:
-        overall.metadata_json = _system_seed_metadata(overall.metadata_json or {})
-        session.add(overall)
-
     _archive_seed_default_agent(session, tenant_id)
 
     seeded_skill_ids = {
@@ -1118,26 +1114,6 @@ def _publish_seeded_system_resources(session: Session) -> None:
             weather.id,
             "active" if weather.status == "published" else "inactive",
             metadata_json=creator_metadata,
-        )
-
-
-def _ensure_seed_agents(session: Session) -> None:
-    tenant_id = "tenant_demo"
-    for agent_id, name, description, is_overall in (
-        (f"agent_{tenant_id}_overall", "整体智能体", "全局资源池", True),
-    ):
-        existing = session.get(AgentProfile, agent_id)
-        if existing:
-            continue
-        session.add(
-            AgentProfile(
-                id=agent_id,
-                tenant_id=tenant_id,
-                name=name,
-                description=description,
-                is_overall=is_overall,
-                status="active",
-            )
         )
 
 
@@ -1245,6 +1221,7 @@ def _seed_weather_general_skill(session: Session) -> None:
     session.add(
         GeneralSkill(
             tenant_id="tenant_demo",
+            scope=GALLERY_SCOPE,
             slug=slug,
             name="中国城市天气",
             description="中国城市天气查询工具",

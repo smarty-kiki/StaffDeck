@@ -7,6 +7,7 @@ import zipfile
 from collections.abc import Iterator
 from io import BytesIO
 from time import sleep
+from typing import Any
 from xml.etree import ElementTree
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -14,20 +15,15 @@ from fastapi.responses import StreamingResponse
 from sqlmodel import Session, select
 
 from app.agents.branching import (
-    branch_versions,
-    ensure_agent_skill_branch,
     ensure_open_gallery_binding,
     ensure_private_resource_binding,
+    ensure_visible_name_unique,
     get_agent,
-    hide_open_gallery_binding,
-    is_bound_resource_visible_for_agent,
-    is_open_gallery_resource,
     mark_resource_open_gallery,
-    project_skill_with_branch,
-    require_overall_agent,
-    rollback_branch,
-    update_branch_skill,
+    purge_resource_references,
+    resource_creator_metadata,
     user_creator_metadata,
+    visible_general_skill_rows,
     visible_knowledge_base_versions,
     visible_skill_rows,
     visible_tool_rows,
@@ -35,9 +31,9 @@ from app.agents.branching import (
 from app.async_jobs import enqueue_async_job
 from app.db import get_session
 from app.db.models import (
+    AGENT_SCOPE,
+    GALLERY_SCOPE,
     AgentEvent,
-    AgentResourceBinding,
-    AgentSkillBranchVersion,
     ChannelBinding,
     ChannelIdentity,
     GeneralSkill,
@@ -49,16 +45,23 @@ from app.db.models import (
     User,
     utc_now,
 )
-from app.llm.model_config_resolver import resolve_model_config_for_runtime
 from app.llm import LLMError
+from app.llm.model_config_resolver import resolve_model_config_for_runtime
 from app.security.auth import ensure_current_user_tenant, get_current_user
 from app.security.permissions import (
     ensure_agent_scope_manager,
     ensure_open_gallery_admin,
+    ensure_resource_writer,
     require_agent_scope_viewer,
 )
 from app.security.tenant import ensure_tenant
 from app.skills import SkillDistiller, SkillEditor
+from app.skills.nesting import (
+    SopNestingError,
+    nested_sop_ids,
+    sop_capability_scope,
+    validate_sop_nesting,
+)
 from app.skills.skill_schema import (
     SkillCard,
     SkillCreateRequest,
@@ -69,18 +72,12 @@ from app.skills.skill_schema import (
     SkillRead,
     SkillRewriteRequest,
     SkillRewriteResponse,
-    SkillVersionRead,
     SkillUpdateRequest,
+    SkillVersionRead,
     skill_card_from_persisted,
 )
-from app.skills.stream_jobs import SkillStreamEvent, SkillStreamJob, stream_jobs
 from app.skills.step_ids import skill_card_with_unique_step_ids
-from app.skills.nesting import (
-    SopNestingError,
-    nested_sop_ids,
-    sop_capability_scope,
-    validate_sop_nesting,
-)
+from app.skills.stream_jobs import SkillStreamEvent, SkillStreamJob, stream_jobs
 
 _CHANNEL_LABELS = {"wechat": "微信", "wecom": "企业微信", "feishu": "飞书", "dingtalk": "钉钉"}
 
@@ -95,6 +92,7 @@ def skill_read(
     row: Skill,
     stats: dict[str, dict[str, float | int]] | None = None,
     recent_stats: dict[str, dict[str, object]] | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> SkillRead:
     all_stats = stats or {}
     skill_stats = _stats_for(all_stats, row.skill_id, row.version)
@@ -103,7 +101,8 @@ def skill_read(
     content, _warnings = skill_card_with_unique_step_ids(
         skill_card_from_persisted(row.content_json)
     )
-    branch_meta = getattr(row, "agent_branch_meta", {}) or {}
+    # 创建人元数据由调用方传入；归属（哪个员工拥有这条私有 SOP）直接读资源列。
+    creator_metadata = metadata if metadata is not None else {}
     return SkillRead(
         id=row.id,
         tenant_id=row.tenant_id,
@@ -130,12 +129,8 @@ def skill_read(
         recent_negative_feedback_count=int(recent_skill_stats.get("negative_feedback_count", 0)),
         recent_positive_rate=float(recent_skill_stats.get("positive_rate", 0.0)),
         recent_negative_rate=float(recent_skill_stats.get("negative_rate", 0.0)),
-        agent_id=branch_meta.get("agent_id"),
-        branch_status=branch_meta.get("status"),
-        branch_sync_state=branch_meta.get("sync_state"),
-        branch_base_version=branch_meta.get("base_version"),
-        branch_head_version=branch_meta.get("head_version"),
-        metadata=dict(branch_meta.get("metadata") or {}),
+        agent_id=row.owner_agent_id,
+        metadata=creator_metadata,
         created_at=row.created_at.isoformat(),
         updated_at=row.updated_at.isoformat(),
     )
@@ -168,33 +163,6 @@ def skill_version_read(
     )
 
 
-def _branch_version_read(row: AgentSkillBranchVersion) -> SkillVersionRead:
-    content, _warnings = skill_card_with_unique_step_ids(
-        skill_card_from_persisted(row.content_json)
-    )
-    return SkillVersionRead(
-        id=row.id,
-        tenant_id=row.tenant_id,
-        skill_id=row.skill_id,
-        version=row.version,
-        name=content.name,
-        business_domain=content.business_domain,
-        description=content.description,
-        content=content,
-        status=row.status,
-        call_count=0,
-        positive_feedback_count=0,
-        negative_feedback_count=0,
-        positive_rate=0.0,
-        negative_rate=0.0,
-        agent_id=row.agent_id,
-        branch_sync_state=row.sync_state,
-        branch_base_version=row.base_version,
-        created_at=row.created_at.isoformat(),
-        updated_at=row.updated_at.isoformat(),
-    )
-
-
 @router.get("", response_model=list[SkillRead], dependencies=[Depends(require_agent_scope_viewer)])
 def list_skills(
     tenant_id: str = Query(...),
@@ -205,7 +173,10 @@ def list_skills(
     rows = visible_skill_rows(db, tenant_id, agent_id, include_inactive=True)
     stats = _skill_stats(db, tenant_id)
     recent_stats = _recent_skill_stats(db, tenant_id, stats)
-    return [skill_read(row, stats, recent_stats) for row in rows]
+    return [
+        skill_read(row, stats, recent_stats, resource_creator_metadata(db, tenant_id, row))
+        for row in rows
+    ]
 
 
 def _validate_handoff_assignees(db: Session, content: SkillCard, tenant_id: str) -> None:
@@ -315,30 +286,39 @@ def create_skill(
     current_user: User = Depends(get_current_user),
 ) -> SkillRead:
     ensure_tenant(db, request.tenant_id)
-    existing = db.exec(
-        select(Skill).where(
-            Skill.tenant_id == request.tenant_id, Skill.skill_id == request.content.skill_id
+    agent = ensure_agent_scope_manager(db, request.tenant_id, agent_id, current_user)
+    private_owner_agent_id = agent.id if agent else None
+    if not private_owner_agent_id:
+        ensure_open_gallery_admin(request.tenant_id, current_user)
+    # skill_id 在同一归属内唯一：不同员工可以有同名 SOP。
+    conflict_statement = select(Skill).where(
+        Skill.tenant_id == request.tenant_id,
+        Skill.skill_id == request.content.skill_id,
+    )
+    if private_owner_agent_id:
+        conflict_statement = conflict_statement.where(
+            Skill.scope == AGENT_SCOPE, Skill.owner_agent_id == private_owner_agent_id
         )
-    ).first()
-    if existing:
+    else:
+        conflict_statement = conflict_statement.where(Skill.scope == GALLERY_SCOPE)
+    if db.exec(conflict_statement).first():
         raise HTTPException(status_code=409, detail="Skill ID already exists for this tenant")
+    # 跨来源唯一性：私有 SOP 不能与该员工已引用的广场 SOP 重名（设计 4.7）。
+    ensure_visible_name_unique(
+        db, request.tenant_id, private_owner_agent_id, "skill", request.content.skill_id
+    )
     normalized_content, _warnings = skill_card_with_unique_step_ids(request.content)
     content = normalized_content.model_dump()
     _validate_handoff_assignees(db, normalized_content, request.tenant_id)
-    agent = ensure_agent_scope_manager(db, request.tenant_id, agent_id, current_user)
     try:
         validate_sop_nesting(
             normalized_content.skill_id,
             content,
-            visible_skill_rows(
-                db,
-                request.tenant_id,
-                agent.id if agent else None,
-                include_inactive=True,
-            ),
+            visible_skill_rows(db, request.tenant_id, agent_id, include_inactive=True),
         )
     except SopNestingError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    creator_metadata = user_creator_metadata(current_user)
     row = Skill(
         tenant_id=request.tenant_id,
         skill_id=normalized_content.skill_id,
@@ -348,48 +328,41 @@ def create_skill(
         description=normalized_content.description,
         content_json=content,
         status=request.status,
+        scope=AGENT_SCOPE if private_owner_agent_id else GALLERY_SCOPE,
+        owner_agent_id=private_owner_agent_id,
+        created_by_user_id=current_user.id,
     )
     db.add(row)
     db.flush()
     _sync_skill_tool_bindings(db, request.tenant_id, row.skill_id, row.content_json)
-    branch = None
-    binding_status = "active" if request.status == "published" else "inactive"
-    creator_metadata = user_creator_metadata(current_user)
-    if agent and not agent.is_overall:
+    if private_owner_agent_id:
         ensure_private_resource_binding(
             db,
             request.tenant_id,
-            agent.id,
+            private_owner_agent_id,
             "skill",
             row.id,
-            binding_status,
-            metadata_json=creator_metadata,
-        )
-        branch = ensure_agent_skill_branch(
-            db,
-            request.tenant_id,
-            agent.id,
-            row,
             metadata_json=creator_metadata,
         )
     else:
-        ensure_open_gallery_admin(request.tenant_id, current_user)
         mark_resource_open_gallery(row, creator_metadata)
         ensure_open_gallery_binding(
             db,
             request.tenant_id,
             "skill",
             row.id,
-            binding_status,
             metadata_json=creator_metadata,
         )
     db.commit()
     db.refresh(row)
     _upsert_skill_version(db, row)
     stats = _skill_stats(db, request.tenant_id)
-    if branch:
-        row = project_skill_with_branch(row, branch, binding_status)
-    return skill_read(row, stats, _recent_skill_stats(db, request.tenant_id, stats))
+    return skill_read(
+        row,
+        stats,
+        _recent_skill_stats(db, request.tenant_id, stats),
+        resource_creator_metadata(db, request.tenant_id, row),
+    )
 
 
 @router.get(
@@ -403,7 +376,7 @@ def get_skill(
 ) -> SkillRead:
     row = _get_visible_skill_for_scope(db, tenant_id, skill_id, agent_id)
     stats = _skill_stats(db, tenant_id)
-    return skill_read(row, stats, _recent_skill_stats(db, tenant_id, stats))
+    return skill_read(row, stats, _recent_skill_stats(db, tenant_id, stats), resource_creator_metadata(db, tenant_id, row))
 
 
 @router.put("/{skill_id}", response_model=SkillRead)
@@ -414,56 +387,25 @@ def update_skill(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> SkillRead:
+    """改写 SOP。
+
+    技能只有一份内容 —— 私有 SOP 由归属人改写，广场 SOP 由管理员改写。
+    改写后所有引用它的员工立刻看到最新版本，不产生任何副本。
+    """
     if request.content.skill_id != skill_id:
         raise HTTPException(status_code=400, detail="SOP skill_id cannot be modified")
-    row = _get_skill(db, request.tenant_id, skill_id)
+    row = _get_skill(db, request.tenant_id, skill_id, agent_id)
+    ensure_resource_writer(db, request.tenant_id, current_user, row)
     normalized_content, _warnings = skill_card_with_unique_step_ids(request.content)
     _validate_handoff_assignees(db, normalized_content, request.tenant_id)
-    agent = ensure_agent_scope_manager(db, request.tenant_id, agent_id, current_user)
     try:
         validate_sop_nesting(
             normalized_content.skill_id,
             normalized_content.model_dump(),
-            visible_skill_rows(
-                db,
-                request.tenant_id,
-                agent.id if agent else None,
-                include_inactive=True,
-            ),
+            visible_skill_rows(db, request.tenant_id, agent_id, include_inactive=True),
         )
     except SopNestingError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if agent and not agent.is_overall:
-        binding = db.exec(
-            select(AgentResourceBinding).where(
-                AgentResourceBinding.tenant_id == request.tenant_id,
-                AgentResourceBinding.agent_id == agent.id,
-                AgentResourceBinding.resource_type == "skill",
-                AgentResourceBinding.resource_id == row.id,
-                AgentResourceBinding.status != "deleted",
-            )
-        ).first()
-        if not binding:
-            raise HTTPException(status_code=404, detail="Skill not visible to this agent")
-        branch = update_branch_skill(
-            db,
-            request.tenant_id,
-            agent.id,
-            row,
-            normalized_content.model_dump(),
-            "技能分支改写",
-        )
-        _sync_skill_tool_bindings(
-            db,
-            request.tenant_id,
-            row.skill_id,
-            normalized_content.model_dump(),
-        )
-        db.commit()
-        projected = project_skill_with_branch(row, branch, binding.status)
-        stats = _skill_stats(db, request.tenant_id)
-        return skill_read(projected, stats, _recent_skill_stats(db, request.tenant_id, stats))
-    ensure_open_gallery_admin(request.tenant_id, current_user)
     row.version = normalized_content.version
     row.name = normalized_content.name
     row.business_domain = normalized_content.business_domain
@@ -478,7 +420,12 @@ def update_skill(
     db.refresh(row)
     _upsert_skill_version(db, row)
     stats = _skill_stats(db, request.tenant_id)
-    return skill_read(row, stats, _recent_skill_stats(db, request.tenant_id, stats))
+    return skill_read(
+        row,
+        stats,
+        _recent_skill_stats(db, request.tenant_id, stats),
+        resource_creator_metadata(db, request.tenant_id, row),
+    )
 
 
 @router.post("/{skill_id}/publish", response_model=SkillRead)
@@ -489,50 +436,25 @@ def publish_skill(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> SkillRead:
-    row = _get_skill(db, tenant_id, skill_id)
-    agent = ensure_agent_scope_manager(db, tenant_id, agent_id, current_user)
-    validation_content = (
-        ensure_agent_skill_branch(db, tenant_id, agent.id, row).content_json
-        if agent and not agent.is_overall
-        else row.content_json
-    )
+    row = _get_skill(db, tenant_id, skill_id, agent_id)
+    ensure_resource_writer(db, tenant_id, current_user, row)
     try:
         validate_sop_nesting(
             row.skill_id,
-            validation_content,
-            visible_skill_rows(
-                db,
-                tenant_id,
-                agent.id if agent else None,
-                include_inactive=True,
-            ),
+            row.content_json,
+            visible_skill_rows(db, tenant_id, agent_id, include_inactive=True),
         )
     except SopNestingError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if agent and not agent.is_overall:
-        branch = ensure_agent_skill_branch(db, tenant_id, agent.id, row)
-        branch.status = "active"
-        branch.updated_at = utc_now()
-        db.add(branch)
-        _sync_skill_tool_bindings(db, tenant_id, row.skill_id, branch.content_json)
-        ensure_private_resource_binding(db, tenant_id, agent.id, "skill", row.id, "active")
-        db.commit()
-        projected = project_skill_with_branch(row, branch, "active")
-        stats = _skill_stats(db, tenant_id)
-        return skill_read(projected, stats, _recent_skill_stats(db, tenant_id, stats))
-    ensure_open_gallery_admin(tenant_id, current_user)
     row.status = "published"
     _sync_skill_tool_bindings(db, tenant_id, row.skill_id, row.content_json)
-    mark_resource_open_gallery(row)
     row.updated_at = utc_now()
     db.add(row)
-    db.flush()
-    ensure_open_gallery_binding(db, tenant_id, "skill", row.id, "active")
     db.commit()
     db.refresh(row)
     _upsert_skill_version(db, row)
     stats = _skill_stats(db, tenant_id)
-    return skill_read(row, stats, _recent_skill_stats(db, tenant_id, stats))
+    return skill_read(row, stats, _recent_skill_stats(db, tenant_id, stats), resource_creator_metadata(db, tenant_id, row))
 
 
 @router.post("/{skill_id}/archive", response_model=SkillRead)
@@ -543,29 +465,16 @@ def archive_skill(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> SkillRead:
-    row = _get_skill(db, tenant_id, skill_id)
-    agent = ensure_agent_scope_manager(db, tenant_id, agent_id, current_user)
-    if agent and not agent.is_overall:
-        branch = ensure_agent_skill_branch(db, tenant_id, agent.id, row)
-        branch.status = "inactive"
-        branch.updated_at = utc_now()
-        db.add(branch)
-        ensure_private_resource_binding(db, tenant_id, agent.id, "skill", row.id, "inactive")
-        db.commit()
-        projected = project_skill_with_branch(row, branch, "inactive")
-        stats = _skill_stats(db, tenant_id)
-        return skill_read(projected, stats, _recent_skill_stats(db, tenant_id, stats))
-    ensure_open_gallery_admin(tenant_id, current_user)
+    row = _get_skill(db, tenant_id, skill_id, agent_id)
+    ensure_resource_writer(db, tenant_id, current_user, row)
     row.status = "archived"
     row.updated_at = utc_now()
     db.add(row)
-    db.flush()
-    ensure_open_gallery_binding(db, tenant_id, "skill", row.id, "inactive")
     db.commit()
     db.refresh(row)
     _upsert_skill_version(db, row)
     stats = _skill_stats(db, tenant_id)
-    return skill_read(row, stats, _recent_skill_stats(db, tenant_id, stats))
+    return skill_read(row, stats, _recent_skill_stats(db, tenant_id, stats), resource_creator_metadata(db, tenant_id, row))
 
 
 @router.post("/{skill_id}/draft", response_model=SkillRead)
@@ -576,21 +485,19 @@ def draft_skill(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> SkillRead:
-    row = _get_skill(db, tenant_id, skill_id)
+    row = _get_skill(db, tenant_id, skill_id, agent_id)
     agent = ensure_agent_scope_manager(db, tenant_id, agent_id, current_user)
-    if agent and not agent.is_overall:
-        raise HTTPException(status_code=403, detail="Only overall SOPs can be moved to draft")
+    if agent:
+        raise HTTPException(status_code=403, detail="Only gallery SOPs can be moved to draft")
     ensure_open_gallery_admin(tenant_id, current_user)
     row.status = "draft"
     row.updated_at = utc_now()
     db.add(row)
-    db.flush()
-    ensure_open_gallery_binding(db, tenant_id, "skill", row.id, "inactive")
     db.commit()
     db.refresh(row)
     _upsert_skill_version(db, row)
     stats = _skill_stats(db, tenant_id)
-    return skill_read(row, stats, _recent_skill_stats(db, tenant_id, stats))
+    return skill_read(row, stats, _recent_skill_stats(db, tenant_id, stats), resource_creator_metadata(db, tenant_id, row))
 
 
 @router.delete("/{skill_id}")
@@ -601,45 +508,13 @@ def delete_skill(
     agent_id: str | None = None,
     current_user: User = Depends(get_current_user),
 ) -> dict[str, str]:
-    row = _get_skill(db, tenant_id, skill_id)
-    agent = ensure_agent_scope_manager(db, tenant_id, agent_id, current_user)
-    if agent and not agent.is_overall:
-        binding = db.exec(
-            select(AgentResourceBinding).where(
-                AgentResourceBinding.tenant_id == tenant_id,
-                AgentResourceBinding.agent_id == agent.id,
-                AgentResourceBinding.resource_type == "skill",
-                AgentResourceBinding.resource_id == row.id,
-            )
-        ).first()
-        if not binding:
-            binding = AgentResourceBinding(
-                tenant_id=tenant_id,
-                agent_id=agent.id,
-                resource_type="skill",
-                resource_id=row.id,
-                status="deleted",
-            )
-        else:
-            binding.status = "deleted"
-            binding.updated_at = utc_now()
-        branch = ensure_agent_skill_branch(db, tenant_id, agent.id, row)
-        branch.status = "deleted"
-        branch.updated_at = utc_now()
-        db.add(binding)
-        db.add(branch)
-        db.commit()
-        return {"status": "hidden"}
-    if agent and agent.is_overall:
-        if not is_open_gallery_resource(db, tenant_id, "skill", row):
-            raise HTTPException(status_code=404, detail="Skill not visible in open gallery")
-        ensure_open_gallery_admin(tenant_id, current_user)
-        hide_open_gallery_binding(db, tenant_id, "skill", row.id)
-        db.commit()
-        return {"status": "hidden"}
+    """删除 SOP。
 
-    require_overall_agent(db, tenant_id, agent_id)
-    ensure_open_gallery_admin(tenant_id, current_user)
+    私有 SOP 由归属人删除；广场 SOP 由管理员删除。删除后清理所有引用行，
+    引用它的员工立刻失去这条 SOP（不留悬挂引用）。
+    """
+    row = _get_skill(db, tenant_id, skill_id, agent_id)
+    ensure_resource_writer(db, tenant_id, current_user, row)
     feedback_rows = db.exec(
         select(SkillFeedback).where(
             SkillFeedback.tenant_id == tenant_id,
@@ -655,6 +530,7 @@ def delete_skill(
     ).all()
     for version_row in version_rows:
         db.delete(version_row)
+    purge_resource_references(db, tenant_id, "skill", row.id)
     db.delete(row)
     db.commit()
     return {"status": "deleted"}
@@ -672,10 +548,6 @@ def list_skill_versions(
     agent_id: str | None = None,
 ) -> list[SkillVersionRead]:
     row = _get_visible_skill_for_scope(db, tenant_id, skill_id, agent_id)
-    agent = get_agent(db, tenant_id, agent_id)
-    if agent and not agent.is_overall:
-        rows = branch_versions(db, tenant_id, agent.id, skill_id)
-        return [_branch_version_read(row) for row in rows]
     current_snapshot = db.exec(
         select(SkillVersion).where(
             SkillVersion.tenant_id == tenant_id,
@@ -707,19 +579,6 @@ def get_skill_version(
     db: Session = Depends(get_session),
 ) -> SkillVersionRead:
     _get_visible_skill_for_scope(db, tenant_id, skill_id, agent_id)
-    agent = get_agent(db, tenant_id, agent_id)
-    if agent and not agent.is_overall:
-        row = next(
-            (
-                item
-                for item in branch_versions(db, tenant_id, agent.id, skill_id)
-                if item.version == version
-            ),
-            None,
-        )
-        if not row:
-            raise HTTPException(status_code=404, detail="Skill version not found")
-        return _branch_version_read(row)
     row = _get_skill_version(db, tenant_id, skill_id, version)
     return skill_version_read(row, _skill_stats(db, tenant_id))
 
@@ -730,10 +589,11 @@ def delete_skill_version(
     version: str,
     tenant_id: str = Query(...),
     db: Session = Depends(get_session),
+    agent_id: str | None = None,
     current_user: User = Depends(get_current_user),
 ) -> dict[str, str]:
-    skill = _get_skill(db, tenant_id, skill_id)
-    ensure_open_gallery_admin(tenant_id, current_user)
+    skill = _get_skill(db, tenant_id, skill_id, agent_id)
+    ensure_resource_writer(db, tenant_id, current_user, skill)
     if skill.version == version:
         raise HTTPException(status_code=409, detail="Cannot delete the active skill version")
     row = _get_skill_version(db, tenant_id, skill_id, version)
@@ -751,16 +611,8 @@ def rollback_skill_version(
     agent_id: str | None = None,
     current_user: User = Depends(get_current_user),
 ) -> SkillRead:
-    agent = ensure_agent_scope_manager(db, tenant_id, agent_id, current_user)
-    if agent and not agent.is_overall:
-        branch = rollback_branch(db, tenant_id, agent.id, skill_id, version)
-        db.commit()
-        skill = _get_skill(db, tenant_id, skill_id)
-        projected = project_skill_with_branch(skill, branch)
-        stats = _skill_stats(db, tenant_id)
-        return skill_read(projected, stats, _recent_skill_stats(db, tenant_id, stats))
-    ensure_open_gallery_admin(tenant_id, current_user)
-    row = _get_skill(db, tenant_id, skill_id)
+    row = _get_skill(db, tenant_id, skill_id, agent_id)
+    ensure_resource_writer(db, tenant_id, current_user, row)
     version_row = _get_skill_version(db, tenant_id, skill_id, version)
     normalized_content, _warnings = skill_card_with_unique_step_ids(
         skill_card_from_persisted(version_row.content_json)
@@ -783,7 +635,7 @@ def rollback_skill_version(
     db.commit()
     db.refresh(row)
     stats = _skill_stats(db, tenant_id)
-    return skill_read(row, stats, _recent_skill_stats(db, tenant_id, stats))
+    return skill_read(row, stats, _recent_skill_stats(db, tenant_id, stats), resource_creator_metadata(db, tenant_id, row))
 
 
 @router.post("/files/extract", response_model=SkillFileExtractResponse)
@@ -1134,41 +986,11 @@ def _visible_general_skill_rows_for_distill(
     tenant_id: str,
     agent_id: str | None,
 ) -> list[GeneralSkill]:
-    agent = get_agent(db, tenant_id, agent_id)
-    rows = db.exec(
-        select(GeneralSkill).where(
-            GeneralSkill.tenant_id == tenant_id,
-            GeneralSkill.status == "published",
-        )
-    ).all()
-    if agent_id and not agent:
-        return []
-    if not agent or agent.is_overall:
-        return [
-            row
-            for row in rows
-            if is_open_gallery_resource(db, tenant_id, "general_skill", row)
-        ]
-    bindings = db.exec(
-        select(AgentResourceBinding).where(
-            AgentResourceBinding.tenant_id == tenant_id,
-            AgentResourceBinding.agent_id == agent.id,
-            AgentResourceBinding.resource_type == "general_skill",
-            AgentResourceBinding.status == "active",
-        )
-    ).all()
-    rows_by_id = {row.id: row for row in rows}
+    """蒸馏目录里的通用技能 = 该员工可见（自己拥有的 ∪ 已引用的广场）且已发布的。"""
     return [
         row
-        for binding in bindings
-        if (row := rows_by_id.get(binding.resource_id)) is not None
-        and is_bound_resource_visible_for_agent(
-            db,
-            tenant_id,
-            "general_skill",
-            row,
-            binding,
-        )
+        for row in visible_general_skill_rows(db, tenant_id, agent_id)
+        if row.status == "published"
     ]
 
 
@@ -1572,14 +1394,32 @@ def _empty_stats() -> dict[str, float | int]:
     }
 
 
-def _get_skill(db: Session, tenant_id: str, skill_id: str) -> Skill:
+def _get_skill(
+    db: Session, tenant_id: str, skill_id: str, agent_id: str | None = None
+) -> Skill:
+    """按归属定位 SOP。
+
+    `skill_id` 只在同一归属内唯一 —— 不同员工可以各有一份同名 SOP，广场也有自己那份。
+    因此写操作（改/删/发布/归档/回滚）必须带上是哪个平面，否则会随机撞到别人的同名 SOP。
+
+    私人员工优先在自己的平面里找；找不到再落到广场平面 —— 这样"成员试图改广场 SOP"
+    会走到权限判定给出 403，而不是含混的 404。
+    """
     ensure_tenant(db, tenant_id)
-    row = db.exec(
-        select(Skill).where(Skill.tenant_id == tenant_id, Skill.skill_id == skill_id)
-    ).first()
-    if not row:
-        raise HTTPException(status_code=404, detail="Skill not found")
-    return row
+    agent = get_agent(db, tenant_id, agent_id)
+    private_owner_agent_id = agent.id if agent else None
+    base = select(Skill).where(Skill.tenant_id == tenant_id, Skill.skill_id == skill_id)
+    statements = []
+    if private_owner_agent_id:
+        statements.append(
+            base.where(Skill.scope == AGENT_SCOPE, Skill.owner_agent_id == private_owner_agent_id)
+        )
+    statements.append(base.where(Skill.scope == GALLERY_SCOPE))
+    for statement in statements:
+        row = db.exec(statement).first()
+        if row:
+            return row
+    raise HTTPException(status_code=404, detail="Skill not found")
 
 
 def _get_visible_skill_for_scope(

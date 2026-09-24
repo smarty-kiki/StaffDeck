@@ -37,30 +37,30 @@ def _seed_pool_team(db: Session, *, config: dict | None = None) -> Team:
     """TL(也带匹配标签)+ 4 名能力标签各异的成员,用于候选选择与竞标流程。"""
     db.add(Tenant(id="tenant_demo", name="Demo"))
     db.add(
-        AgentProfile(
+        AgentProfile(owner_user_id="user_admin",
             id="agent_tl", tenant_id="tenant_demo", name="TL",
             metadata_json={"expertise_tags": ["调研", "竞品"]},
         )
     )
     db.add(
-        AgentProfile(
+        AgentProfile(owner_user_id="user_admin",
             id="agent_a", tenant_id="tenant_demo", name="甲",
             metadata_json={"expertise_tags": ["调研", "竞品"]},
         )
     )
     db.add(
-        AgentProfile(
+        AgentProfile(owner_user_id="user_admin",
             id="agent_b", tenant_id="tenant_demo", name="乙",
             metadata_json={"expertise_tags": ["调研"]},
         )
     )
     db.add(
-        AgentProfile(
+        AgentProfile(owner_user_id="user_admin",
             id="agent_c", tenant_id="tenant_demo", name="丙",
             metadata_json={"expertise_tags": ["定价"]},
         )
     )
-    db.add(AgentProfile(id="agent_d", tenant_id="tenant_demo", name="丁"))
+    db.add(AgentProfile(owner_user_id="user_admin", id="agent_d", tenant_id="tenant_demo", name="丁"))
     db.commit()
     team = create_team(
         db,
@@ -245,7 +245,7 @@ def test_select_candidates_zero_match_fallback() -> None:
 def test_start_bidding_without_candidates_escalates() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(AgentProfile(id="agent_tl", tenant_id="tenant_demo", name="TL"))
+        db.add(AgentProfile(owner_user_id="user_admin", id="agent_tl", tenant_id="tenant_demo", name="TL"))
         db.commit()
         team = create_team(
             db, tenant_id="tenant_demo", name="光杆团队",

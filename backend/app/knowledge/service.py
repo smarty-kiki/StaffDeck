@@ -18,6 +18,7 @@ from app.capability_scope import normalize_capability_scope
 from app import paths
 from app.db import engine
 from app.db.models import (
+    GALLERY_SCOPE,
     KnowledgeBucket,
     KnowledgeBase,
     KnowledgeChunk,
@@ -1340,6 +1341,7 @@ class KnowledgeService:
         row = Tool(
             tenant_id=suggestion.tenant_id,
             name=name,
+            scope=GALLERY_SCOPE,
             display_name=_optional_str(payload.get("display_name")) or suggestion.title,
             description=_optional_str(payload.get("description") or suggestion.reason),
             bucket=str(payload.get("bucket") or "知识自发现工具").strip() or "知识自发现工具",
@@ -1371,6 +1373,7 @@ class KnowledgeService:
         row = Skill(
             tenant_id=suggestion.tenant_id,
             skill_id=card.skill_id,
+            scope=GALLERY_SCOPE,
             version=card.version,
             name=card.name,
             business_domain=card.business_domain,
@@ -1409,6 +1412,7 @@ class KnowledgeService:
             name="默认知识库",
             description="系统默认知识库",
             status="active",
+            scope=GALLERY_SCOPE,
         )
         self.db.add(row)
         self.db.commit()

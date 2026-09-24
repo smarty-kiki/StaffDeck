@@ -73,7 +73,7 @@ def test_purge_orphaned_chat_sessions_cleans_pre_fix_leftovers(
     SQLModel.metadata.create_all(engine)
     with Session(engine) as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(AgentProfile(id="agent_keep", tenant_id="tenant_demo", name="保留员工"))
+        db.add(AgentProfile(owner_user_id="user_admin", id="agent_keep", tenant_id="tenant_demo", name="保留员工"))
         team = Team(
             tenant_id="tenant_demo",
             name="存活的团队",

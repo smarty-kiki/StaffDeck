@@ -42,9 +42,9 @@ def _gallery_agents(db: Session, principal: PublicPrincipal) -> list[AgentProfil
     return [
         row
         for row in rows
-        if not row.is_overall
-        and row.status == "active"
-        and (row.metadata or {}).get("published_to_gallery") is True
+        if row.status == "active"
+        # 发布状态已进列：`is_published` 取代 metadata.published_to_gallery。
+        and bool(row.is_published)
     ]
 
 

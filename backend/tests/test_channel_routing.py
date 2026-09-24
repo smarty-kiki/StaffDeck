@@ -44,8 +44,8 @@ def _seed_binding(engine, *, mounts: list[tuple[str, str, bool]] | None = None) 
     """创建绑定与两个员工;mounts=(agent_id, name, is_default),None 表示存量绑定(无挂载行)。"""
     with Session(engine) as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(AgentProfile(id="agent_xz", tenant_id="tenant_demo", name="行政", metadata_json={}))
-        db.add(AgentProfile(id="agent_cw", tenant_id="tenant_demo", name="财务", metadata_json={}))
+        db.add(AgentProfile(owner_user_id="user_admin", id="agent_xz", tenant_id="tenant_demo", name="行政", metadata_json={}))
+        db.add(AgentProfile(owner_user_id="user_admin", id="agent_cw", tenant_id="tenant_demo", name="财务", metadata_json={}))
         binding = ChannelBinding(
             tenant_id="tenant_demo",
             agent_id="agent_xz",
@@ -759,7 +759,7 @@ def _seed_api_users(engine) -> dict[str, User]:
         db.add(other)
         for agent_id, name in (("agent_xz", "行政"), ("agent_cw", "财务"), ("agent_rs", "人事")):
             db.add(
-                AgentProfile(
+                AgentProfile(owner_user_id=owner.id,
                     id=agent_id,
                     tenant_id="tenant_demo",
                     name=name,

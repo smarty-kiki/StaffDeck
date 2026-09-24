@@ -62,7 +62,8 @@ export default function ScheduledTasksTab() {
   const navigate = useNavigate();
 
   const selectedAgent = agents.find((item) => item.id === agentId) || null;
-  const createDisabled = !agentId || Boolean(selectedAgent?.is_overall);
+  // 广场不是一条「员工」记录：没选中员工时定时任务无处挂载。
+  const createDisabled = !selectedAgent;
 
   useEffect(() => {
     const onScopeChange = (event: Event) => {
@@ -410,7 +411,7 @@ export default function ScheduledTasksTab() {
     </div>
   );
 
-  const scheduledBody = selectedAgent?.is_overall ? (
+  const scheduledBody = !selectedAgent ? (
     <div className="flex min-h-[200px] items-center justify-center rounded-[14px] bg-[#f6f6f6] text-[13px] text-[#858b9c]">
       请先选择一个数字员工再配置定时任务。
     </div>

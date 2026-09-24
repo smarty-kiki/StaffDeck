@@ -3,15 +3,15 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Header, Query, Request, Response
 from sqlmodel import Session, select
 
+from app.agents.branching import visible_skill
 from app.agents.schema import (
     AgentModelsUpdateRequest,
     AgentProfileCreateRequest,
     AgentProfileUpdateRequest,
-    AgentResourceBindingInput,
+    AgentResourceReferenceInput,
     AgentResourcesUpdateRequest,
 )
 from app.api import agents as internal_agents
-from app.agents.branching import visible_skill
 from app.core.capability_manifest import CapabilityManifestBuilder
 from app.db import get_session
 from app.db.models import AgentProfile, ModelConfig
@@ -29,7 +29,6 @@ from app.public_api.schemas import (
     ResourceBindingsUpdate,
 )
 from app.public_api.utils import etag_for
-
 
 router = APIRouter(prefix="/agents", tags=["agents"])
 
@@ -78,8 +77,6 @@ def create_agent(
             name=body.name,
             description=body.description,
             persona_prompt=body.persona_prompt,
-            source_mode=body.source_mode,
-            copy_from_agent_id=body.copy_from_agent_id,
             harness_max_actions=body.harness_max_actions,
             metadata=body.metadata,
         ),
@@ -188,7 +185,7 @@ def update_agent_resources(
         agent_id,
         AgentResourcesUpdateRequest(
             tenant_id=principal.tenant_id,
-            resources=[AgentResourceBindingInput(**item.model_dump()) for item in body.resources],
+            resources=[AgentResourceReferenceInput(**item.model_dump()) for item in body.resources],
         ),
         db,
         principal.actor_user,

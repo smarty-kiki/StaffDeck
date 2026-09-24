@@ -232,11 +232,8 @@ class SkillRead(BaseModel):
     recent_negative_feedback_count: int = 0
     recent_positive_rate: float = 0.0
     recent_negative_rate: float = 0.0
+    # 归属员工（私有 SOP 的 owner_agent_id）；广场 SOP 为 None。
     agent_id: Optional[str] = None
-    branch_status: Optional[str] = None
-    branch_sync_state: Optional[str] = None
-    branch_base_version: Optional[str] = None
-    branch_head_version: Optional[str] = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: str
     updated_at: str
@@ -260,8 +257,6 @@ class SkillVersionRead(BaseModel):
     positive_rate: float = 0.0
     negative_rate: float = 0.0
     agent_id: Optional[str] = None
-    branch_sync_state: Optional[str] = None
-    branch_base_version: Optional[str] = None
     created_at: str
     updated_at: str
 

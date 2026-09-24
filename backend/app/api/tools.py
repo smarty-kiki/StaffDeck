@@ -10,24 +10,29 @@ from sqlmodel import Session, select
 from app.agents.branching import (
     ensure_open_gallery_binding,
     ensure_private_resource_binding,
+    ensure_visible_name_unique,
     get_agent,
-    hide_open_gallery_binding,
-    is_bound_resource_visible_for_agent,
     is_open_gallery_resource,
-    require_overall_agent,
-    resource_binding_metadata,
+    mark_resource_open_gallery,
+    mark_resource_private_for_agent,
+    purge_resource_references,
+    reference_resource,
+    referenced_resource_ids,
+    resource_creator_metadata,
+    unreference_resource,
     user_creator_metadata,
     visible_tool_rows,
 )
-from app.config import get_settings
 from app.capability_scope import normalize_capability_scope
+from app.config import get_settings
 from app.db import get_session
 from app.db.models import (
+    AGENT_SCOPE,
+    GALLERY_SCOPE,
     A2ATaskEvent,
     A2ATaskRun,
     AgentEvent,
     AgentProfile,
-    AgentResourceBinding,
     MCPServer,
     Tool,
     User,
@@ -37,6 +42,7 @@ from app.security.auth import ensure_current_user_tenant, get_current_user
 from app.security.permissions import (
     ensure_agent_scope_manager,
     ensure_open_gallery_admin,
+    ensure_resource_writer,
     require_agent_scope_viewer,
     require_tenant_admin,
 )
@@ -55,9 +61,9 @@ from app.tools.tool_schema import (
     MCPAppResourceRead,
     MCPAppToolCallRequest,
     MCPAppToolCallResponse,
+    MCPDiscoveredTool,
     MCPDiscoverRequest,
     MCPDiscoverResponse,
-    MCPDiscoveredTool,
     MCPServerConnection,
     MCPServerCreateRequest,
     MCPServerRead,
@@ -156,8 +162,7 @@ def list_tools(
 ) -> list[ToolRead]:
     ensure_tenant(db, tenant_id)
     rows = _visible_tool_rows(db, tenant_id, bucket, agent_id)
-    metadata_by_id = resource_binding_metadata(db, tenant_id, agent_id, "tool")
-    return [tool_read(row, metadata_by_id.get(row.id)) for row in rows]
+    return [tool_read(row, resource_creator_metadata(db, tenant_id, row)) for row in rows]
 
 
 @router.get(
@@ -195,12 +200,20 @@ def create_tool(
     current_user: User = Depends(get_current_user),
 ) -> ToolRead:
     ensure_tenant(db, request.tenant_id)
-    existing = db.exec(
-        select(Tool).where(Tool.tenant_id == request.tenant_id, Tool.name == request.name)
-    ).first()
-    if existing:
-        raise HTTPException(status_code=409, detail="Tool name already exists for this tenant")
     agent = ensure_agent_scope_manager(db, request.tenant_id, agent_id, current_user)
+    private_owner_agent_id = agent.id if agent else None
+    if not private_owner_agent_id:
+        ensure_open_gallery_admin(request.tenant_id, current_user)
+    # 名字在同一归属内唯一：不同员工可以有同名工具。
+    if _tool_name_taken(
+        db, request.tenant_id, request.name, owner_agent_id=private_owner_agent_id
+    ):
+        raise HTTPException(status_code=409, detail="Tool name already exists for this tenant")
+    # 跨来源唯一性：私有工具名不能与该员工已引用的广场工具重名（设计 4.7）。
+    ensure_visible_name_unique(
+        db, request.tenant_id, private_owner_agent_id, "tool", request.name
+    )
+    creator_metadata = user_creator_metadata(current_user)
     row = Tool(
         tenant_id=request.tenant_id,
         name=request.name,
@@ -218,34 +231,25 @@ def create_tool(
         allowed_skills_json=request.allowed_skills,
         capability_scope=request.capability_scope,
         enabled=request.enabled,
+        scope=AGENT_SCOPE if private_owner_agent_id else GALLERY_SCOPE,
+        owner_agent_id=private_owner_agent_id,
+        created_by_user_id=current_user.id,
     )
     db.add(row)
     db.flush()
-    creator_metadata = user_creator_metadata(current_user)
-    if agent and not agent.is_overall:
+    if private_owner_agent_id:
+        mark_resource_private_for_agent(row, private_owner_agent_id, creator_metadata)
         ensure_private_resource_binding(
-            db,
-            request.tenant_id,
-            agent.id,
-            "tool",
-            row.id,
-            "active" if request.enabled else "inactive",
-            metadata_json=creator_metadata,
+            db, request.tenant_id, private_owner_agent_id, "tool", row.id
         )
     else:
-        ensure_open_gallery_admin(request.tenant_id, current_user)
+        mark_resource_open_gallery(row, creator_metadata)
         ensure_open_gallery_binding(
-            db,
-            request.tenant_id,
-            "tool",
-            row.id,
-            "active" if request.enabled else "inactive",
-            metadata_json=creator_metadata,
+            db, request.tenant_id, "tool", row.id, metadata_json=creator_metadata
         )
     db.commit()
     db.refresh(row)
-    metadata_by_id = resource_binding_metadata(db, request.tenant_id, agent_id, "tool")
-    return tool_read(row, metadata_by_id.get(row.id))
+    return tool_read(row, resource_creator_metadata(db, request.tenant_id, row))
 
 
 @router.post("/probe", response_model=ToolProbeResponse)
@@ -287,6 +291,7 @@ def probe_tool(
         tool = Tool(
             tenant_id=request.tenant_id,
             name=request.name or "a2a_probe",
+            scope=GALLERY_SCOPE,
             display_name=request.display_name,
             description=request.description,
             bucket=request.bucket,
@@ -434,8 +439,8 @@ def cancel_a2a_task_run(
     current_user: User = Depends(get_current_user),
 ) -> A2ATaskRunRead:
     row = _get_tool(db, tenant_id, tool_id)
-    ensure_agent_scope_manager(db, tenant_id, agent_id, current_user)
     _ensure_tool_visible(db, tenant_id, row, agent_id)
+    ensure_resource_writer(db, tenant_id, current_user, row)
     run = db.get(A2ATaskRun, run_id)
     if run is None or run.tenant_id != tenant_id or run.tool_id != tool_id:
         raise HTTPException(status_code=404, detail="A2A 任务不存在")
@@ -459,8 +464,7 @@ def get_tool(
 ) -> ToolRead:
     row = _get_tool(db, tenant_id, tool_id)
     _ensure_tool_visible(db, tenant_id, row, agent_id)
-    metadata_by_id = resource_binding_metadata(db, tenant_id, agent_id, "tool")
-    return tool_read(row, metadata_by_id.get(row.id))
+    return tool_read(row, resource_creator_metadata(db, tenant_id, row))
 
 
 @router.put("/{tool_id}", response_model=ToolRead)
@@ -472,19 +476,10 @@ def update_tool(
     current_user: User = Depends(get_current_user),
 ) -> ToolRead:
     row = _get_tool(db, request.tenant_id, tool_id)
-    agent = ensure_agent_scope_manager(db, request.tenant_id, agent_id, current_user)
     _ensure_tool_visible(db, request.tenant_id, row, agent_id)
-    if agent and not agent.is_overall:
-        source_tool_id = row.id
-        source_was_open_gallery = is_open_gallery_resource(db, request.tenant_id, "tool", row)
-        row = _ensure_private_tool_for_agent(db, request.tenant_id, agent, row)
-        if not source_was_open_gallery and request.name.strip() != row.name:
-            raise HTTPException(status_code=400, detail="Tool name cannot be modified")
-    else:
-        ensure_open_gallery_admin(request.tenant_id, current_user)
-        source_tool_id = row.id
-        if request.name.strip() != row.name:
-            raise HTTPException(status_code=400, detail="Tool name cannot be modified")
+    ensure_resource_writer(db, request.tenant_id, current_user, row)
+    if request.name.strip() != row.name:
+        raise HTTPException(status_code=400, detail="Tool name cannot be modified")
     row.display_name = request.display_name
     row.description = request.description
     row.bucket = _normalize_bucket(request.bucket)
@@ -510,36 +505,9 @@ def update_tool(
     row.updated_at = utc_now()
     db.add(row)
     db.flush()
-    creator_metadata = user_creator_metadata(current_user)
-    if agent and not agent.is_overall:
-        if source_tool_id != row.id:
-            source_binding = _tool_binding(db, request.tenant_id, agent.id, source_tool_id)
-            if source_binding:
-                source_binding.status = "deleted"
-                source_binding.updated_at = utc_now()
-                db.add(source_binding)
-        ensure_private_resource_binding(
-            db,
-            request.tenant_id,
-            agent.id,
-            "tool",
-            row.id,
-            "active" if request.enabled else "inactive",
-            metadata_json=creator_metadata if source_tool_id != row.id else None,
-        )
-    else:
-        ensure_open_gallery_binding(
-            db,
-            request.tenant_id,
-            "tool",
-            row.id,
-            "active" if request.enabled else "inactive",
-            metadata_json=creator_metadata,
-        )
     db.commit()
     db.refresh(row)
-    metadata_by_id = resource_binding_metadata(db, request.tenant_id, agent_id, "tool")
-    return tool_read(row, metadata_by_id.get(row.id))
+    return tool_read(row, resource_creator_metadata(db, request.tenant_id, row))
 
 
 @router.delete("/{tool_id}")
@@ -551,25 +519,9 @@ def delete_tool(
     current_user: User = Depends(get_current_user),
 ) -> dict[str, str]:
     row = _get_tool(db, tenant_id, tool_id)
-    agent = ensure_agent_scope_manager(db, tenant_id, agent_id, current_user)
-    if agent and not agent.is_overall:
-        binding = _tool_binding(db, tenant_id, agent.id, row.id)
-        if binding:
-            binding.status = "deleted"
-            binding.updated_at = utc_now()
-            db.add(binding)
-            db.commit()
-            return {"status": "hidden"}
-        raise HTTPException(status_code=404, detail="Tool not visible to this agent")
-    if agent and agent.is_overall:
-        if not is_open_gallery_resource(db, tenant_id, "tool", row):
-            raise HTTPException(status_code=404, detail="Tool not visible in open gallery")
-        ensure_open_gallery_admin(tenant_id, current_user)
-        hide_open_gallery_binding(db, tenant_id, "tool", row.id)
-        db.commit()
-        return {"status": "hidden"}
-    require_overall_agent(db, tenant_id, agent_id)
-    ensure_open_gallery_admin(tenant_id, current_user)
+    ensure_resource_writer(db, tenant_id, current_user, row)
+    # 真删，并清理所有引用行 —— 引用它的员工立刻失去这个工具。
+    purge_resource_references(db, tenant_id, "tool", row.id)
     db.delete(row)
     db.commit()
     return {"status": "deleted"}
@@ -648,85 +600,34 @@ def _ensure_tool_visible(db: Session, tenant_id: str, row: Tool, agent_id: str |
     agent = get_agent(db, tenant_id, agent_id)
     if agent_id and not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
-    if agent and not agent.is_overall:
-        binding = _tool_binding(db, tenant_id, agent.id, row.id)
-        if not binding or not is_bound_resource_visible_for_agent(
-            db, tenant_id, "tool", row, binding
-        ):
+    if agent:
+        if getattr(row, "owner_agent_id", None) == agent.id:
+            return
+        if row.id not in set(referenced_resource_ids(db, tenant_id, agent.id, "tool")):
             raise HTTPException(status_code=404, detail="Tool not visible to this agent")
-    if (not agent or agent.is_overall) and not is_open_gallery_resource(db, tenant_id, "tool", row):
+        if not is_open_gallery_resource(db, tenant_id, "tool", row):
+            raise HTTPException(status_code=404, detail="Tool not visible to this agent")
+        return
+    if not is_open_gallery_resource(db, tenant_id, "tool", row):
         raise HTTPException(status_code=404, detail="Tool not visible in open gallery")
 
 
-def _tool_binding(
-    db: Session, tenant_id: str, agent_id: str, tool_id: str
-) -> AgentResourceBinding | None:
-    return db.exec(
-        select(AgentResourceBinding).where(
-            AgentResourceBinding.tenant_id == tenant_id,
-            AgentResourceBinding.agent_id == agent_id,
-            AgentResourceBinding.resource_type == "tool",
-            AgentResourceBinding.resource_id == tool_id,
-            AgentResourceBinding.status != "deleted",
-        )
-    ).first()
-
-
-def _ensure_private_tool_for_agent(
-    db: Session, tenant_id: str, agent: AgentProfile, row: Tool
-) -> Tool:
-    if not is_open_gallery_resource(db, tenant_id, "tool", row):
-        return row
-    now = utc_now()
-    clone = Tool(
-        tenant_id=tenant_id,
-        name=_unique_tool_name(db, tenant_id, row.name, agent.id),
-        display_name=row.display_name,
-        description=row.description,
-        bucket=row.bucket,
-        tool_type=row.tool_type,
-        method=row.method,
-        url=row.url,
-        headers_json=dict(row.headers_json or {}),
-        auth_json=dict(row.auth_json or {}),
-        config_json=dict(row.config_json or {}),
-        input_schema=dict(row.input_schema or {}),
-        output_schema=dict(row.output_schema or {}),
-        allowed_skills_json=list(row.allowed_skills_json or []),
-        mcp_server_id=row.mcp_server_id,
-        capability_scope=normalize_capability_scope(row.capability_scope),
-        capability_scope_inherited=row.capability_scope_inherited,
-        enabled=row.enabled,
-        created_at=now,
-        updated_at=now,
-    )
-    db.add(clone)
-    db.flush()
-    return clone
-
-
-def _tool_name_taken(db: Session, tenant_id: str, name: str, exclude_id: str | None = None) -> bool:
+def _tool_name_taken(
+    db: Session,
+    tenant_id: str,
+    name: str,
+    exclude_id: str | None = None,
+    owner_agent_id: str | None = None,
+) -> bool:
+    """名字在某归属内是否已占用。私有工具按所属员工查，广场工具按租户查。"""
     stmt = select(Tool).where(Tool.tenant_id == tenant_id, Tool.name == name)
+    if owner_agent_id:
+        stmt = stmt.where(Tool.scope == AGENT_SCOPE, Tool.owner_agent_id == owner_agent_id)
+    else:
+        stmt = stmt.where(Tool.scope == GALLERY_SCOPE)
     if exclude_id:
         stmt = stmt.where(Tool.id != exclude_id)
     return db.exec(stmt).first() is not None
-
-
-def _unique_tool_name(
-    db: Session,
-    tenant_id: str,
-    base_name: str,
-    agent_id: str,
-    exclude_id: str | None = None,
-) -> str:
-    base = (base_name or "tool").strip() or "tool"
-    suffix_base = f"{base}-{agent_id[:8]}"
-    candidate = suffix_base
-    suffix = 2
-    while _tool_name_taken(db, tenant_id, candidate, exclude_id=exclude_id):
-        candidate = f"{suffix_base}-{suffix}"
-        suffix += 1
-    return candidate
 
 
 def _normalize_bucket(value: str | None) -> str:
@@ -1086,10 +987,10 @@ def delete_mcp_server(
     current_user: User = Depends(get_current_user),
 ) -> dict[str, str]:
     agent = ensure_agent_scope_manager(db, tenant_id, agent_id, current_user)
-    if agent and not agent.is_overall:
+    if agent:
         # 工具集是租户级资源:员工范围内只解绑该员工可见的同步工具,不动 server 本身
         return _remove_mcp_server_from_agent(db, tenant_id, agent, server_id)
-    require_overall_agent(db, tenant_id, agent_id)
+    # 工具集是租户级资源 —— 删除 server 需要管理员权限。
     ensure_open_gallery_admin(tenant_id, current_user)
     row = _get_mcp_server(db, tenant_id, server_id)
     if remove_tools:
@@ -1205,6 +1106,8 @@ def sync_mcp_tools(
             new_row = Tool(
                 tenant_id=row.tenant_id,
                 name=_scoped_tool_name(row.name, tool.name),
+                scope=GALLERY_SCOPE,
+                created_by_user_id=current_user.id,
                 display_name=tool.name,
                 description=tool.description,
                 bucket=row.bucket or "MCP 工具",
@@ -1248,35 +1151,23 @@ def sync_mcp_tools(
             touched_tool_ids.append(current.id)
             updated.append(tool.name)
 
-    # 与 create_tool 一致：按当前 agent 范围绑定——员工范围内只对该员工私有可见，
-    # 否则落到工具广场（open gallery），所有人可见。已存在的工具也一并补绑定，
-    # 避免「先在广场导入，再切到员工同步」时员工侧仍然看不到。
-    # revive=True：同步是显式的「把这个工具集装到当前范围」，应覆盖此前移除留下的墓碑，
-    # 否则移除后无法通过任何界面把工具加回来。
+    # 工具集与同步出来的工具行都是「租户级资产」：一律落到工具广场（scope='gallery'）。
+    # 指定了员工范围时，再为这个员工「引用」这些工具 —— 引用行的存在即该员工可见。
+    # 已存在的工具也一并补引用，避免「先在广场导入，再切到员工同步」时员工侧看不到。
     agent = get_agent(db, row.tenant_id, agent_id)
     creator_metadata = user_creator_metadata(current_user)
     for tool_id in touched_tool_ids:
-        if agent and not agent.is_overall:
-            ensure_private_resource_binding(
-                db,
-                row.tenant_id,
-                agent.id,
-                "tool",
-                tool_id,
-                "active",
-                metadata_json=creator_metadata,
-                revive=True,
-            )
-        else:
-            ensure_open_gallery_binding(
-                db,
-                row.tenant_id,
-                "tool",
-                tool_id,
-                "active",
-                metadata_json=creator_metadata,
-                revive=True,
-            )
+        ensure_open_gallery_binding(
+            db,
+            row.tenant_id,
+            "tool",
+            tool_id,
+            "active",
+            metadata_json=creator_metadata,
+            revive=True,
+        )
+        if agent:
+            reference_resource(db, row.tenant_id, agent.id, "tool", tool_id)
 
     db.add(row)
     db.commit()
@@ -1428,19 +1319,14 @@ def _remove_mcp_server_from_agent(
     tool_ids = db.exec(
         select(Tool.id).where(Tool.tenant_id == tenant_id, Tool.mcp_server_id == server_id)
     ).all()
-    hidden = 0
+    removed = 0
     for tool_id in tool_ids:
-        binding = _tool_binding(db, tenant_id, agent.id, tool_id)
-        if not binding:
-            continue
-        binding.status = "deleted"
-        binding.updated_at = utc_now()
-        db.add(binding)
-        hidden += 1
-    if not hidden:
+        if unreference_resource(db, tenant_id, agent.id, "tool", tool_id):
+            removed += 1
+    if not removed:
         raise HTTPException(status_code=404, detail="MCP server not visible to this agent")
     db.commit()
-    return {"status": "hidden"}
+    return {"status": "unreferenced"}
 
 
 def _get_mcp_server(db: Session, tenant_id: str, server_id: str) -> MCPServer:

@@ -13,12 +13,11 @@ from app.api import knowledge_bases as internal_knowledge_bases
 from app.api import scheduled_tasks as internal_scheduled_tasks
 from app.api import tools as internal_tools
 from app.db import get_session
-from app.db.models import APIJob, AgentResourceBinding, KnowledgeIngestJob, Tool, utc_now
+from app.db.models import AgentResourceReference, APIJob, KnowledgeIngestJob, Tool
 from app.general_skills.schema import GeneralSkillImportRequest, GeneralSkillRunRequest
 from app.knowledge.schema import (
     KnowledgeBaseCreateRequest,
     KnowledgeBaseUpdateRequest,
-    KnowledgeBaseRollbackRequest,
     KnowledgeDocumentUpdateRequest,
     KnowledgeDocumentUploadRequest,
     KnowledgeSearchRequest,
@@ -40,7 +39,6 @@ from app.tools.tool_schema import (
     ToolTestRequest,
     ToolUpdateRequest,
 )
-
 
 router = APIRouter(tags=["resources"])
 
@@ -217,25 +215,6 @@ def list_knowledge_versions(
         knowledge_base_id, principal.tenant_id, agent_id, db
     )
     return {"data": rows}
-
-
-@router.post("/agents/{agent_id}/knowledge-bases/{knowledge_base_id}:rollback", response_model=dict)
-def rollback_knowledge_base(
-    agent_id: str,
-    knowledge_base_id: str,
-    body: dict[str, Any],
-    principal: PublicPrincipal = Depends(require_scopes("knowledge:publish")),
-    db: Session = Depends(get_session),
-) -> dict:
-    enforce_agent_access(principal, agent_id, write=True)
-    request = KnowledgeBaseRollbackRequest(
-        tenant_id=principal.tenant_id,
-        agent_id=agent_id,
-        version=str(body.get("version") or ""),
-    )
-    return internal_knowledge_bases.rollback_knowledge_base(
-        knowledge_base_id, request, db, principal.actor_user
-    )
 
 
 @router.get("/agents/{agent_id}/knowledge-bases/{knowledge_base_id}/documents", response_model=dict)
@@ -477,18 +456,17 @@ def archive_tool(
     if not tool or tool.tenant_id != principal.tenant_id:
         raise PublicAPIError(404, "TOOL_NOT_FOUND", "Tool not found.")
     binding = db.exec(
-        select(AgentResourceBinding).where(
-            AgentResourceBinding.tenant_id == principal.tenant_id,
-            AgentResourceBinding.agent_id == agent_id,
-            AgentResourceBinding.resource_type == "tool",
-            AgentResourceBinding.resource_id == tool_id,
+        select(AgentResourceReference).where(
+            AgentResourceReference.tenant_id == principal.tenant_id,
+            AgentResourceReference.agent_id == agent_id,
+            AgentResourceReference.resource_type == "tool",
+            AgentResourceReference.resource_id == tool_id,
         )
     ).first()
     if not binding:
         raise PublicAPIError(404, "TOOL_NOT_FOUND", "Tool not found.")
-    binding.status = "inactive"
-    binding.updated_at = utc_now()
-    db.add(binding)
+    # 取消引用 = 删行（引用表已无 status）。
+    db.delete(binding)
     db.commit()
     return {"id": tool_id, "status": "archived"}
 

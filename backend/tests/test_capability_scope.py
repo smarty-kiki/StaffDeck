@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from fastapi import HTTPException
 from pydantic import ValidationError
 from sqlalchemy import inspect, text
 from sqlalchemy.pool import StaticPool
@@ -11,6 +12,7 @@ from app.agents.branching import (
     ensure_open_gallery_binding,
     ensure_private_resource_binding,
     mark_resource_private_for_agent,
+    reference_resource,
 )
 from app.api.general_skills import general_skill_read, import_general_skill
 from app.api.knowledge_bases import (
@@ -29,8 +31,8 @@ from app.api.tools import (
 from app.capability_scope import normalize_capability_scope
 from app.db.database import _migrate_capability_scope_schema
 from app.db.models import (
+    GALLERY_SCOPE,
     AgentProfile,
-    AgentKnowledgeBranch,
     GeneralSkill,
     KnowledgeBase,
     KnowledgeBaseVersion,
@@ -73,8 +75,12 @@ def _admin_user() -> User:
 def test_distill_catalog_uses_capabilities_visible_to_selected_agent() -> None:
     with _test_session() as db:
         tenant = Tenant(id="tenant_demo", name="Demo")
-        agent = AgentProfile(id="agent_writer", tenant_id=tenant.id, name="Writer")
-        other_agent = AgentProfile(id="agent_other", tenant_id=tenant.id, name="Other")
+        agent = AgentProfile(
+            owner_user_id="admin", id="agent_writer", tenant_id=tenant.id, name="Writer"
+        )
+        other_agent = AgentProfile(
+            owner_user_id="admin", id="agent_other", tenant_id=tenant.id, name="Other"
+        )
         visible_tool = Tool(
             id="tool_excel",
             tenant_id=tenant.id,
@@ -145,13 +151,14 @@ def test_distill_catalog_uses_capabilities_visible_to_selected_agent() -> None:
         )
 
         assert {item["id"] for item in enriched.available_tools} == {visible_tool.id}
-        assert {item["id"] for item in enriched.available_general_skills} == {
-            visible_skill.id
-        }
+        assert {item["id"] for item in enriched.available_general_skills} == {visible_skill.id}
 
 
 def test_capability_scope_request_defaults_and_update_compatibility() -> None:
-    assert GeneralSkillImportRequest(tenant_id="tenant_demo", markdown="# demo").capability_scope is None
+    assert (
+        GeneralSkillImportRequest(tenant_id="tenant_demo", markdown="# demo").capability_scope
+        is None
+    )
     assert (
         KnowledgeBaseCreateRequest(tenant_id="tenant_demo", name="制度库").capability_scope
         == "general"
@@ -165,8 +172,7 @@ def test_capability_scope_request_defaults_and_update_compatibility() -> None:
         == "general"
     )
     assert (
-        MCPServerCreateRequest(tenant_id="tenant_demo", name="demo").capability_scope
-        == "general"
+        MCPServerCreateRequest(tenant_id="tenant_demo", name="demo").capability_scope == "general"
     )
     assert KnowledgeBaseUpdateRequest(tenant_id="tenant_demo").capability_scope is None
     assert (
@@ -190,18 +196,10 @@ def test_create_update_and_read_apis_round_trip_capability_scope() -> None:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.add(
             AgentProfile(
-                id="agent_overall",
-                tenant_id="tenant_demo",
-                name="整体智能体",
-                is_overall=True,
-            )
-        )
-        db.add(
-            AgentProfile(
+                owner_user_id="admin",
                 id="agent_private",
                 tenant_id="tenant_demo",
                 name="客服员工",
-                is_overall=False,
             )
         )
         db.commit()
@@ -231,21 +229,26 @@ def test_create_update_and_read_apis_round_trip_capability_scope() -> None:
             admin,
         )
         assert preserved_general_skill.capability_scope == "sop_specific"
-        private_general_skill = import_general_skill(
-            GeneralSkillImportRequest(
-                tenant_id="tenant_demo",
-                agent_id="agent_private",
-                slug="sop-helper",
-                original_slug="sop-helper",
-                name="员工 SOP Helper",
-                markdown="# Employee SOP Helper",
-            ),
-            db,
-            admin,
+        # 成员把广场技能引用到自己员工之后，不能再建一个同名的私有技能（4.7 跨来源唯一性）。
+        assert reference_resource(
+            db, "tenant_demo", "agent_private", "general_skill", general_skill.id, "admin"
         )
-        assert private_general_skill.id != general_skill.id
-        assert private_general_skill.capability_scope == "sop_specific"
+        db.commit()
+        with pytest.raises(HTTPException) as skill_conflict:
+            import_general_skill(
+                GeneralSkillImportRequest(
+                    tenant_id="tenant_demo",
+                    agent_id="agent_private",
+                    slug="sop-helper",
+                    name="员工 SOP Helper",
+                    markdown="# Employee SOP Helper",
+                ),
+                db,
+                admin,
+            )
+        assert skill_conflict.value.status_code == 409
 
+        # 广场工具由管理员直接建，不挂任何私人员工。
         tool = create_tool(
             ToolCreateRequest(
                 tenant_id="tenant_demo",
@@ -253,7 +256,7 @@ def test_create_update_and_read_apis_round_trip_capability_scope() -> None:
                 url="https://example.test/lookup",
                 capability_scope="sop_specific",
             ),
-            agent_id="agent_overall",
+            agent_id=None,
             db=db,
             current_user=admin,
         )
@@ -265,33 +268,28 @@ def test_create_update_and_read_apis_round_trip_capability_scope() -> None:
                 name="sop.lookup",
                 url="https://example.test/lookup-v2",
             ),
-            agent_id="agent_overall",
+            agent_id=None,
             db=db,
             current_user=admin,
         )
         assert preserved_tool.capability_scope == "sop_specific"
-        ensure_private_resource_binding(
-            db,
-            "tenant_demo",
-            "agent_private",
-            "tool",
-            tool.id,
-            "active",
-        )
+
+        # 引用的广场工具与私有工具同名 → 409，不允许出现"同名两份"。
+        assert reference_resource(db, "tenant_demo", "agent_private", "tool", tool.id, "admin")
         db.commit()
-        private_tool = update_tool(
-            tool.id,
-            ToolUpdateRequest(
-                tenant_id="tenant_demo",
-                name="sop.lookup",
-                url="https://example.test/private-lookup",
-            ),
-            agent_id="agent_private",
-            db=db,
-            current_user=admin,
-        )
-        assert private_tool.id != tool.id
-        assert private_tool.capability_scope == "sop_specific"
+        with pytest.raises(HTTPException) as tool_conflict:
+            create_tool(
+                ToolCreateRequest(
+                    tenant_id="tenant_demo",
+                    name="sop.lookup",
+                    url="https://example.test/private-lookup",
+                    capability_scope="sop_specific",
+                ),
+                agent_id="agent_private",
+                db=db,
+                current_user=admin,
+            )
+        assert tool_conflict.value.status_code == 409
 
         knowledge_base = create_knowledge_base(
             KnowledgeBaseCreateRequest(
@@ -299,7 +297,7 @@ def test_create_update_and_read_apis_round_trip_capability_scope() -> None:
                 name="SOP 制度库",
                 capability_scope="sop_specific",
             ),
-            agent_id="agent_overall",
+            agent_id=None,
             db=db,
             current_user=admin,
         )
@@ -310,7 +308,7 @@ def test_create_update_and_read_apis_round_trip_capability_scope() -> None:
                 tenant_id="tenant_demo",
                 capability_scope="general",
             ),
-            agent_id="agent_overall",
+            agent_id=None,
             db=db,
             current_user=admin,
         )
@@ -350,6 +348,7 @@ def test_knowledge_base_versions_inherit_root_scope() -> None:
             tenant_id="tenant_demo",
             name="SOP 制度库",
             capability_scope="sop_specific",
+            scope=GALLERY_SCOPE,
         )
         db.add(knowledge_base)
         db.flush()
@@ -357,28 +356,29 @@ def test_knowledge_base_versions_inherit_root_scope() -> None:
         version = ensure_knowledge_base_version(db, knowledge_base)
 
         assert version.capability_scope == "sop_specific"
-        assert knowledge_base_read(
-            knowledge_base, {}, version_row=version
-        ).capability_scope == "sop_specific"
+        assert (
+            knowledge_base_read(knowledge_base, {}, version_row=version).capability_scope
+            == "sop_specific"
+        )
 
 
-def test_private_knowledge_scope_update_uses_an_isolated_branch_version() -> None:
+def test_private_agent_cannot_fork_gallery_knowledge_scope() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.add(
             AgentProfile(
-                id="agent_overall",
-                tenant_id="tenant_demo",
-                name="整体智能体",
-                is_overall=True,
-            )
-        )
-        db.add(
-            AgentProfile(
+                owner_user_id="user_private",
                 id="agent_private",
                 tenant_id="tenant_demo",
                 name="客服员工",
-                is_overall=False,
+            )
+        )
+        db.add(
+            User(
+                id="user_private",
+                tenant_id="tenant_demo",
+                username="private",
+                password_hash="x",
             )
         )
         knowledge_base = KnowledgeBase(
@@ -386,6 +386,7 @@ def test_private_knowledge_scope_update_uses_an_isolated_branch_version() -> Non
             tenant_id="tenant_demo",
             name="共享制度库",
             capability_scope="general",
+            scope=GALLERY_SCOPE,
         )
         db.add(knowledge_base)
         db.flush()
@@ -396,40 +397,53 @@ def test_private_knowledge_scope_update_uses_an_isolated_branch_version() -> Non
             "knowledge_base",
             knowledge_base.id,
             "active",
+            revive=True,
         )
         db.commit()
 
-        private_read = update_knowledge_base(
+        member = User(
+            id="user_private",
+            tenant_id="tenant_demo",
+            username="private",
+            password_hash="x",
+        )
+        # 广场知识库仅管理员可写：成员以自己员工身份改它 → 403（不再生成私有分支副本）。
+        with pytest.raises(HTTPException) as denied:
+            update_knowledge_base(
+                knowledge_base.id,
+                KnowledgeBaseUpdateRequest(
+                    tenant_id="tenant_demo",
+                    capability_scope="sop_specific",
+                ),
+                agent_id="agent_private",
+                db=db,
+                current_user=member,
+            )
+        assert denied.value.status_code == 403
+
+        # 管理员改广场知识库：内容只有一份，所有使用者立刻看到新 scope，不产生任何副本。
+        updated = update_knowledge_base(
             knowledge_base.id,
             KnowledgeBaseUpdateRequest(
                 tenant_id="tenant_demo",
                 capability_scope="sop_specific",
             ),
-            agent_id="agent_private",
+            agent_id=None,
             db=db,
             current_user=_admin_user(),
         )
-
-        branch = db.exec(
-            select(AgentKnowledgeBranch).where(
-                AgentKnowledgeBranch.agent_id == "agent_private",
-                AgentKnowledgeBranch.knowledge_base_id == knowledge_base.id,
-            )
-        ).one()
-        branch_version = db.exec(
-            select(KnowledgeBaseVersion).where(
-                KnowledgeBaseVersion.knowledge_base_id == knowledge_base.id,
-                KnowledgeBaseVersion.version == branch.head_version,
-            )
-        ).one()
         db.refresh(knowledge_base)
         db.refresh(base_version)
 
-        assert private_read.capability_scope == "sop_specific"
-        assert branch.head_version != branch.base_version
-        assert branch_version.capability_scope == "sop_specific"
-        assert base_version.capability_scope == "general"
-        assert knowledge_base.capability_scope == "general"
+        assert updated.capability_scope == "sop_specific"
+        assert knowledge_base.capability_scope == "sop_specific"
+        assert base_version.capability_scope == "sop_specific"
+        versions = db.exec(
+            select(KnowledgeBaseVersion).where(
+                KnowledgeBaseVersion.knowledge_base_id == knowledge_base.id
+            )
+        ).all()
+        assert len(versions) == 1
 
 
 def test_mcp_server_scope_cascades_only_to_inherited_children() -> None:
@@ -442,6 +456,7 @@ def test_mcp_server_scope_cascades_only_to_inherited_children() -> None:
         inherited = Tool(
             tenant_id="tenant_demo",
             name="demo.inherited",
+            scope=GALLERY_SCOPE,
             method="POST",
             url="mcp://demo/inherited",
             tool_type="mcp",
@@ -453,6 +468,7 @@ def test_mcp_server_scope_cascades_only_to_inherited_children() -> None:
         overridden = Tool(
             tenant_id="tenant_demo",
             name="demo.overridden",
+            scope=GALLERY_SCOPE,
             method="POST",
             url="mcp://demo/overridden",
             tool_type="mcp",
@@ -481,14 +497,6 @@ def test_mcp_server_scope_cascades_only_to_inherited_children() -> None:
 def test_mcp_sync_inherits_server_scope_and_accepts_child_override() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(
-            AgentProfile(
-                id="agent_overall",
-                tenant_id="tenant_demo",
-                name="整体智能体",
-                is_overall=True,
-            )
-        )
         server = MCPServer(
             id="server_builtin",
             tenant_id="tenant_demo",
@@ -544,15 +552,19 @@ def test_sqlite_capability_scope_migration_backfills_and_is_idempotent(tmp_path)
 
     with engine.begin() as conn:
         for table_name in table_names:
-            assert conn.execute(
-                text(f"SELECT capability_scope FROM {table_name} WHERE id = 'legacy'")
-            ).scalar_one() == "general"
-        conn.execute(
-            text("UPDATE tools SET capability_scope = 'unsupported' WHERE id = 'legacy'")
-        )
+            assert (
+                conn.execute(
+                    text(f"SELECT capability_scope FROM {table_name} WHERE id = 'legacy'")
+                ).scalar_one()
+                == "general"
+            )
+        conn.execute(text("UPDATE tools SET capability_scope = 'unsupported' WHERE id = 'legacy'"))
 
     with engine.begin() as conn:
         _migrate_capability_scope_schema(conn, inspect(engine), table_names)
-        assert conn.execute(
-            text("SELECT capability_scope FROM tools WHERE id = 'legacy'")
-        ).scalar_one() == "general"
+        assert (
+            conn.execute(
+                text("SELECT capability_scope FROM tools WHERE id = 'legacy'")
+            ).scalar_one()
+            == "general"
+        )

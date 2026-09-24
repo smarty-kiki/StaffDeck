@@ -9,7 +9,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
 import { api, TENANT_ID } from '../api/client';
-import { type EnterpriseAuthUser } from '../auth';
+import { isEmployeeOwnedBy, isEnterpriseAdmin, type EnterpriseAuthUser } from '../auth';
 
 import AppHeader from '../components/AppHeader';
 import { ConfirmDialog } from '../components/ConfirmDialog';
@@ -19,7 +19,9 @@ import EmployeeCard from '../components/EmployeeCard';
 import EmployeeProfileEditor from '../components/EmployeeProfileEditor';
 import {
   canManageEmployeeAgent,
+  canPublishAgentToGallery,
   canSelectCurrentEmployeeAgent,
+  canUnpublishAgent,
   employeeDisplayName,
   employeeDisplayNameWithCreator,
   employeeProfile,
@@ -80,10 +82,14 @@ export default function AgentsPage({
     return () => window.removeEventListener('ultrarag-enterprise-agent-scope-change', handler);
   }, []);
 
-  const employees = useMemo(
-    () => agents.filter((item) => !item.is_overall && canManageEmployeeAgent(item, currentUser)),
-    [agents, currentUser],
-  );
+  // 列表按归属过滤：普通账号只看自己名下的员工。
+  // 管理员额外可见全部员工 —— 这不给他编辑权，只为让他能行使「从广场下架」
+  // （编辑/删除/上下线仍由 `canManageEmployeeAgent` 逐卡门控，仅归属人可用）。
+  const employees = useMemo(() => {
+    // 广场不是一条「员工」记录：agents 里每一行都是真实数字员工。
+    if (isEnterpriseAdmin(currentUser)) return agents;
+    return agents.filter((item) => isEmployeeOwnedBy(item, currentUser));
+  }, [agents, currentUser]);
   const offlineEmployees = employees.filter((item) => item.status !== 'active');
   const onlineEmployees = employees.filter((item) => item.status === 'active');
   const pendingEmployees = employees.filter((item) => {
@@ -155,16 +161,13 @@ export default function AgentsPage({
 
   async function updateGalleryState(row: AgentProfileRead, published: boolean) {
     try {
-      const metadata = {
-        ...(row.metadata || {}),
-        published_to_gallery: published,
-        gallery_published_at: published ? new Date().toISOString() : undefined,
-        gallery_published_by: published ? currentUser?.username : undefined,
-      };
-      await api.put<AgentProfileRead>(`/api/enterprise/agents/${row.id}`, {
-        tenant_id: TENANT_ID,
-        metadata,
-      });
+      // 发布状态是 `agent_profiles.is_published` 这一列，改 metadata 不会再生效。
+      // 发布与下架是两个独立端点：发布只认归属人，下架归属人或管理员皆可。
+      const action = published ? 'gallery:publish' : 'gallery:unpublish';
+      await api.post<AgentProfileRead>(
+        `/api/enterprise/agents/${encodeURIComponent(row.id)}/${action}?tenant_id=${encodeURIComponent(TENANT_ID)}`,
+        {},
+      );
       notify.success(published ? '已发布到广场' : '已从广场下架');
       await load();
       window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));
@@ -292,6 +295,8 @@ export default function AgentsPage({
             employee={employee}
             busy={selectingAgentId === employee.id}
             canManage={canManageEmployeeAgent(employee, currentUser)}
+            canPublish={canPublishAgentToGallery(employee, currentUser)}
+            canUnpublish={canUnpublishAgent(employee, currentUser)}
             selected={employee.id === selectedAgentId}
             onOpen={() => void selectEmployee(employee)}
             onStatus={(status) => void updateStatus(employee, status)}
@@ -316,7 +321,6 @@ export default function AgentsPage({
       <EmployeeProfileEditor
         agent={profileAgent}
         open={Boolean(profileAgent)}
-        currentUser={currentUser}
         onClose={() => setProfileAgent(null)}
         onSaved={updateAgentInList}
       />

@@ -141,17 +141,16 @@ export default function DashboardPage({
     };
   }, [agentId, currentUser, isAdmin]);
 
+  // 广场不是一条「员工」记录：agents 里每一行都是真实数字员工。
   const selectedAgent = agents.find((item) => item.id === agentId)
-    || agents.find((item) => !item.is_overall)
+    || agents[0]
     || null;
-  const employeeSessions = selectedAgent?.is_overall
-    ? sessions
-    : sessions.filter((item) => item.agent_id === selectedAgent?.id);
+  const employeeSessions = sessions.filter((item) => item.agent_id === selectedAgent?.id);
 
   useEffect(() => {
     let cancelled = false;
     async function loadWorkRecord() {
-      if (!selectedAgent || selectedAgent.is_overall) {
+      if (!selectedAgent) {
         setActivityEvents([]);
         return;
       }
@@ -172,7 +171,7 @@ export default function DashboardPage({
     return () => {
       cancelled = true;
     };
-  }, [selectedAgent?.id, selectedAgent?.is_overall]);
+  }, [selectedAgent?.id]);
   const defaultModel = models.find((item) => item.is_default);
   const totalCalls = skills.reduce((sum, item) => sum + (item.total_call_count || item.call_count || 0), 0);
   const positiveFeedback = skills.reduce((sum, item) => sum + (item.total_positive_feedback_count || 0), 0);
@@ -202,7 +201,7 @@ export default function DashboardPage({
     );
   }
 
-  if (!selectedAgent || selectedAgent.is_overall) {
+  if (!selectedAgent) {
     return (
       <div className="page dashboard-page">
         <div className="page-title">
@@ -217,7 +216,7 @@ export default function DashboardPage({
             </p>
           </div>
           <div className="employee-hero-metrics">
-            <MetricTile label="员工" value={agents.filter((item) => !item.is_overall).length} />
+            <MetricTile label="员工" value={agents.length} />
             <MetricTile label="对话" value={sessions.length} />
             <MetricTile label="反馈" value={feedbackSummary?.total_feedback || 0} />
           </div>
@@ -245,7 +244,8 @@ export default function DashboardPage({
   const employee = employeeProfile(selectedAgent);
   const employeeCreator = employeeCreatorName(selectedAgent);
   const canEditSelectedAgent = canManageEmployeeAgent(selectedAgent, currentUser);
-  const activeSkills = skills.filter((item) => item.status === 'published' && item.branch_status !== 'inactive');
+  // 分支模型已下线：SOP 生命周期只由 status 决定。
+  const activeSkills = skills.filter((item) => item.status === 'published');
   const activeGeneralSkills = generalSkills.filter((item) => item.status === 'published');
   const activeKnowledge = visibleKnowledgeBases.filter((item) => item.status === 'active');
   const activeTools = tools.filter((item) => item.enabled);
@@ -401,7 +401,6 @@ export default function DashboardPage({
       <EmployeeProfileEditor
         agent={selectedAgent}
         open={profileEditorOpen}
-        currentUser={currentUser}
         onClose={() => setProfileEditorOpen(false)}
         onSaved={(saved) => setAgents((current) => current.map((item) => (item.id === saved.id ? saved : item)))}
       />

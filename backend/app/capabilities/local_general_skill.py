@@ -10,8 +10,8 @@ from typing import Any
 from sqlmodel import select
 
 from app.agents.branching import (
-    is_bound_resource_visible_for_agent,
     is_open_gallery_resource,
+    referenced_resource_ids,
 )
 from app.capabilities.contracts import (
     CapabilityContext,
@@ -20,7 +20,7 @@ from app.capabilities.contracts import (
     GeneralSkillResourceRef,
     GeneralSkillSummary,
 )
-from app.db.models import AgentProfile, AgentResourceBinding, GeneralSkill
+from app.db.models import AGENT_SCOPE, AgentProfile, GeneralSkill
 
 LOCAL_GENERAL_SKILL_PROVIDER_ID = "local_general_skill"
 LOCAL_GENERAL_SKILL_PACKAGE_CONTRACT = "1"
@@ -96,28 +96,17 @@ class LocalGeneralSkillCatalog:
 
     def _is_visible(self, context: CapabilityContext, row: GeneralSkill) -> bool:
         agent = self.db.get(AgentProfile, context.agent_id)
-        if not agent or agent.tenant_id != context.tenant_id or agent.is_overall:
+        if not agent or agent.tenant_id != context.tenant_id:
             return is_open_gallery_resource(
                 self.db, context.tenant_id, "general_skill", row
             )
-        binding = self.db.exec(
-            select(AgentResourceBinding).where(
-                AgentResourceBinding.tenant_id == context.tenant_id,
-                AgentResourceBinding.agent_id == agent.id,
-                AgentResourceBinding.resource_type == "general_skill",
-                AgentResourceBinding.resource_id == row.id,
-                AgentResourceBinding.status == "active",
-            )
-        ).first()
-        return bool(
-            binding
-            and is_bound_resource_visible_for_agent(
-                self.db,
-                context.tenant_id,
-                "general_skill",
-                row,
-                binding,
-            )
+        # 私有技能归属即生效；广场技能需已引用。
+        if getattr(row, "scope", None) == AGENT_SCOPE and row.owner_agent_id == agent.id:
+            return True
+        if not is_open_gallery_resource(self.db, context.tenant_id, "general_skill", row):
+            return False
+        return row.id in set(
+            referenced_resource_ids(self.db, context.tenant_id, agent.id, "general_skill")
         )
 
 

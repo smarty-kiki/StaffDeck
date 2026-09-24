@@ -10,7 +10,7 @@ import pytest
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
-from app.db.models import Tenant, Tool
+from app.db.models import GALLERY_SCOPE, Tenant, Tool
 from app.api.tools import probe_tool
 from app.tools.tool_schema import ToolProbeRequest
 from app.db.models import User
@@ -73,7 +73,7 @@ def test_real_auth_matrix_service_accepts_tool_configuration(
 ) -> None:
     with _session() as db:
         db.add(
-            Tool(
+            Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
                 tenant_id="tenant_demo",
                 name=name,
                 method="POST",

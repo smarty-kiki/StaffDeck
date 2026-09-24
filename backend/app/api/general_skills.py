@@ -23,15 +23,18 @@ from sqlmodel import Session, select
 from app.agents.branching import (
     ensure_open_gallery_binding,
     ensure_private_resource_binding,
+    ensure_visible_name_unique,
     get_agent,
-    hide_open_gallery_binding,
-    is_bound_resource_visible_for_agent,
     is_open_gallery_resource,
     mark_resource_open_gallery,
     mark_resource_private_for_agent,
     metadata_preserving_creator,
-    require_overall_agent,
+    purge_resource_references,
+    reference_resource,
+    referenced_resource_ids,
+    unreference_resource,
     user_creator_metadata,
+    visible_general_skill_rows,
 )
 from app.capabilities.local_general_skill import (
     GeneralSkillRuntimeSnapshot,
@@ -41,8 +44,9 @@ from app.capability_scope import normalize_capability_scope
 from app.core import AgentLoop
 from app.db import engine, get_session
 from app.db.models import (
+    AGENT_SCOPE,
+    GALLERY_SCOPE,
     AgentEvent,
-    AgentResourceBinding,
     ChatSession,
     GeneralSkill,
     Message,
@@ -66,6 +70,7 @@ from app.security.auth import get_current_user
 from app.security.permissions import (
     ensure_agent_scope_manager,
     ensure_open_gallery_admin,
+    ensure_resource_writer,
     require_agent_scope_viewer,
 )
 from app.security.tenant import ensure_tenant
@@ -146,63 +151,34 @@ def import_general_skill(
     lookup_slug = _optional_text(request.original_slug)
     agent_id = _agent_id_or_none(request.agent_id)
     agent = ensure_agent_scope_manager(db, request.tenant_id, agent_id, current_user)
-    is_private_agent_scope = bool(agent and not agent.is_overall)
-    if not is_private_agent_scope:
+    private_owner_agent_id = agent.id if agent else None
+    if not private_owner_agent_id:
         ensure_open_gallery_admin(request.tenant_id, current_user)
     row = None
-    package_source_row = None
     inherited_capability_scope = "general"
     if lookup_slug:
-        row = db.exec(
-            select(GeneralSkill).where(
-                GeneralSkill.tenant_id == request.tenant_id,
-                GeneralSkill.slug == lookup_slug,
-            )
-        ).first()
+        row = _scoped_general_skill(db, request.tenant_id, lookup_slug, private_owner_agent_id)
         if not row:
             raise HTTPException(status_code=404, detail="General skill to update was not found")
         inherited_capability_scope = normalize_capability_scope(row.capability_scope)
         if slug != row.slug:
             raise HTTPException(status_code=400, detail="General skill slug cannot be modified")
-        if is_private_agent_scope:
-            if is_open_gallery_resource(db, request.tenant_id, "general_skill", row):
-                package_source_row = row
-                row = None
-                slug = _unique_slug(db, request.tenant_id, slug)
-            elif not _general_skill_editable_by_agent(db, request.tenant_id, agent.id, row):
-                raise HTTPException(
-                    status_code=404, detail="General skill not visible to this agent"
-                )
-            elif not _private_skill_owned_by_agent(
-                db, request.tenant_id, row, agent.id
-            ):
-                package_source_row = row
-                row = None
-                slug = _unique_slug(db, request.tenant_id, slug)
+        # 只有归属人可改：广场技能归广场所有（仅管理员可改），成员只能引用、不复制副本。
+        ensure_resource_writer(db, request.tenant_id, current_user, row)
     else:
-        conflict = db.exec(
-            select(GeneralSkill).where(
-                GeneralSkill.tenant_id == request.tenant_id,
-                GeneralSkill.slug == slug,
-            )
-        ).first()
+        conflict = _scoped_general_skill(db, request.tenant_id, slug, private_owner_agent_id)
         if conflict:
-            if is_private_agent_scope and is_open_gallery_resource(
-                db,
-                request.tenant_id,
-                "general_skill",
-                conflict,
-            ):
-                slug = _unique_slug(db, request.tenant_id, slug)
-            elif is_private_agent_scope and _private_skill_owned_by_agent(
-                db, request.tenant_id, conflict, agent.id
-            ):
-                # A private skill removed from this agent keeps its entity so
-                # other references remain stable; re-import should restore it.
+            if private_owner_agent_id and conflict.owner_agent_id == private_owner_agent_id:
+                # 重新导入自己的私有技能 = 就地更新（保持 id 稳定，已有引用不丢）。
                 row = conflict
             else:
                 raise HTTPException(status_code=409, detail="General skill slug already exists")
-    package_source = row or package_source_row
+    package_source = row
+    if package_source is None and private_owner_agent_id:
+        # 跨来源唯一性：私有通用技能 slug 不能与该员工已引用的广场技能重名（设计 4.7）。
+        ensure_visible_name_unique(
+            db, request.tenant_id, private_owner_agent_id, "general_skill", slug
+        )
     if package_source is not None and not request.files and request.markdown is not None:
         files = _replace_skill_markdown_in_package(package_source, request.markdown)
         markdown = _skill_markdown_from_files(files)
@@ -215,6 +191,8 @@ def import_general_skill(
     now = utc_now()
     if row:
         metadata = metadata_preserving_creator(row.metadata_json, parsed_metadata)
+        if row.created_by_user_id is None:
+            row.created_by_user_id = current_user.id
         directories = (
             requested_directories
             if requested_directories is not None
@@ -224,23 +202,6 @@ def import_general_skill(
             metadata["skill_directories"] = directories
         else:
             metadata.pop("skill_directories", None)
-        if slug != row.slug:
-            conflict = db.exec(
-                select(GeneralSkill).where(
-                    GeneralSkill.tenant_id == request.tenant_id,
-                    GeneralSkill.slug == slug,
-                )
-            ).first()
-            if conflict:
-                if is_private_agent_scope and is_open_gallery_resource(
-                    db,
-                    request.tenant_id,
-                    "general_skill",
-                    conflict,
-                ):
-                    slug = _unique_slug(db, request.tenant_id, slug)
-                else:
-                    raise HTTPException(status_code=409, detail="General skill slug already exists")
         row.slug = slug
         row.name = name
         row.description = description
@@ -272,47 +233,14 @@ def import_general_skill(
             runtime_config_json={"runtime": "python", "timeout_seconds": 12},
             created_at=now,
             updated_at=now,
+            created_by_user_id=current_user.id,
         )
-    if is_private_agent_scope:
-        mark_resource_private_for_agent(row, agent.id, metadata)
+    # 归属是列：私有 = scope='agent' + owner_agent_id；广场 = scope='gallery' + 无归属。
+    if private_owner_agent_id:
+        mark_resource_private_for_agent(row, private_owner_agent_id, metadata)
     else:
         mark_resource_open_gallery(row, metadata)
     db.add(row)
-    db.flush()
-    if is_private_agent_scope:
-        ensure_private_resource_binding(
-            db,
-            request.tenant_id,
-            agent.id,
-            "general_skill",
-            row.id,
-            "active" if request.status == "published" else "inactive",
-            metadata_json=metadata,
-            revive=True,
-        )
-        if package_source_row is not None and package_source_row.id != row.id:
-            replaced_binding = db.exec(
-                select(AgentResourceBinding).where(
-                    AgentResourceBinding.tenant_id == request.tenant_id,
-                    AgentResourceBinding.agent_id == agent.id,
-                    AgentResourceBinding.resource_type == "general_skill",
-                    AgentResourceBinding.resource_id == package_source_row.id,
-                    AgentResourceBinding.status != "deleted",
-                )
-            ).first()
-            if replaced_binding is not None:
-                replaced_binding.status = "deleted"
-                replaced_binding.updated_at = now
-                db.add(replaced_binding)
-    else:
-        ensure_open_gallery_binding(
-            db,
-            request.tenant_id,
-            "general_skill",
-            row.id,
-            "active" if request.status == "published" else "inactive",
-            metadata_json=metadata,
-        )
     db.commit()
     db.refresh(row)
     return general_skill_read(row)
@@ -437,6 +365,12 @@ def _create_imported_general_skill(
     now = utc_now()
     resolved_agent_id = _agent_id_or_none(agent_id)
     agent = ensure_agent_scope_manager(db, tenant_id, resolved_agent_id, current_user)
+    private_owner_agent_id = agent.id if agent else None
+    if not private_owner_agent_id:
+        ensure_open_gallery_admin(tenant_id, current_user)
+    creator_metadata = user_creator_metadata(
+        current_user, {**metadata, "import_source": import_source}
+    )
     row = GeneralSkill(
         tenant_id=tenant_id,
         slug=resolved_slug,
@@ -445,42 +379,28 @@ def _create_imported_general_skill(
         homepage=resolved_homepage,
         skill_markdown=markdown,
         skill_files_json=[file.model_dump(mode="json") for file in files],
-        metadata_json=user_creator_metadata(
-            current_user, {**metadata, "import_source": import_source}
-        ),
+        metadata_json=creator_metadata,
         status=status,
         capability_scope=normalize_capability_scope(capability_scope),
         permissions_json={"network": True, "python": True},
         runtime_config_json={"runtime": "python", "timeout_seconds": 12},
         created_at=now,
         updated_at=now,
+        scope=AGENT_SCOPE if private_owner_agent_id else GALLERY_SCOPE,
+        owner_agent_id=private_owner_agent_id,
+        created_by_user_id=current_user.id,
     )
-    if not (agent and not agent.is_overall):
-        ensure_open_gallery_admin(tenant_id, current_user)
-    if agent and not agent.is_overall:
-        mark_resource_private_for_agent(row, agent.id, row.metadata_json or {})
-    else:
-        mark_resource_open_gallery(row, row.metadata_json or {})
     db.add(row)
     db.flush()
-    if agent and not agent.is_overall:
+    if private_owner_agent_id:
+        mark_resource_private_for_agent(row, private_owner_agent_id, creator_metadata)
         ensure_private_resource_binding(
-            db,
-            tenant_id,
-            agent.id,
-            "general_skill",
-            row.id,
-            "active" if status == "published" else "inactive",
-            metadata_json=row.metadata_json or {},
+            db, tenant_id, private_owner_agent_id, "general_skill", row.id
         )
     else:
+        mark_resource_open_gallery(row, creator_metadata)
         ensure_open_gallery_binding(
-            db,
-            tenant_id,
-            "general_skill",
-            row.id,
-            "active" if status == "published" else "inactive",
-            metadata_json=row.metadata_json or {},
+            db, tenant_id, "general_skill", row.id, metadata_json=creator_metadata
         )
     db.commit()
     db.refresh(row)
@@ -497,54 +417,7 @@ def list_general_skills(
 ) -> list[GeneralSkillRead]:
     ensure_tenant(db, tenant_id)
     agent_id = _agent_id_or_none(agent_id)
-    agent = get_agent(db, tenant_id, agent_id)
-    if agent and not agent.is_overall:
-        bindings = db.exec(
-            select(AgentResourceBinding)
-            .where(
-                AgentResourceBinding.tenant_id == tenant_id,
-                AgentResourceBinding.agent_id == agent.id,
-                AgentResourceBinding.resource_type == "general_skill",
-            )
-            .order_by(AgentResourceBinding.updated_at.desc())
-        ).all()
-        if not bindings:
-            return []
-        rows_by_id = {
-            row.id: row
-            for row in db.exec(
-                select(GeneralSkill).where(
-                    GeneralSkill.tenant_id == tenant_id,
-                    GeneralSkill.id.in_([binding.resource_id for binding in bindings]),
-                )
-            ).all()
-        }
-        visible_rows: list[GeneralSkillRead] = []
-        for binding in bindings:
-            row = rows_by_id.get(binding.resource_id)
-            if not row:
-                continue
-            if not is_bound_resource_visible_for_agent(
-                db, tenant_id, "general_skill", row, binding
-            ):
-                continue
-            visible_rows.append(
-                general_skill_read(
-                    row,
-                    status_override=(
-                        "published"
-                        if binding.status == "active" and row.status == "published"
-                        else "archived"
-                    ),
-                )
-            )
-        return visible_rows
-    rows = db.exec(
-        select(GeneralSkill)
-        .where(GeneralSkill.tenant_id == tenant_id)
-        .order_by(GeneralSkill.updated_at.desc())
-    ).all()
-    rows = [row for row in rows if is_open_gallery_resource(db, tenant_id, "general_skill", row)]
+    rows = visible_general_skill_rows(db, tenant_id, agent_id)
     return [general_skill_read(row) for row in rows]
 
 
@@ -573,18 +446,18 @@ def publish_general_skill(
     row = _get_general_skill(db, tenant_id, slug)
     agent_id = _agent_id_or_none(agent_id)
     agent = ensure_agent_scope_manager(db, tenant_id, agent_id, current_user)
-    if agent and not agent.is_overall:
-        binding = _ensure_general_skill_binding(
-            db,
-            tenant_id,
-            agent.id,
-            row.id,
-            metadata_json=row.metadata_json or {},
-        )
-        binding.status = "active"
-        binding.updated_at = utc_now()
-        db.add(binding)
+    if agent:
+        if getattr(row, "owner_agent_id", None) == agent.id:
+            row.status = "published"
+            row.updated_at = utc_now()
+            db.add(row)
+        else:
+            # 广场技能「启用」= 建立引用，不改技能本身。
+            reference_resource(
+                db, tenant_id, agent.id, "general_skill", row.id, current_user.id
+            )
         db.commit()
+        db.refresh(row)
         return general_skill_read(row, status_override="published")
     ensure_open_gallery_admin(tenant_id, current_user)
     row.status = "published"
@@ -592,14 +465,6 @@ def publish_general_skill(
     row.updated_at = utc_now()
     db.add(row)
     db.flush()
-    ensure_open_gallery_binding(
-        db,
-        tenant_id,
-        "general_skill",
-        row.id,
-        "active",
-        metadata_json=row.metadata_json or {},
-    )
     db.commit()
     db.refresh(row)
     return general_skill_read(row)
@@ -616,56 +481,22 @@ def archive_general_skill(
     row = _get_general_skill(db, tenant_id, slug)
     agent_id = _agent_id_or_none(agent_id)
     agent = ensure_agent_scope_manager(db, tenant_id, agent_id, current_user)
-    if agent and not agent.is_overall:
-        binding = _ensure_general_skill_binding(db, tenant_id, agent.id, row.id)
-        binding.status = "inactive"
-        binding.updated_at = utc_now()
-        db.add(binding)
+    if agent:
+        if getattr(row, "owner_agent_id", None) == agent.id:
+            row.status = "archived"
+            row.updated_at = utc_now()
+            db.add(row)
+        else:
+            # 广场技能「停用」= 取消引用（删行），不改技能本身。
+            unreference_resource(db, tenant_id, agent.id, "general_skill", row.id)
         db.commit()
+        db.refresh(row)
         return general_skill_read(row, status_override="archived")
     ensure_open_gallery_admin(tenant_id, current_user)
     row.status = "archived"
     row.updated_at = utc_now()
     db.add(row)
     db.flush()
-    ensure_open_gallery_binding(db, tenant_id, "general_skill", row.id, "inactive")
-    db.commit()
-    db.refresh(row)
-    return general_skill_read(row)
-
-
-@router.post("/{slug}/publish-to-gallery", response_model=GeneralSkillRead)
-def publish_general_skill_to_gallery(
-    slug: str,
-    tenant_id: str = Query(...),
-    agent_id: str = Query(...),
-    db: Session = Depends(get_session),
-    current_user: User = Depends(get_current_user),
-) -> GeneralSkillRead:
-    """Promote an agent-private skill to the tenant's open gallery."""
-    row = _get_general_skill(db, tenant_id, slug)
-    agent = ensure_agent_scope_manager(db, tenant_id, agent_id, current_user)
-    if agent is None or agent.is_overall:
-        raise HTTPException(status_code=400, detail="A non-overall agent is required")
-    if is_open_gallery_resource(db, tenant_id, "general_skill", row):
-        return general_skill_read(row)
-    if not _private_skill_owned_by_agent(db, tenant_id, row, agent.id):
-        raise HTTPException(status_code=403, detail="Only the skill owner can publish it")
-
-    row.status = "published"
-    mark_resource_open_gallery(row, row.metadata_json or {})
-    row.updated_at = utc_now()
-    db.add(row)
-    db.flush()
-    ensure_open_gallery_binding(
-        db,
-        tenant_id,
-        "general_skill",
-        row.id,
-        "active",
-        metadata_json=row.metadata_json or {},
-        revive=True,
-    )
     db.commit()
     db.refresh(row)
     return general_skill_read(row)
@@ -679,26 +510,10 @@ def delete_general_skill(
     agent_id: str | None = Query(None),
     current_user: User = Depends(get_current_user),
 ) -> dict[str, str]:
-    agent_id = _agent_id_or_none(agent_id)
     row = _get_general_skill(db, tenant_id, slug)
-    agent = ensure_agent_scope_manager(db, tenant_id, agent_id, current_user)
-    if agent and not agent.is_overall:
-        binding = _ensure_general_skill_binding(db, tenant_id, agent.id, row.id)
-        binding.status = "deleted"
-        binding.updated_at = utc_now()
-        db.add(binding)
-        db.commit()
-        return {"status": "hidden", "slug": slug}
-    if agent and agent.is_overall:
-        if not is_open_gallery_resource(db, tenant_id, "general_skill", row):
-            raise HTTPException(status_code=404, detail="General skill not visible in open gallery")
-        ensure_open_gallery_admin(tenant_id, current_user)
-        hide_open_gallery_binding(db, tenant_id, "general_skill", row.id)
-        db.commit()
-        return {"status": "hidden", "slug": slug}
-
-    require_overall_agent(db, tenant_id, agent_id)
-    ensure_open_gallery_admin(tenant_id, current_user)
+    ensure_resource_writer(db, tenant_id, current_user, row)
+    # 真删，并清理所有引用行 —— 引用它的员工立刻失去这个技能。
+    purge_resource_references(db, tenant_id, "general_skill", row.id)
     db.delete(row)
     db.commit()
     return {"status": "deleted", "slug": slug}
@@ -978,26 +793,30 @@ def _get_general_skill(db: Session, tenant_id: str, slug: str) -> GeneralSkill:
     return row
 
 
+def _scoped_general_skill(
+    db: Session, tenant_id: str, slug: str, owner_agent_id: str | None
+) -> GeneralSkill | None:
+    """按归属查技能：私有按 (scope='agent', owner_agent_id)，广场按 scope='gallery'。
+
+    slug 只在同一归属内唯一 —— 不同员工可以有同名通用技能（私有侧按 owner 唯一），
+    广场侧按租户唯一。因此按 slug 查找必须带上是哪个平面，否则会撞到别人的同名技能。
+    """
+    statement = select(GeneralSkill).where(
+        GeneralSkill.tenant_id == tenant_id, GeneralSkill.slug == slug
+    )
+    if owner_agent_id:
+        statement = statement.where(
+            GeneralSkill.scope == AGENT_SCOPE, GeneralSkill.owner_agent_id == owner_agent_id
+        )
+    else:
+        statement = statement.where(GeneralSkill.scope == GALLERY_SCOPE)
+    return db.exec(statement).first()
+
+
 def _private_skill_owned_by_agent(
     db: Session, tenant_id: str, row: GeneralSkill, agent_id: str
 ) -> bool:
-    metadata = row.metadata_json or {}
-    if metadata.get("owner_agent_id") == agent_id and metadata.get("scope") == "agent_private":
-        return True
-    binding = db.exec(
-        select(AgentResourceBinding).where(
-            AgentResourceBinding.tenant_id == tenant_id,
-            AgentResourceBinding.agent_id == agent_id,
-            AgentResourceBinding.resource_type == "general_skill",
-            AgentResourceBinding.resource_id == row.id,
-        )
-    ).first()
-    binding_metadata = binding.metadata_json if binding else {}
-    return bool(
-        binding
-        and binding_metadata.get("scope") == "agent_private"
-        and binding_metadata.get("owner_agent_id") == agent_id
-    )
+    return getattr(row, "scope", None) == AGENT_SCOPE and row.owner_agent_id == agent_id
 
 
 def _ensure_general_skill_visible(
@@ -1007,89 +826,26 @@ def _ensure_general_skill_visible(
     agent_id: str | None,
 ) -> None:
     agent = get_agent(db, tenant_id, _agent_id_or_none(agent_id))
-    if not agent or agent.is_overall:
+    if not agent:
         if is_open_gallery_resource(db, tenant_id, "general_skill", row):
             return
         raise HTTPException(status_code=404, detail="General skill not visible in open gallery")
-    binding = db.exec(
-        select(AgentResourceBinding).where(
-            AgentResourceBinding.tenant_id == tenant_id,
-            AgentResourceBinding.agent_id == agent.id,
-            AgentResourceBinding.resource_type == "general_skill",
-            AgentResourceBinding.resource_id == row.id,
-        )
-    ).first()
-    if not binding or not is_bound_resource_visible_for_agent(
-        db, tenant_id, "general_skill", row, binding
-    ):
+    if getattr(row, "owner_agent_id", None) == agent.id:
+        return
+    if row.id not in set(referenced_resource_ids(db, tenant_id, agent.id, "general_skill")):
         raise HTTPException(status_code=404, detail="General skill not visible to this agent")
-
-
-def _ensure_general_skill_binding(
-    db: Session,
-    tenant_id: str,
-    agent_id: str,
-    general_skill_id: str,
-    metadata_json: dict[str, object] | None = None,
-) -> AgentResourceBinding:
-    row = db.exec(
-        select(AgentResourceBinding).where(
-            AgentResourceBinding.tenant_id == tenant_id,
-            AgentResourceBinding.agent_id == agent_id,
-            AgentResourceBinding.resource_type == "general_skill",
-            AgentResourceBinding.resource_id == general_skill_id,
-        )
-    ).first()
-    metadata = {
-        **(metadata_json or {}),
-        "scope": "agent_private",
-        "visibility": "agent_private",
-        "owner_agent_id": agent_id,
-        "created_from_agent": True,
-    }
-    if row:
-        merged_metadata = {
-            **(row.metadata_json or {}),
-            **metadata,
-        }
-        row.metadata_json = metadata_preserving_creator(
-            row.metadata_json,
-            merged_metadata,
-        )
-        return row
-    row = AgentResourceBinding(
-        tenant_id=tenant_id,
-        agent_id=agent_id,
-        resource_type="general_skill",
-        resource_id=general_skill_id,
-        status="active",
-        metadata_json=metadata,
-    )
-    db.add(row)
-    db.flush()
-    return row
+    if not is_open_gallery_resource(db, tenant_id, "general_skill", row):
+        raise HTTPException(status_code=404, detail="General skill not visible to this agent")
 
 
 def _general_skill_editable_by_agent(
     db: Session, tenant_id: str, agent_id: str, row: GeneralSkill
 ) -> bool:
-    metadata = row.metadata_json or {}
-    if metadata.get("owner_agent_id") == agent_id and metadata.get("scope") == "agent_private":
-        return True
-    binding = db.exec(
-        select(AgentResourceBinding).where(
-            AgentResourceBinding.tenant_id == tenant_id,
-            AgentResourceBinding.agent_id == agent_id,
-            AgentResourceBinding.resource_type == "general_skill",
-            AgentResourceBinding.resource_id == row.id,
-            AgentResourceBinding.status != "deleted",
-        )
-    ).first()
-    return bool(
-        binding
-        and not is_open_gallery_resource(db, tenant_id, "general_skill", row)
-        and is_bound_resource_visible_for_agent(db, tenant_id, "general_skill", row, binding)
-    )
+    """技能是否可编辑。
+
+    只有「归属该员工的私有技能」可编辑 —— 广场技能归广场所有，成员只能引用。
+    """
+    return _private_skill_owned_by_agent(db, tenant_id, row, agent_id)
 
 
 def _get_default_model(db: Session, tenant_id: str) -> ModelConfig:

@@ -6,7 +6,7 @@ import httpx
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
-from app.db.models import Tenant, Tool
+from app.db.models import GALLERY_SCOPE, Tenant, Tool
 from app.tools.tool_executor import ToolExecutor
 from app.tools.tool_schema import ToolCall
 
@@ -44,7 +44,7 @@ def test_http_tool_auth_json_reaches_protected_service(monkeypatch) -> None:
     monkeypatch.setattr(httpx, "Client", Client)
     with _session() as db:
         db.add(
-            Tool(
+            Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
                 tenant_id="tenant_demo",
                 name="protected.lookup",
                 method="POST",
@@ -81,7 +81,7 @@ def test_custom_auth_json_is_sent_as_literal_headers(monkeypatch) -> None:
     monkeypatch.setattr(httpx, "Client", Client)
     with _session() as db:
         db.add(
-            Tool(
+            Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
                 tenant_id="tenant_demo",
                 name="vendor.lookup",
                 method="POST",

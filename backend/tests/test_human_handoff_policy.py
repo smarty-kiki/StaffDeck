@@ -6,6 +6,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 import app.api.chat as chat_api
 from app.core.agent_loop import AgentLoop
 from app.db.models import (
+    GALLERY_SCOPE,
     AgentEvent,
     AgentProfile,
     ChatSession,
@@ -78,7 +79,7 @@ def _handoff_skill(step: dict | None = None) -> Skill:
         "allowed_actions": ["handoff_human"],
         "handoff_question": "请人工确认后继续处理。",
     }
-    return Skill(
+    return Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
         tenant_id="tenant_demo",
         skill_id="manual_skill",
         name="人工复核流程",
@@ -147,7 +148,7 @@ def test_handoff_assignee_uses_agent_owner_metadata_before_admin():
     with Session(engine) as db:
         _admin, user, other = _seed_handoff_users(db)
         db.add(
-            AgentProfile(
+            AgentProfile(owner_user_id=other.id,
                 id="agent_owned",
                 tenant_id="tenant_demo",
                 name="owned",
@@ -167,7 +168,7 @@ def test_handoff_assignee_falls_back_to_tenant_admin_before_requester():
     with Session(engine) as db:
         admin, user, _other = _seed_handoff_users(db)
         db.add(
-            AgentProfile(
+            AgentProfile(owner_user_id="user_admin",
                 id="agent_no_owner",
                 tenant_id="tenant_demo",
                 name="no owner",
@@ -197,7 +198,7 @@ def test_handoff_assignee_skips_invalid_agent_owner_metadata():
             )
         )
         db.add(
-            AgentProfile(
+            AgentProfile(owner_user_id="deleted_user",
                 id="agent_invalid_owner",
                 tenant_id="tenant_demo",
                 name="invalid owner",
@@ -249,7 +250,7 @@ def test_handoff_assignee_uses_requester_when_no_owner_or_admin_exists():
         user = User(id="user_demo", tenant_id="tenant_demo", username="user_demo", password_hash="x")
         db.add(user)
         db.add(
-            AgentProfile(
+            AgentProfile(owner_user_id="user_admin",
                 id="agent_no_admin",
                 tenant_id="tenant_demo",
                 name="no admin",

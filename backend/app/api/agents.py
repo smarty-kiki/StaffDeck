@@ -1,58 +1,45 @@
 from __future__ import annotations
 
-from copy import deepcopy
 from datetime import UTC, datetime
-from time import sleep
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlmodel import Session, select
 
+from app.agents.branching import (
+    count_resource_references,
+    is_open_gallery_resource,
+    purge_agent_owned_resources,
+    reference_resource,
+    resource_model_for_type,
+    unreference_resource,
+    visible_skill_rows,
+)
 from app.agents.schema import (
-    AgentModelsUpdateRequest,
-    AgentAPICredentialCreateRequest,
     AgentAPICredentialCreated,
+    AgentAPICredentialCreateRequest,
     AgentAPICredentialRead,
+    AgentModelsUpdateRequest,
     AgentProfileCreateRequest,
     AgentProfileRead,
     AgentProfileUpdateRequest,
-    AgentResourceBindingInput,
-    AgentResourceImportRequest,
-    AgentResourceBindingRead,
+    AgentResourceReferenceInput,
+    AgentResourceReferenceRead,
     AgentResourcesUpdateRequest,
     AgentScopeRead,
-    AgentSkillRollbackRequest,
     AgentWorkRecordEventRead,
     AgentWorkRecordRead,
     AgentWorkRecordReplyStatsRead,
 )
-from app.agents.branching import (
-    agent_private_metadata,
-    branch_versions,
-    copy_overall_scope_to_agent,
-    ensure_agent_skill_branch,
-    ensure_knowledge_base_version,
-    get_overall_agent,
-    is_bound_resource_visible_for_agent,
-    is_open_gallery_resource,
-    promote_branch_to_overall,
-    promote_knowledge_branch_to_overall,
-    rollback_branch,
-    sync_branch_from_overall,
-    visible_skill_rows,
-)
 from app.db import get_session
 from app.db.models import (
+    AgentModelBinding,
+    AgentProfile,
+    AgentResourceReference,
+    AgentUsage,
     APIClient,
     APICredential,
-    AgentModelBinding,
-    AgentKnowledgeBranch,
-    AgentProfile,
-    AgentResourceBinding,
-    AgentSkillBranch,
-    AgentSkillBranchVersion,
-    AgentUsage,
     ChannelBinding,
     ChannelBindingAgent,
     ChatSession,
@@ -68,8 +55,8 @@ from app.db.models import (
     Skill,
     TeamMember,
     Tool,
-    utc_now,
     User,
+    utc_now,
 )
 from app.public_api.auth import generate_api_key
 from app.public_api.credential_profiles import (
@@ -78,16 +65,20 @@ from app.public_api.credential_profiles import (
     scopes_for_agent_access,
 )
 from app.security.auth import get_current_user
-from app.security.permissions import agent_owned_by_user as _agent_owned_by_user
-from app.security.permissions import is_admin_user as _is_admin_user
+from app.security.permissions import (
+    agent_owned_by_user as _agent_owned_by_user,
+)
+from app.security.permissions import (
+    ensure_agent_publish_manager as _ensure_agent_publish_manager,
+)
+from app.security.permissions import (
+    is_admin_user as _is_admin_user,
+)
 from app.security.tenant import ensure_tenant
 from app.session.cleanup import (
     purge_chat_session_records,
     remove_chat_session_workspace,
 )
-
-IMPORT_LOCK_RETRY_ATTEMPTS = 2
-IMPORT_LOCK_RETRY_DELAY_SECONDS = 0.5
 
 enterprise_router = APIRouter(prefix="/api/enterprise/agents", tags=["enterprise:agents"])
 chat_router = APIRouter(prefix="/api/chat/agents", tags=["chat:agents"])
@@ -119,14 +110,13 @@ def list_agents(
     rows = db.exec(
         select(AgentProfile)
         .where(AgentProfile.tenant_id == tenant_id)
-        .order_by(AgentProfile.is_overall.desc(), AgentProfile.updated_at.desc())
+        .order_by(AgentProfile.is_published.desc(), AgentProfile.updated_at.desc())
     ).all()
     rows = [row for row in rows if not _agent_hidden_from_staffdeck(row)]
     if not _is_admin_user(user):
-        # Non-admin users still need the overall agent as a read-only open-gallery
-        # source for copy/use flows. Mutations remain guarded by manage/update
-        # endpoints, so this only exposes the source scope.
-        rows = [row for row in rows if row.is_overall or _agent_visible_to_user(row, user)]
+        # 非管理员只看到：自己的员工 ∪ 已发布到广场的员工。
+        # 别人的私人员工对他们完全不可见 —— 这里不再有任何"只为复制用"的暴露。
+        rows = [row for row in rows if _agent_usable_by_user(row, user)]
     bindings = _bindings_by_agent(db, tenant_id)
     used_agent_ids = _used_agent_ids_for_user(db, tenant_id, user)
     return [agent_read(row, bindings.get(row.id, []), row.id in used_agent_ids) for row in rows]
@@ -141,47 +131,32 @@ def create_agent(
     ensure_tenant(db, request.tenant_id)
     user = current_user
     _ensure_request_tenant(request.tenant_id, user)
-    if request.is_overall and not _is_admin_user(user):
-        raise HTTPException(status_code=403, detail="Only administrator can create overall agent")
     name = str(request.name or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="Agent name cannot be empty")
+    # 同名只在自己的员工里查重：不同作者可以有同名员工，广场里靠 @创建人 区分。
     existing = db.exec(
         select(AgentProfile).where(
-            AgentProfile.tenant_id == request.tenant_id, AgentProfile.name == name
+            AgentProfile.tenant_id == request.tenant_id,
+            AgentProfile.owner_user_id == user.id,
+            AgentProfile.name == name,
         )
     ).first()
     if existing:
-        raise HTTPException(status_code=409, detail="Agent name already exists")
+        raise HTTPException(status_code=409, detail="You already have a staff with this name")
     row = AgentProfile(
         tenant_id=request.tenant_id,
+        owner_user_id=user.id,
         name=name,
         description=request.description,
         persona_prompt=request.persona_prompt,
-        is_overall=request.is_overall,
         status="active",
         harness_max_actions=request.harness_max_actions,
         metadata_json=_metadata_with_creator(request.metadata or {}, user),
     )
     db.add(row)
     db.flush()
-    if not row.is_overall:
-        copy_from_agent_id = request.copy_from_agent_id
-        if request.source_mode == "blank":
-            pass
-        elif copy_from_agent_id:
-            source_agent = _get_agent(db, request.tenant_id, copy_from_agent_id)
-            _ensure_can_copy_from_agent(source_agent, user)
-            if not row.persona_prompt:
-                row.persona_prompt = source_agent.persona_prompt
-            _copy_agent_scope_from_source(db, request.tenant_id, source_agent, row)
-        else:
-            overall = get_overall_agent(db, request.tenant_id)
-            if overall and not row.persona_prompt:
-                row.persona_prompt = overall.persona_prompt
-            copy_overall_scope_to_agent(db, request.tenant_id, row)
-            if overall:
-                _copy_agent_models_from_source(db, request.tenant_id, overall, row)
+    # 新员工从空白开始。需要的广场资源由引用端点挂载（引用而非复制）。
     db.commit()
     db.refresh(row)
     return agent_read(row, _bindings_by_agent(db, request.tenant_id).get(row.id, []))
@@ -234,8 +209,6 @@ def create_agent_api_credential(
 ) -> AgentAPICredentialCreated:
     agent = _get_agent(db, request.tenant_id, agent_id)
     _ensure_can_manage_agent(agent, current_user)
-    if agent.is_overall:
-        raise HTTPException(status_code=400, detail="Open gallery cannot own an employee API key")
     client = _ensure_staffdeck_agent_api_client(db, request.tenant_id, current_user)
     token, prefix, digest = generate_api_key()
     row = APICredential(
@@ -383,15 +356,17 @@ def update_agent(
         name = request.name.strip()
         if not name:
             raise HTTPException(status_code=400, detail="Agent name cannot be empty")
+        # 重名只在归属人自己的员工里查 —— 同名不同作者是允许的。
         conflict = db.exec(
             select(AgentProfile).where(
                 AgentProfile.tenant_id == request.tenant_id,
+                AgentProfile.owner_user_id == row.owner_user_id,
                 AgentProfile.name == name,
                 AgentProfile.id != row.id,
             )
         ).first()
         if conflict:
-            raise HTTPException(status_code=409, detail="Agent name already exists")
+            raise HTTPException(status_code=409, detail="You already have a staff with this name")
         row.name = name
     if request.description is not None:
         row.description = request.description
@@ -412,6 +387,31 @@ def update_agent(
     return agent_read(row, _bindings_by_agent(db, request.tenant_id).get(row.id, []))
 
 
+@enterprise_router.post("/{agent_id}/gallery:publish", response_model=AgentProfileRead)
+def publish_agent_to_gallery(
+    agent_id: str,
+    tenant_id: str = Query(...),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> AgentProfileRead:
+    """把数字员工发布到广场。归属人自己做，即发布给全租户使用。
+
+    发布后员工本身与其资源都保持**归属作者** —— 使用者看到的是实时引用，
+    不是快照。其他账号（含管理员）不能编辑，管理员只能下架。
+    """
+    row = _get_agent(db, tenant_id, agent_id)
+    _ensure_agent_publish_manager(row, current_user)
+    now = utc_now()
+    row.is_published = True
+    row.published_at = now
+    row.published_by = current_user.username
+    row.updated_at = now
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return agent_read(row, _bindings_by_agent(db, tenant_id).get(row.id, []))
+
+
 @enterprise_router.post("/{agent_id}/gallery:unpublish", response_model=AgentProfileRead)
 def unpublish_agent_from_gallery(
     agent_id: str,
@@ -419,23 +419,19 @@ def unpublish_agent_from_gallery(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> AgentProfileRead:
-    """Remove an employee from the open gallery without deleting the employee itself."""
-    _ensure_admin_user(tenant_id, current_user)
+    """从广场下架（不删除员工本身）。
+
+    下架权 = 归属人 **或** 管理员。这是管理员相对归属人的唯一额外权限 ——
+    管理员可以下架别人的员工，但不能编辑它。
+    """
     row = _get_agent(db, tenant_id, agent_id)
-    if row.is_overall:
-        raise HTTPException(status_code=400, detail="Overall agent cannot be unpublished")
-
-    metadata = dict(row.metadata_json or {})
-    if metadata.get("published_to_gallery") is not True:
+    _ensure_agent_publish_manager(row, current_user)
+    if not row.is_published:
         return agent_read(row, _bindings_by_agent(db, tenant_id).get(row.id, []))
-
     now = utc_now()
-    metadata["published_to_gallery"] = False
-    metadata["gallery_unpublished_at"] = now.isoformat()
-    metadata["gallery_unpublished_by"] = current_user.username
-    metadata.pop("gallery_published_at", None)
-    metadata.pop("gallery_published_by", None)
-    row.metadata_json = metadata
+    row.is_published = False
+    row.published_at = None
+    row.published_by = None
     row.updated_at = now
     db.add(row)
     db.commit()
@@ -452,13 +448,27 @@ def delete_agent(
 ) -> dict[str, str]:
     row = _get_agent(db, tenant_id, agent_id)
     _ensure_can_manage_agent(row, current_user)
-    if row.is_overall:
-        raise HTTPException(status_code=400, detail="Overall agent cannot be deleted")
-    bindings = db.exec(
-        select(AgentResourceBinding).where(AgentResourceBinding.agent_id == row.id)
+    workspace_keys = purge_agent(db, tenant_id, row)
+    db.commit()
+    for session_tenant_id, session_id in workspace_keys:
+        remove_chat_session_workspace(tenant_id=session_tenant_id, session_id=session_id, db=db)
+    return {"status": "deleted"}
+
+
+def purge_agent(db: Session, tenant_id: str, row: AgentProfile) -> list[tuple[str, str]]:
+    """彻底删除一个数字员工及其私有资源，返回待清理工作区。
+
+    账号注销时也走这里（`app/api/auth.py` 的 delete_user），保证"账号被删除时，
+    其创建的数字员工及资源一并删除"。
+    """
+    # 该员工私有资源（知识库/技能/SOP/工具）一并清理 —— 它们只属于这个员工。
+    purge_agent_owned_resources(db, tenant_id, row.id)
+    # 该员工对其他资源的引用行。
+    references = db.exec(
+        select(AgentResourceReference).where(AgentResourceReference.agent_id == row.id)
     ).all()
-    for binding in bindings:
-        db.delete(binding)
+    for reference in references:
+        db.delete(reference)
     # 渠道挂载同步清理:否则孤儿挂载行会让 /员工 列出已删除员工的裸 ID,
     # 甚至可被 /切换 路由到。默认挂载被删时把首个剩余挂载提升为默认并同步
     # binding.agent_id,保持存量绑定回退路径有效。会话指针无需处理:
@@ -524,68 +534,67 @@ def delete_agent(
         handoff.updated_at = utc_now()
         db.add(handoff)
     db.delete(row)
-    db.commit()
-    for session_tenant_id, session_id in workspace_keys:
-        remove_chat_session_workspace(tenant_id=session_tenant_id, session_id=session_id, db=db)
-    return {"status": "deleted"}
+    return workspace_keys
 
 
-@enterprise_router.get("/{agent_id}/resources", response_model=list[AgentResourceBindingRead])
+@enterprise_router.get("/{agent_id}/resources", response_model=list[AgentResourceReferenceRead])
 def get_agent_resources(
     agent_id: str,
     tenant_id: str = Query(...),
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
-) -> list[AgentResourceBindingRead]:
+) -> list[AgentResourceReferenceRead]:
     _ensure_can_access_agent(_get_agent(db, tenant_id, agent_id), current_user)
     rows = db.exec(
-        select(AgentResourceBinding)
+        select(AgentResourceReference)
         .where(
-            AgentResourceBinding.tenant_id == tenant_id, AgentResourceBinding.agent_id == agent_id
+            AgentResourceReference.tenant_id == tenant_id, AgentResourceReference.agent_id == agent_id
         )
-        .order_by(AgentResourceBinding.resource_type, AgentResourceBinding.created_at)
+        .order_by(AgentResourceReference.resource_type, AgentResourceReference.created_at)
     ).all()
     return [binding_read(row) for row in rows]
 
 
-@enterprise_router.put("/{agent_id}/resources", response_model=list[AgentResourceBindingRead])
+@enterprise_router.put("/{agent_id}/resources", response_model=list[AgentResourceReferenceRead])
 def update_agent_resources(
     agent_id: str,
     request: AgentResourcesUpdateRequest,
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
-) -> list[AgentResourceBindingRead]:
+) -> list[AgentResourceReferenceRead]:
+    """整体覆盖该员工引用的广场资源集合。
+
+    只建/删引用行，**从不复制资源内容** —— 资源内容只有一份，归属其作者。
+    作者更新资源，所有引用它的员工立刻生效。
+    """
     agent = _get_agent(db, request.tenant_id, agent_id)
     _ensure_can_manage_agent(agent, current_user)
-    if agent.is_overall:
-        raise HTTPException(status_code=400, detail="Overall agent uses the global resource pool")
     existing = db.exec(
-        select(AgentResourceBinding).where(
-            AgentResourceBinding.tenant_id == request.tenant_id,
-            AgentResourceBinding.agent_id == agent_id,
+        select(AgentResourceReference).where(
+            AgentResourceReference.tenant_id == request.tenant_id,
+            AgentResourceReference.agent_id == agent_id,
         )
     ).all()
     by_key = {(row.resource_type, row.resource_id): row for row in existing}
     desired_keys: set[tuple[str, str]] = set()
     for item in request.resources:
-        _ensure_resource_exists(db, request.tenant_id, item)
         key = (item.resource_type, item.resource_id)
-        desired_keys.add(key)
-        row = by_key.get(key)
-        if row:
-            row.status = item.status
-            row.metadata_json = item.metadata
-            row.updated_at = utc_now()
-        else:
-            row = AgentResourceBinding(
-                tenant_id=request.tenant_id,
-                agent_id=agent_id,
-                resource_type=item.resource_type,
-                resource_id=item.resource_id,
-                status=item.status,
-                metadata_json=item.metadata,
+        if key in desired_keys:
+            continue
+        if not reference_resource(
+            db,
+            request.tenant_id,
+            agent_id,
+            item.resource_type,
+            item.resource_id,
+            created_by_user_id=current_user.id,
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Only gallery resources can be referenced by a staff",
             )
-        db.add(row)
+        desired_keys.add(key)
+    # 不在目标集合里的引用行 → 取消引用（删行）。
     for key, row in by_key.items():
         if key not in desired_keys:
             db.delete(row)
@@ -593,93 +602,67 @@ def update_agent_resources(
     return get_agent_resources(agent_id, request.tenant_id, db, current_user)
 
 
-@enterprise_router.post("/{agent_id}/resources/import")
-def import_agent_resources(
+@enterprise_router.post(
+    "/{agent_id}/resources:reference", response_model=AgentResourceReferenceRead
+)
+def reference_agent_resource(
     agent_id: str,
-    request: AgentResourceImportRequest,
+    request: AgentResourceReferenceInput,
+    tenant_id: str = Query(...),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> AgentResourceReferenceRead:
+    """启用一个广场资源到该员工（= 建立引用）。"""
+    agent = _get_agent(db, tenant_id, agent_id)
+    _ensure_can_manage_agent(agent, current_user)
+    if not reference_resource(
+        db,
+        tenant_id,
+        agent_id,
+        request.resource_type,
+        request.resource_id,
+        created_by_user_id=current_user.id,
+    ):
+        raise HTTPException(
+            status_code=400, detail="Only gallery resources can be referenced by a staff"
+        )
+    db.commit()
+    row = db.exec(
+        select(AgentResourceReference).where(
+            AgentResourceReference.tenant_id == tenant_id,
+            AgentResourceReference.agent_id == agent_id,
+            AgentResourceReference.resource_type == request.resource_type,
+            AgentResourceReference.resource_id == request.resource_id,
+        )
+    ).first()
+    if row is None:
+        raise HTTPException(status_code=500, detail="Reference was not persisted")
+    return binding_read(row)
+
+
+@enterprise_router.delete("/{agent_id}/resources/{resource_type}/{resource_id}")
+def unreference_agent_resource(
+    agent_id: str,
+    resource_type: str,
+    resource_id: str,
+    tenant_id: str = Query(...),
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> dict[str, object]:
-    for attempt in range(IMPORT_LOCK_RETRY_ATTEMPTS):
-        try:
-            return _import_agent_resources_once(agent_id, request, db, current_user)
-        except OperationalError as exc:
-            db.rollback()
-            if not _is_database_locked_error(exc) or attempt >= IMPORT_LOCK_RETRY_ATTEMPTS - 1:
-                raise
-            sleep(IMPORT_LOCK_RETRY_DELAY_SECONDS * (attempt + 1))
-    raise HTTPException(status_code=503, detail="Resource import is temporarily busy")
+    """取消引用（= 停用该广场资源）。
 
-
-def _import_agent_resources_once(
-    agent_id: str,
-    request: AgentResourceImportRequest,
-    db: Session,
-    current_user: User | object,
-) -> dict[str, object]:
-    target_agent = _get_agent(db, request.tenant_id, agent_id)
-    source_agent = _get_agent(db, request.tenant_id, request.source_agent_id)
-    user = current_user
-    _ensure_can_import_to_agent(target_agent, user)
-    _ensure_can_copy_from_agent(source_agent, user)
-    if source_agent.id == target_agent.id:
-        raise HTTPException(status_code=400, detail="Source and target agent cannot be the same")
-    resource_ids = _dedupe_ids(request.resource_ids)
-    if not resource_ids:
-        raise HTTPException(status_code=400, detail="No resources selected")
-    imported: list[dict[str, object]] = []
-    missing: list[dict[str, str]] = []
-    for identifier in resource_ids:
-        resolved = _resolve_resource(db, request.tenant_id, request.resource_type, identifier)
-        if not resolved:
-            missing.append({"resource_id": identifier, "reason": "resource_not_found"})
-            continue
-        source_binding = _source_resource_binding(
-            db, request.tenant_id, source_agent, request.resource_type, resolved.id
-        )
-        if not source_agent.is_overall and not source_binding:
-            missing.append({"resource_id": identifier, "reason": "not_visible_in_source_agent"})
-            continue
-        block_reason = _blocked_learning_reason(
-            db,
-            request.tenant_id,
-            source_agent,
-            request.resource_type,
-            resolved,
-            source_binding,
-        )
-        if block_reason:
-            missing.append({"resource_id": identifier, "reason": block_reason})
-            continue
-        if target_agent.is_overall:
-            _import_resource_to_overall(
-                db, request.tenant_id, source_agent, request.resource_type, resolved
-            )
-        else:
-            resolved = _upsert_imported_resource_binding(
-                db,
-                request.tenant_id,
-                source_agent,
-                target_agent,
-                request.resource_type,
-                resolved,
-                source_binding,
-            )
-        imported.append(
-            {
-                "resource_type": request.resource_type,
-                "resource_id": resolved.id,
-                "display_id": _resource_display_id(request.resource_type, resolved),
-                "name": getattr(resolved, "name", getattr(resolved, "slug", resolved.id)),
-            }
-        )
+    只删引用行，**不删除资源本身** —— 资源仍属于作者，其他员工的引用不受影响。
+    """
+    agent = _get_agent(db, tenant_id, agent_id)
+    _ensure_can_manage_agent(agent, current_user)
+    removed = unreference_resource(db, tenant_id, agent_id, resource_type, resource_id)
     db.commit()
+    remaining = count_resource_references(db, tenant_id, resource_type, resource_id)
     return {
-        "status": "imported",
-        "target_agent_id": target_agent.id,
-        "source_agent_id": source_agent.id,
-        "imported": imported,
-        "missing": missing,
+        "status": "unreferenced" if removed else "not_referenced",
+        "resource_type": resource_type,
+        "resource_id": resource_id,
+        "remaining_reference_count": remaining,
     }
 
 
@@ -692,105 +675,8 @@ def get_agent_skills(
 ) -> list[dict[str, object]]:
     _ensure_can_access_agent(_get_agent(db, tenant_id, agent_id), current_user)
     return [
-        _skill_branch_read(skill)
+        _skill_read(skill)
         for skill in visible_skill_rows(db, tenant_id, agent_id, include_inactive=True)
-    ]
-
-
-@enterprise_router.post("/{agent_id}/skills/{skill_id}/sync-from-overall")
-def sync_agent_skill_from_overall(
-    agent_id: str,
-    skill_id: str,
-    tenant_id: str = Query(...),
-    db: Session = Depends(get_session),
-    current_user: User = Depends(get_current_user),
-) -> dict[str, object]:
-    agent = _get_agent(db, tenant_id, agent_id)
-    _ensure_can_manage_agent(agent, current_user)
-    if agent.is_overall:
-        raise HTTPException(status_code=400, detail="Overall agent is already the trunk")
-    skill = _get_global_skill(db, tenant_id, skill_id)
-    if skill.status != "published":
-        raise HTTPException(
-            status_code=400, detail="Disabled SOP cannot be learned from the open gallery"
-        )
-    branch = sync_branch_from_overall(db, tenant_id, agent_id, skill)
-    db.commit()
-    return {"status": "synced", "skill_id": skill_id, "head_version": branch.head_version}
-
-
-@enterprise_router.post("/{agent_id}/skills/{skill_id}/promote-to-overall")
-def promote_agent_skill_to_overall(
-    agent_id: str,
-    skill_id: str,
-    tenant_id: str = Query(...),
-    db: Session = Depends(get_session),
-    current_user: User = Depends(get_current_user),
-) -> dict[str, object]:
-    _ensure_admin_user(tenant_id, current_user)
-    agent = _get_agent(db, tenant_id, agent_id)
-    if agent.is_overall:
-        raise HTTPException(
-            status_code=400, detail="Overall agent does not have a branch to promote"
-        )
-    branch = db.exec(
-        select(AgentSkillBranch).where(
-            AgentSkillBranch.tenant_id == tenant_id,
-            AgentSkillBranch.agent_id == agent_id,
-            AgentSkillBranch.skill_id == skill_id,
-        )
-    ).first()
-    if not branch:
-        raise HTTPException(status_code=404, detail="Branch not found")
-    skill = promote_branch_to_overall(db, tenant_id, branch)
-    db.commit()
-    return {"status": "promoted", "skill_id": skill_id, "version": skill.version}
-
-
-@enterprise_router.post("/{agent_id}/skills/{skill_id}/rollback")
-def rollback_agent_skill(
-    agent_id: str,
-    skill_id: str,
-    request: AgentSkillRollbackRequest,
-    db: Session = Depends(get_session),
-    current_user: User = Depends(get_current_user),
-) -> dict[str, object]:
-    agent = _get_agent(db, request.tenant_id, agent_id)
-    _ensure_can_manage_agent(agent, current_user)
-    if agent.is_overall:
-        raise HTTPException(
-            status_code=400, detail="Use the global skill rollback endpoint for overall agent"
-        )
-    branch = rollback_branch(db, request.tenant_id, agent_id, skill_id, request.version)
-    db.commit()
-    return {"status": "rolled_back", "skill_id": skill_id, "head_version": branch.head_version}
-
-
-@enterprise_router.get("/{agent_id}/skills/{skill_id}/versions")
-def list_agent_skill_versions(
-    agent_id: str,
-    skill_id: str,
-    tenant_id: str = Query(...),
-    db: Session = Depends(get_session),
-    current_user: User = Depends(get_current_user),
-) -> list[dict[str, object]]:
-    _ensure_can_access_agent(_get_agent(db, tenant_id, agent_id), current_user)
-    return [
-        {
-            "id": row.id,
-            "tenant_id": row.tenant_id,
-            "agent_id": row.agent_id,
-            "skill_id": row.skill_id,
-            "version": row.version,
-            "base_version": row.base_version,
-            "sync_state": row.sync_state,
-            "status": row.status,
-            "content": row.content_json,
-            "change_summary": row.change_summary,
-            "created_at": row.created_at.isoformat(),
-            "updated_at": row.updated_at.isoformat(),
-        }
-        for row in branch_versions(db, tenant_id, agent_id, skill_id)
     ]
 
 
@@ -844,7 +730,6 @@ def list_chat_agents(
         .where(
             AgentProfile.tenant_id == tenant_id,
             AgentProfile.status == "active",
-            AgentProfile.is_overall == False,  # noqa: E712
         )
         .order_by(AgentProfile.updated_at.desc())
     ).all()
@@ -869,8 +754,7 @@ def use_chat_agent(
     ensure_tenant(db, tenant_id)
     row = _get_agent(db, tenant_id, agent_id)
     if (
-        row.is_overall
-        or row.status != "active"
+        row.status != "active"
         or not _chat_agent_visible_to_user(row, current_user)
     ):
         raise HTTPException(status_code=403, detail="Cannot access this agent")
@@ -884,11 +768,11 @@ def _agent_resource_timeline_events(
     tenant_id: str,
     agent_id: str,
 ) -> list[AgentWorkRecordEventRead]:
+    # 引用行的存在即状态：取消引用会直接删除该行，不再有 status 字段可过滤。
     bindings = db.exec(
-        select(AgentResourceBinding).where(
-            AgentResourceBinding.tenant_id == tenant_id,
-            AgentResourceBinding.agent_id == agent_id,
-            AgentResourceBinding.status == "active",
+        select(AgentResourceReference).where(
+            AgentResourceReference.tenant_id == tenant_id,
+            AgentResourceReference.agent_id == agent_id,
         )
     ).all()
     ids_by_type = {
@@ -935,24 +819,6 @@ def _agent_resource_timeline_events(
             )
         ).all()
     } if ids_by_type["tool"] else {}
-    skill_branches = {
-        row.skill_id: row
-        for row in db.exec(
-            select(AgentSkillBranch).where(
-                AgentSkillBranch.tenant_id == tenant_id,
-                AgentSkillBranch.agent_id == agent_id,
-            )
-        ).all()
-    }
-    knowledge_branches = {
-        row.knowledge_base_id: row
-        for row in db.exec(
-            select(AgentKnowledgeBranch).where(
-                AgentKnowledgeBranch.tenant_id == tenant_id,
-                AgentKnowledgeBranch.agent_id == agent_id,
-            )
-        ).all()
-    }
 
     events: list[AgentWorkRecordEventRead] = []
     for binding in bindings:
@@ -960,8 +826,7 @@ def _agent_resource_timeline_events(
         label: str
         if binding.resource_type == "skill":
             resource = skills.get(binding.resource_id)
-            branch = skill_branches.get(resource.skill_id) if resource else None
-            if not resource or resource.status != "published" or (branch and branch.status != "active"):
+            if not resource or resource.status != "published":
                 continue
             kind, label = "sop", resource.name
         elif binding.resource_type == "general_skill":
@@ -971,8 +836,7 @@ def _agent_resource_timeline_events(
             kind, label = "skill", resource.name
         elif binding.resource_type == "knowledge_base":
             resource = knowledge_bases.get(binding.resource_id)
-            branch = knowledge_branches.get(binding.resource_id)
-            if not resource or resource.status != "active" or (branch and branch.status != "active"):
+            if not resource or resource.status != "active":
                 continue
             kind, label = "knowledge", resource.name
         elif binding.resource_type == "tool":
@@ -1037,7 +901,7 @@ def _iso_utc(value: datetime) -> str:
 
 def agent_read(
     row: AgentProfile,
-    bindings: list[AgentResourceBinding],
+    bindings: list[AgentResourceReference],
     used_by_current_user: bool | None = None,
 ) -> AgentProfileRead:
     metadata = dict(row.metadata_json or {})
@@ -1047,10 +911,16 @@ def agent_read(
     return AgentProfileRead(
         id=row.id,
         tenant_id=row.tenant_id,
+        owner_user_id=row.owner_user_id or "",
+        owner_display_name=str(
+            metadata.get("owner_display_name") or metadata.get("owner_username") or ""
+        ),
         name=row.name,
         description=row.description,
         persona_prompt=row.persona_prompt,
-        is_overall=row.is_overall,
+        is_published=bool(row.is_published),
+        published_at=row.published_at.isoformat() if row.published_at else None,
+        published_by=row.published_by,
         status=row.status,
         harness_max_actions=max(1, min(int(row.harness_max_actions or 32), 100)),
         metadata=metadata,
@@ -1130,15 +1000,20 @@ def _agent_api_credential_read(row: APICredential) -> AgentAPICredentialRead:
     )
 
 
+def _agent_usable_by_user(row: AgentProfile, user: User) -> bool:
+    """只读可见性：自己的 ∪ 已发布到广场的。"""
+    if row.is_published:
+        return True
+    return _agent_owned_by_user(row, user)
+
+
 def _agent_visible_to_user(row: AgentProfile, user: User) -> bool:
     if _agent_hidden_from_staffdeck(row):
         return False
     if _is_admin_user(user):
+        # 管理员能"看到"全部员工，是为了行使下架权 —— 但看不到不等于能改。
         return True
-    if row.is_overall:
-        return True
-    metadata = row.metadata_json or {}
-    return _agent_owned_by_user(row, user) or metadata.get("published_to_gallery") is True
+    return _agent_usable_by_user(row, user)
 
 
 def _agent_hidden_from_staffdeck(row: AgentProfile) -> bool:
@@ -1146,7 +1021,7 @@ def _agent_hidden_from_staffdeck(row: AgentProfile) -> bool:
 
 
 def _agent_published_to_gallery(row: AgentProfile) -> bool:
-    return (row.metadata_json or {}).get("published_to_gallery") is True
+    return bool(row.is_published)
 
 
 def _used_agent_ids_for_user(db: Session, tenant_id: str, user: User) -> set[str]:
@@ -1198,13 +1073,13 @@ def _mark_agent_used(db: Session, tenant_id: str, user: User, agent_id: str) -> 
 
 
 def _chat_agent_selectable_to_user(row: AgentProfile, user: User, used_agent_ids: set[str]) -> bool:
-    if row.is_overall:
-        return False
     if _agent_owned_by_user(row, user):
         return True
-    if _agent_published_to_gallery(row):
+    # 广场员工：用过一次才留在自己的可选用列表里。管理员也不再无条件放行 ——
+    # 管理员的额外权限只有"下架"，不是"替别人选用员工"。
+    if row.is_published:
         return row.id in used_agent_ids
-    return _is_admin_user(user)
+    return False
 
 
 def _ensure_can_access_agent(row: AgentProfile, user: User) -> None:
@@ -1213,31 +1088,16 @@ def _ensure_can_access_agent(row: AgentProfile, user: User) -> None:
         raise HTTPException(status_code=403, detail="Cannot access this agent")
 
 
-def _ensure_can_copy_from_agent(row: AgentProfile, user: User) -> None:
-    _ensure_request_tenant(row.tenant_id, user)
-    if row.is_overall or _agent_visible_to_user(row, user):
-        return
-    raise HTTPException(status_code=403, detail="Cannot copy resources from this agent")
-
-
 def _ensure_can_manage_agent(row: AgentProfile, user: User) -> None:
+    """数字员工的写权限：**仅归属人**。
+
+    管理员没有分支 —— 需求要求"管理员也不能编辑别人的员工"，管理员相对归属人
+    只多"下架"一项（见 `publish_agent_to_gallery` / `unpublish_agent_from_gallery`）。
+    """
     _ensure_request_tenant(row.tenant_id, user)
-    if _is_admin_user(user):
-        return
-    if row.is_overall:
-        raise HTTPException(status_code=403, detail="Only administrator can manage overall agent")
     if _agent_owned_by_user(row, user):
         return
-    raise HTTPException(
-        status_code=403, detail="Only the creator or administrator can manage this staff"
-    )
-
-
-def _ensure_can_import_to_agent(row: AgentProfile, user: User) -> None:
-    if row.is_overall:
-        _ensure_admin_user(row.tenant_id, user)
-        return
-    _ensure_can_manage_agent(row, user)
+    raise HTTPException(status_code=403, detail="Only the owner can manage this staff")
 
 
 def _ensure_admin_user(tenant_id: str, user: User) -> None:
@@ -1288,451 +1148,16 @@ def _chat_agent_visible_to_user(row: AgentProfile, user: User) -> bool:
     return _agent_visible_to_user(row, user)
 
 
-def binding_read(row: AgentResourceBinding) -> AgentResourceBindingRead:
-    return AgentResourceBindingRead(
+def binding_read(row: AgentResourceReference) -> AgentResourceReferenceRead:
+    return AgentResourceReferenceRead(
         id=row.id,
         tenant_id=row.tenant_id,
         agent_id=row.agent_id,
         resource_type=row.resource_type,  # type: ignore[arg-type]
         resource_id=row.resource_id,
-        status=row.status,
-        metadata=dict(row.metadata_json or {}),
         created_at=row.created_at.isoformat(),
         updated_at=row.updated_at.isoformat(),
     )
-
-
-def _copy_agent_scope_from_source(
-    db: Session, tenant_id: str, source: AgentProfile, target: AgentProfile
-) -> None:
-    if source.is_overall:
-        copy_overall_scope_to_agent(db, tenant_id, target)
-    else:
-        bindings = db.exec(
-            select(AgentResourceBinding).where(
-                AgentResourceBinding.tenant_id == tenant_id,
-                AgentResourceBinding.agent_id == source.id,
-            )
-        ).all()
-        for binding in bindings:
-            _copy_resource_binding(db, tenant_id, source.id, target.id, binding)
-    _copy_agent_models_from_source(db, tenant_id, source, target)
-
-
-def _copy_resource_binding(
-    db: Session,
-    tenant_id: str,
-    source_agent_id: str,
-    target_agent_id: str,
-    binding: AgentResourceBinding,
-) -> None:
-    if binding.status != "active":
-        return
-    resource_id = binding.resource_id
-    metadata = dict(binding.metadata_json or {})
-    if binding.resource_type == "general_skill":
-        general_skill = db.get(GeneralSkill, binding.resource_id)
-        if (
-            general_skill is not None
-            and general_skill.tenant_id == tenant_id
-            and not is_open_gallery_resource(db, tenant_id, "general_skill", general_skill)
-        ):
-            copied_skill = _copy_private_general_skill(
-                db,
-                tenant_id,
-                general_skill,
-                target_agent_id,
-            )
-            resource_id = copied_skill.id
-            metadata = agent_private_metadata(target_agent_id, metadata)
-    copied_binding = AgentResourceBinding(
-        tenant_id=tenant_id,
-        agent_id=target_agent_id,
-        resource_type=binding.resource_type,
-        resource_id=resource_id,
-        status=binding.status,
-        metadata_json=metadata,
-    )
-    db.add(copied_binding)
-    if binding.resource_type == "skill":
-        skill = db.get(Skill, binding.resource_id)
-        if skill and skill.tenant_id == tenant_id:
-            _copy_skill_branch(db, tenant_id, source_agent_id, target_agent_id, skill)
-    elif binding.resource_type == "knowledge_base":
-        kb = db.get(KnowledgeBase, binding.resource_id)
-        if kb and kb.tenant_id == tenant_id:
-            _copy_knowledge_branch(db, tenant_id, source_agent_id, target_agent_id, kb)
-
-
-def _dedupe_ids(resource_ids: list[str]) -> list[str]:
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for raw_id in resource_ids:
-        resource_id = str(raw_id or "").strip()
-        if not resource_id or resource_id in seen:
-            continue
-        seen.add(resource_id)
-        deduped.append(resource_id)
-    return deduped
-
-
-def _source_resource_binding(
-    db: Session,
-    tenant_id: str,
-    source_agent: AgentProfile,
-    resource_type: str,
-    resource_id: str,
-) -> AgentResourceBinding | None:
-    if source_agent.is_overall:
-        return None
-    return db.exec(
-        select(AgentResourceBinding).where(
-            AgentResourceBinding.tenant_id == tenant_id,
-            AgentResourceBinding.agent_id == source_agent.id,
-            AgentResourceBinding.resource_type == resource_type,
-            AgentResourceBinding.resource_id == resource_id,
-        )
-    ).first()
-
-
-AgentResource = Skill | GeneralSkill | KnowledgeBase | Tool
-
-
-def _blocked_learning_reason(
-    db: Session,
-    tenant_id: str,
-    source_agent: AgentProfile,
-    resource_type: str,
-    resolved: AgentResource,
-    source_binding: AgentResourceBinding | None,
-) -> str | None:
-    if source_agent.is_overall:
-        return (
-            None
-            if _open_gallery_resource_enabled(db, tenant_id, resource_type, resolved)
-            else "disabled_in_open_gallery"
-        )
-    if not source_binding or source_binding.status != "active":
-        return "inactive_in_source_agent"
-    if resource_type == "skill" and isinstance(resolved, Skill):
-        branch = db.exec(
-            select(AgentSkillBranch).where(
-                AgentSkillBranch.tenant_id == tenant_id,
-                AgentSkillBranch.agent_id == source_agent.id,
-                AgentSkillBranch.skill_id == resolved.skill_id,
-            )
-        ).first()
-        if branch and branch.status != "active":
-            return "inactive_in_source_agent"
-    if resource_type == "knowledge_base" and isinstance(resolved, KnowledgeBase):
-        branch = db.exec(
-            select(AgentKnowledgeBranch).where(
-                AgentKnowledgeBranch.tenant_id == tenant_id,
-                AgentKnowledgeBranch.agent_id == source_agent.id,
-                AgentKnowledgeBranch.knowledge_base_id == resolved.id,
-            )
-        ).first()
-        if branch and branch.status != "active":
-            return "inactive_in_source_agent"
-    return None
-
-
-def _open_gallery_resource_enabled(
-    db: Session,
-    tenant_id: str,
-    resource_type: str,
-    resolved: AgentResource,
-) -> bool:
-    if not is_open_gallery_resource(db, tenant_id, resource_type, resolved):
-        return False
-    if resource_type == "skill" and isinstance(resolved, Skill):
-        return resolved.status == "published"
-    if resource_type == "general_skill" and isinstance(resolved, GeneralSkill):
-        return resolved.status == "published"
-    if resource_type == "knowledge_base" and isinstance(resolved, KnowledgeBase):
-        return resolved.status == "active"
-    if resource_type == "tool" and isinstance(resolved, Tool):
-        return resolved.enabled
-    return False
-
-
-def _import_resource_to_overall(
-    db: Session,
-    tenant_id: str,
-    source_agent: AgentProfile,
-    resource_type: str,
-    resolved: AgentResource,
-) -> None:
-    if source_agent.is_overall:
-        return
-    if resource_type == "skill" and isinstance(resolved, Skill):
-        branch = db.exec(
-            select(AgentSkillBranch).where(
-                AgentSkillBranch.tenant_id == tenant_id,
-                AgentSkillBranch.agent_id == source_agent.id,
-                AgentSkillBranch.skill_id == resolved.skill_id,
-            )
-        ).first()
-        if branch:
-            promote_branch_to_overall(db, tenant_id, branch)
-        return
-    if resource_type == "knowledge_base" and isinstance(resolved, KnowledgeBase):
-        promote_knowledge_branch_to_overall(db, tenant_id, source_agent.id, resolved.id)
-
-
-def _upsert_imported_resource_binding(
-    db: Session,
-    tenant_id: str,
-    source_agent: AgentProfile,
-    target_agent: AgentProfile,
-    resource_type: str,
-    resolved: AgentResource,
-    source_binding: AgentResourceBinding | None,
-) -> AgentResource:
-    if (
-        resource_type == "general_skill"
-        and isinstance(resolved, GeneralSkill)
-        and not is_open_gallery_resource(db, tenant_id, resource_type, resolved)
-    ):
-        resolved = _copy_private_general_skill(db, tenant_id, resolved, target_agent.id)
-    status = source_binding.status if source_binding else "active"
-    metadata = agent_private_metadata(
-        target_agent.id,
-        dict(source_binding.metadata_json or {}) if source_binding else {},
-    )
-    existing = db.exec(
-        select(AgentResourceBinding).where(
-            AgentResourceBinding.tenant_id == tenant_id,
-            AgentResourceBinding.agent_id == target_agent.id,
-            AgentResourceBinding.resource_type == resource_type,
-            AgentResourceBinding.resource_id == resolved.id,
-        )
-    ).first()
-    if existing:
-        existing.status = status
-        existing.metadata_json = metadata
-        existing.updated_at = utc_now()
-        db.add(existing)
-    else:
-        db.add(
-            AgentResourceBinding(
-                tenant_id=tenant_id,
-                agent_id=target_agent.id,
-                resource_type=resource_type,
-                resource_id=resolved.id,
-                status=status,
-                metadata_json=metadata,
-            )
-        )
-    if resource_type == "skill" and isinstance(resolved, Skill):
-        _copy_or_update_skill_branch(db, tenant_id, source_agent.id, target_agent.id, resolved)
-    elif resource_type == "knowledge_base" and isinstance(resolved, KnowledgeBase):
-        _copy_or_update_knowledge_branch(db, tenant_id, source_agent.id, target_agent.id, resolved)
-    return resolved
-
-
-def _copy_private_general_skill(
-    db: Session,
-    tenant_id: str,
-    source: GeneralSkill,
-    target_agent_id: str,
-) -> GeneralSkill:
-    existing_bindings = db.exec(
-        select(AgentResourceBinding).where(
-            AgentResourceBinding.tenant_id == tenant_id,
-            AgentResourceBinding.agent_id == target_agent_id,
-            AgentResourceBinding.resource_type == "general_skill",
-            AgentResourceBinding.status != "deleted",
-        )
-    ).all()
-    for existing_binding in existing_bindings:
-        existing = db.get(GeneralSkill, existing_binding.resource_id)
-        metadata = (
-            existing.metadata_json
-            if existing is not None and isinstance(existing.metadata_json, dict)
-            else {}
-        )
-        if metadata.get("copied_from_general_skill_id") == source.id:
-            return existing
-
-    metadata = agent_private_metadata(target_agent_id, deepcopy(source.metadata_json or {}))
-    metadata["copied_from_general_skill_id"] = source.id
-    metadata["copied_from_general_skill_slug"] = source.slug
-    copied = GeneralSkill(
-        tenant_id=tenant_id,
-        slug=_unique_general_skill_slug(db, tenant_id, f"{source.slug}-copy"),
-        name=source.name,
-        description=source.description,
-        homepage=source.homepage,
-        skill_markdown=source.skill_markdown,
-        skill_files_json=deepcopy(source.skill_files_json or []),
-        metadata_json=metadata,
-        status=source.status,
-        capability_scope=source.capability_scope,
-        permissions_json=deepcopy(source.permissions_json or {}),
-        runtime_config_json=deepcopy(source.runtime_config_json or {}),
-    )
-    db.add(copied)
-    db.flush()
-    return copied
-
-
-def _unique_general_skill_slug(db: Session, tenant_id: str, base_slug: str) -> str:
-    candidate = base_slug
-    suffix = 2
-    while db.exec(
-        select(GeneralSkill).where(
-            GeneralSkill.tenant_id == tenant_id,
-            GeneralSkill.slug == candidate,
-        )
-    ).first():
-        candidate = f"{base_slug}-{suffix}"
-        suffix += 1
-    return candidate
-
-
-def _copy_or_update_skill_branch(
-    db: Session, tenant_id: str, source_agent_id: str, target_agent_id: str, skill: Skill
-) -> None:
-    with db.no_autoflush:
-        source_branch = db.exec(
-            select(AgentSkillBranch).where(
-                AgentSkillBranch.tenant_id == tenant_id,
-                AgentSkillBranch.agent_id == source_agent_id,
-                AgentSkillBranch.skill_id == skill.skill_id,
-            )
-        ).first()
-    if not source_branch:
-        branch = sync_branch_from_overall(db, tenant_id, target_agent_id, skill)
-        _ensure_copied_skill_branch_version(db, branch, "导入自整体智能体")
-        return
-    with db.no_autoflush:
-        target_branch = db.exec(
-            select(AgentSkillBranch).where(
-                AgentSkillBranch.tenant_id == tenant_id,
-                AgentSkillBranch.agent_id == target_agent_id,
-                AgentSkillBranch.skill_id == skill.skill_id,
-            )
-        ).first()
-    if not target_branch:
-        target_branch = AgentSkillBranch(
-            tenant_id=tenant_id,
-            agent_id=target_agent_id,
-            skill_id=source_branch.skill_id,
-            source_skill_id=source_branch.source_skill_id,
-        )
-    target_branch.base_version = source_branch.base_version
-    target_branch.head_version = source_branch.head_version
-    target_branch.content_json = dict(source_branch.content_json or {})
-    target_branch.status = source_branch.status
-    target_branch.sync_state = source_branch.sync_state
-    target_branch.metadata_json = dict(source_branch.metadata_json or {})
-    target_branch.updated_at = utc_now()
-    db.add(target_branch)
-    db.flush()
-    _ensure_copied_skill_branch_version(db, target_branch, f"导入自 {source_agent_id}")
-
-
-def _ensure_copied_skill_branch_version(
-    db: Session, branch: AgentSkillBranch, change_summary: str
-) -> None:
-    existing = db.exec(
-        select(AgentSkillBranchVersion).where(
-            AgentSkillBranchVersion.tenant_id == branch.tenant_id,
-            AgentSkillBranchVersion.agent_id == branch.agent_id,
-            AgentSkillBranchVersion.skill_id == branch.skill_id,
-            AgentSkillBranchVersion.version == branch.head_version,
-        )
-    ).first()
-    if existing:
-        existing.content_json = dict(branch.content_json or {})
-        existing.status = branch.status
-        existing.sync_state = branch.sync_state
-        existing.updated_at = utc_now()
-        db.add(existing)
-        return
-    db.add(
-        AgentSkillBranchVersion(
-            tenant_id=branch.tenant_id,
-            agent_id=branch.agent_id,
-            skill_id=branch.skill_id,
-            source_skill_id=branch.source_skill_id,
-            version=branch.head_version,
-            base_version=branch.base_version,
-            content_json=dict(branch.content_json or {}),
-            status=branch.status,
-            sync_state=branch.sync_state,
-            change_summary=change_summary,
-        )
-    )
-
-
-def _copy_or_update_knowledge_branch(
-    db: Session,
-    tenant_id: str,
-    source_agent_id: str,
-    target_agent_id: str,
-    kb: KnowledgeBase,
-) -> None:
-    with db.no_autoflush:
-        source_branch = db.exec(
-            select(AgentKnowledgeBranch).where(
-                AgentKnowledgeBranch.tenant_id == tenant_id,
-                AgentKnowledgeBranch.agent_id == source_agent_id,
-                AgentKnowledgeBranch.knowledge_base_id == kb.id,
-            )
-        ).first()
-        target_branch = db.exec(
-            select(AgentKnowledgeBranch).where(
-                AgentKnowledgeBranch.tenant_id == tenant_id,
-                AgentKnowledgeBranch.agent_id == target_agent_id,
-                AgentKnowledgeBranch.knowledge_base_id == kb.id,
-            )
-        ).first()
-    if source_branch:
-        base_version = source_branch.base_version
-        head_version = source_branch.head_version
-        status = source_branch.status
-        sync_state = source_branch.sync_state
-        metadata = dict(source_branch.metadata_json or {})
-    else:
-        version = ensure_knowledge_base_version(db, kb).version
-        base_version = version
-        head_version = version
-        status = "active"
-        sync_state = "synced"
-        metadata = {}
-    if not target_branch:
-        target_branch = AgentKnowledgeBranch(
-            tenant_id=tenant_id,
-            agent_id=target_agent_id,
-            knowledge_base_id=kb.id,
-        )
-    target_branch.base_version = base_version
-    target_branch.head_version = head_version
-    target_branch.status = status
-    target_branch.sync_state = sync_state
-    target_branch.metadata_json = metadata
-    target_branch.updated_at = utc_now()
-    db.add(target_branch)
-
-
-def _resource_display_id(resource_type: str, resolved: AgentResource) -> str:
-    if resource_type == "skill" and isinstance(resolved, Skill):
-        return resolved.skill_id
-    if resource_type == "general_skill" and isinstance(resolved, GeneralSkill):
-        return resolved.slug
-    if resource_type == "tool" and isinstance(resolved, Tool):
-        return resolved.name
-    return resolved.id
-
-
-def _copy_agent_models_from_source(
-    db: Session, tenant_id: str, source: AgentProfile, target: AgentProfile
-) -> None:
-    # Model bindings are intentionally not copied. Every employee inherits the tenant default.
-    _ = source
-    _delete_agent_model_bindings(db, tenant_id, target.id)
 
 
 def _delete_agent_model_bindings(db: Session, tenant_id: str, agent_id: str) -> None:
@@ -1746,113 +1171,6 @@ def _delete_agent_model_bindings(db: Session, tenant_id: str, agent_id: str) -> 
         db.delete(binding)
 
 
-def _copy_skill_branch(
-    db: Session, tenant_id: str, source_agent_id: str, target_agent_id: str, skill: Skill
-) -> None:
-    source_branch = db.exec(
-        select(AgentSkillBranch).where(
-            AgentSkillBranch.tenant_id == tenant_id,
-            AgentSkillBranch.agent_id == source_agent_id,
-            AgentSkillBranch.skill_id == skill.skill_id,
-        )
-    ).first()
-    if not source_branch:
-        ensure_agent_skill_branch(db, tenant_id, target_agent_id, skill)
-        return
-    target_branch = AgentSkillBranch(
-        tenant_id=tenant_id,
-        agent_id=target_agent_id,
-        skill_id=source_branch.skill_id,
-        source_skill_id=source_branch.source_skill_id,
-        base_version=source_branch.base_version,
-        head_version=source_branch.head_version,
-        content_json=dict(source_branch.content_json or {}),
-        status=source_branch.status,
-        sync_state=source_branch.sync_state,
-        metadata_json=dict(source_branch.metadata_json or {}),
-    )
-    db.add(target_branch)
-    db.flush()
-    db.add(
-        AgentSkillBranchVersion(
-            tenant_id=tenant_id,
-            agent_id=target_agent_id,
-            skill_id=target_branch.skill_id,
-            source_skill_id=target_branch.source_skill_id,
-            version=target_branch.head_version,
-            base_version=target_branch.base_version,
-            content_json=dict(target_branch.content_json or {}),
-            status=target_branch.status,
-            sync_state=target_branch.sync_state,
-            change_summary=f"复制自 {source_agent_id}",
-        )
-    )
-
-
-def _copy_knowledge_branch(
-    db: Session, tenant_id: str, source_agent_id: str, target_agent_id: str, kb: KnowledgeBase
-) -> None:
-    source_branch = db.exec(
-        select(AgentKnowledgeBranch).where(
-            AgentKnowledgeBranch.tenant_id == tenant_id,
-            AgentKnowledgeBranch.agent_id == source_agent_id,
-            AgentKnowledgeBranch.knowledge_base_id == kb.id,
-        )
-    ).first()
-    if not source_branch:
-        return
-    db.add(
-        AgentKnowledgeBranch(
-            tenant_id=tenant_id,
-            agent_id=target_agent_id,
-            knowledge_base_id=source_branch.knowledge_base_id,
-            base_version=source_branch.base_version,
-            head_version=source_branch.head_version,
-            status=source_branch.status,
-            sync_state=source_branch.sync_state,
-            metadata_json=dict(source_branch.metadata_json or {}),
-        )
-    )
-
-
-def _resolve_resource(
-    db: Session, tenant_id: str, resource_type: str, identifier: str
-) -> AgentResource | None:
-    if resource_type == "skill":
-        return (
-            db.get(Skill, identifier)
-            or db.exec(
-                select(Skill).where(Skill.tenant_id == tenant_id, Skill.skill_id == identifier)
-            ).first()
-        )
-    if resource_type == "general_skill":
-        return (
-            db.get(GeneralSkill, identifier)
-            or db.exec(
-                select(GeneralSkill).where(
-                    GeneralSkill.tenant_id == tenant_id, GeneralSkill.slug == identifier
-                )
-            ).first()
-        )
-    if resource_type == "knowledge_base":
-        return (
-            db.get(KnowledgeBase, identifier)
-            or db.exec(
-                select(KnowledgeBase).where(
-                    KnowledgeBase.tenant_id == tenant_id, KnowledgeBase.name == identifier
-                )
-            ).first()
-        )
-    if resource_type == "tool":
-        return (
-            db.get(Tool, identifier)
-            or db.exec(
-                select(Tool).where(Tool.tenant_id == tenant_id, Tool.name == identifier)
-            ).first()
-        )
-    return None
-
-
 def _get_agent(db: Session, tenant_id: str, agent_id: str) -> AgentProfile:
     ensure_tenant(db, tenant_id)
     row = db.get(AgentProfile, agent_id)
@@ -1861,11 +1179,11 @@ def _get_agent(db: Session, tenant_id: str, agent_id: str) -> AgentProfile:
     return row
 
 
-def _bindings_by_agent(db: Session, tenant_id: str) -> dict[str, list[AgentResourceBinding]]:
+def _bindings_by_agent(db: Session, tenant_id: str) -> dict[str, list[AgentResourceReference]]:
     rows = db.exec(
-        select(AgentResourceBinding)
-        .where(AgentResourceBinding.tenant_id == tenant_id)
-        .order_by(AgentResourceBinding.created_at.asc())
+        select(AgentResourceReference)
+        .where(AgentResourceReference.tenant_id == tenant_id)
+        .order_by(AgentResourceReference.created_at.asc())
     ).all()
     agent_ids = {row.agent_id for row in rows}
     agents_by_id = {
@@ -1877,7 +1195,7 @@ def _bindings_by_agent(db: Session, tenant_id: str) -> dict[str, list[AgentResou
             )
         ).all()
     }
-    grouped: dict[str, list[AgentResourceBinding]] = {}
+    grouped: dict[str, list[AgentResourceReference]] = {}
     for row in rows:
         if not _resource_binding_visible_in_agent_summary(
             db, tenant_id, agents_by_id.get(row.agent_id), row
@@ -1891,75 +1209,26 @@ def _resource_binding_visible_in_agent_summary(
     db: Session,
     tenant_id: str,
     agent: AgentProfile | None,
-    binding: AgentResourceBinding,
+    binding: AgentResourceReference,
 ) -> bool:
-    if not agent or binding.status == "deleted":
-        return False
+    """引用行是否应在员工摘要里展示。
 
-    model_by_type = {
-        "skill": Skill,
-        "general_skill": GeneralSkill,
-        "knowledge_base": KnowledgeBase,
-        "tool": Tool,
-    }
-    model = model_by_type.get(binding.resource_type)
+    引用只指向广场资源；资源下架（status='hidden'）时对使用者不可见，
+    但引用行保留 —— 资源恢复后引用自动生效。
+    """
+    if not agent:
+        return False
+    model = resource_model_for_type(binding.resource_type)
     if model is None:
         return False
     resource = db.get(model, binding.resource_id)
-    if not resource or resource.tenant_id != tenant_id:
+    if not resource or getattr(resource, "tenant_id", None) != tenant_id:
         return False
     if isinstance(resource, KnowledgeBase) and _is_empty_default_knowledge_base(
         db, tenant_id, resource
     ):
         return False
-
-    if agent.is_overall:
-        if not is_open_gallery_resource(db, tenant_id, binding.resource_type, resource):
-            return False
-    elif not is_bound_resource_visible_for_agent(
-        db, tenant_id, binding.resource_type, resource, binding
-    ):
-        return False
-
-    if isinstance(resource, Skill) and not agent.is_overall:
-        branch = db.exec(
-            select(AgentSkillBranch).where(
-                AgentSkillBranch.tenant_id == tenant_id,
-                AgentSkillBranch.agent_id == agent.id,
-                AgentSkillBranch.skill_id == resource.skill_id,
-            )
-        ).first()
-        if branch and branch.status == "deleted":
-            return False
-        skill_status = branch.status if branch else resource.status
-        if binding.status == "active" and skill_status not in {"active", "published"}:
-            return False
-
-    if isinstance(resource, KnowledgeBase) and not agent.is_overall:
-        branch = db.exec(
-            select(AgentKnowledgeBranch).where(
-                AgentKnowledgeBranch.tenant_id == tenant_id,
-                AgentKnowledgeBranch.agent_id == agent.id,
-                AgentKnowledgeBranch.knowledge_base_id == resource.id,
-                AgentKnowledgeBranch.status != "deleted",
-            )
-        ).first()
-        if not branch:
-            return False
-        if binding.status == "active" and branch.status != "active":
-            return False
-
-    if binding.status != "active":
-        return True
-    if isinstance(resource, Skill):
-        return agent.is_overall is False or resource.status == "published"
-    if isinstance(resource, GeneralSkill):
-        return resource.status == "published"
-    if isinstance(resource, KnowledgeBase):
-        return resource.status == "active"
-    if isinstance(resource, Tool):
-        return resource.enabled
-    return False
+    return is_open_gallery_resource(db, tenant_id, binding.resource_type, resource)
 
 
 def _is_empty_default_knowledge_base(db: Session, tenant_id: str, kb: KnowledgeBase) -> bool:
@@ -1980,20 +1249,6 @@ def _is_empty_default_knowledge_base(db: Session, tenant_id: str, kb: KnowledgeB
     return kb.name == "默认知识库"
 
 
-def _ensure_resource_exists(db: Session, tenant_id: str, item: AgentResourceBindingInput) -> None:
-    model = {
-        "skill": Skill,
-        "general_skill": GeneralSkill,
-        "knowledge_base": KnowledgeBase,
-        "tool": Tool,
-    }[item.resource_type]
-    row = db.get(model, item.resource_id)
-    if not row or row.tenant_id != tenant_id:
-        raise HTTPException(
-            status_code=404, detail=f"Resource not found: {item.resource_type}:{item.resource_id}"
-        )
-
-
 def _get_global_skill(db: Session, tenant_id: str, skill_id: str) -> Skill:
     row = db.exec(
         select(Skill).where(Skill.tenant_id == tenant_id, Skill.skill_id == skill_id)
@@ -2003,11 +1258,11 @@ def _get_global_skill(db: Session, tenant_id: str, skill_id: str) -> Skill:
     return row
 
 
-def _skill_branch_read(skill: Skill) -> dict[str, object]:
-    metadata = getattr(skill, "agent_branch_meta", {}) or {}
-    content = skill.content_json or {}
-    if not metadata and isinstance(content.get("metadata"), dict):
-        metadata = content.get("metadata", {}).get("agent_branch", {}) or {}
+def _skill_read(skill: Skill) -> dict[str, object]:
+    """员工可见的技能/SOP。
+
+    技能内容只有一份，不存在"分支副本" —— 作者改动对使用者立即可见。
+    """
     return {
         "id": skill.id,
         "tenant_id": skill.tenant_id,
@@ -2018,12 +1273,8 @@ def _skill_branch_read(skill: Skill) -> dict[str, object]:
         "description": skill.description,
         "content": skill.content_json,
         "status": skill.status,
-        "agent_id": metadata.get("agent_id"),
-        "branch_status": metadata.get("status"),
-        "branch_sync_state": metadata.get("sync_state"),
-        "branch_base_version": metadata.get("base_version"),
-        "branch_head_version": metadata.get("head_version"),
-        "metadata": dict(metadata.get("metadata") or {}),
+        "scope": getattr(skill, "scope", None),
+        "owner_agent_id": getattr(skill, "owner_agent_id", None),
         "created_at": skill.created_at.isoformat(),
         "updated_at": skill.updated_at.isoformat(),
     }

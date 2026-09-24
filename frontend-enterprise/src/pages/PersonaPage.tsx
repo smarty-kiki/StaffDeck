@@ -38,7 +38,8 @@ export default function PersonaPage() {
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
   const [selectedAgentId, setSelectedAgentId] = useState(readEmployeeScope);
   const selectedAgent = agents.find((agent) => agent.id === selectedAgentId) || null;
-  const isOverallPersona = !selectedAgent || selectedAgent.is_overall;
+  // 没选中员工 = 组织默认人设；选中员工 = 该员工自己的岗位人设。
+  const isOrgDefaultPersona = !selectedAgent;
 
   const updatePersona = (patch: Partial<PersonaForm>) => setForm((prev) => ({ ...prev, ...patch }));
 
@@ -58,20 +59,6 @@ export default function PersonaPage() {
   useEffect(() => {
     const agent = agents.find((item) => item.id === selectedAgentId);
     if (agent) {
-      if (agent.is_overall) {
-        api
-          .get<PersonaRead>(`/api/enterprise/persona?tenant_id=${TENANT_ID}`)
-          .then((row) => {
-            setForm({
-              agent_name: agent.name,
-              agent_description: agent.description || '',
-              system_prompt: agent.persona_prompt || row.system_prompt,
-            });
-            setUpdatedAt(agent.updated_at || row.updated_at);
-          })
-          .catch((error) => notify.error(error.message));
-        return;
-      }
       setForm({
         agent_name: agent.name,
         agent_description: agent.description || '',
@@ -97,7 +84,7 @@ export default function PersonaPage() {
         const stored = readEmployeeScope();
         const candidate = current || stored || '';
         if (candidate && rows.some((agent) => agent.id === candidate)) return candidate;
-        return rows.find((agent) => agent.is_overall)?.id || rows[0]?.id || '';
+        return rows[0]?.id || '';
       });
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '加载员工域失败');
@@ -121,12 +108,6 @@ export default function PersonaPage() {
         });
         setAgents((prev) => prev.map((item) => (item.id === row.id ? { ...row, resources: item.resources } : item)));
         setUpdatedAt(row.updated_at);
-        if (row.is_overall) {
-          await api.put<PersonaRead>('/api/enterprise/persona', {
-            tenant_id: TENANT_ID,
-            system_prompt: form.system_prompt,
-          });
-        }
         window.dispatchEvent(new CustomEvent('ultrarag-enterprise-agent-scope-change', { detail: { agentId: row.id } }));
         notify.success('岗位人设已保存');
       } else {
@@ -171,7 +152,7 @@ export default function PersonaPage() {
               className="persona-editor"
               rows={12}
               value={form.system_prompt}
-              placeholder={isOverallPersona ? '输入组织默认岗位人设' : '输入仅当前员工可见的岗位人设'}
+              placeholder={isOrgDefaultPersona ? '输入组织默认岗位人设' : '输入仅当前员工可见的岗位人设'}
               onChange={(event) => updatePersona({ system_prompt: event.target.value })}
             />
           </LabeledField>

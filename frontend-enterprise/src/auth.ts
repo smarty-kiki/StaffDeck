@@ -56,16 +56,18 @@ export function isEnterpriseAdmin(user?: EnterpriseAuthUser | null): boolean {
   return user?.role === 'admin';
 }
 
-export function isGalleryEmployee(agent?: { metadata?: Record<string, unknown> } | null): boolean {
-  return agent?.metadata?.published_to_gallery === true;
+export function isGalleryEmployee(
+  agent?: { is_published?: boolean } | null,
+): boolean {
+  // 发布状态只看列：`is_published` 已取代 metadata.published_to_gallery。
+  return agent?.is_published === true;
 }
 
 export function isEmployeeOwnedBy(
-  agent: { metadata?: Record<string, unknown> },
+  agent: { owner_user_id?: string },
   user?: EnterpriseAuthUser | null,
 ): boolean {
   if (!user) return false;
-  const metadata = agent.metadata || {};
-  const ownerUserId = metadata.owner_user_id;
-  return ownerUserId === user.id;
+  // 归属只看列：`owner_user_id` 是唯一真相，metadata 里那份已随改造清除。
+  return agent.owner_user_id === user.id;
 }

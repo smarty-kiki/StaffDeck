@@ -1292,8 +1292,8 @@ def test_wecom_group_inbound_uses_sender_name_prefix() -> None:
 def test_wecom_switch_command_routes_agents() -> None:
     engine = _test_engine()
     with Session(engine) as db:
-        db.add(AgentProfile(id="agent_1", tenant_id="tenant_demo", name="行政", metadata_json={}))
-        db.add(AgentProfile(id="agent_2", tenant_id="tenant_demo", name="财务", metadata_json={}))
+        db.add(AgentProfile(owner_user_id="user_admin", id="agent_1", tenant_id="tenant_demo", name="行政", metadata_json={}))
+        db.add(AgentProfile(owner_user_id="user_admin", id="agent_2", tenant_id="tenant_demo", name="财务", metadata_json={}))
         db.commit()
     binding_id = _seed_wecom_binding(engine)
     with Session(engine) as db:
@@ -1346,7 +1346,7 @@ def _seed_api_users(engine) -> dict[str, User]:
         db.add(owner)
         db.add(other)
         db.add(
-            AgentProfile(
+            AgentProfile(owner_user_id=owner.id,
                 id="agent_1",
                 tenant_id="tenant_demo",
                 name="客服员工",

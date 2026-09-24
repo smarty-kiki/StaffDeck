@@ -11,7 +11,7 @@ import type { ComponentType, ReactNode, SVGProps } from 'react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { api, TENANT_ID } from '../api/client';
-import { isGalleryEmployee, type EnterpriseAuthUser } from '../auth';
+import { isEnterpriseAdmin, isGalleryEmployee, type EnterpriseAuthUser } from '../auth';
 import EmployeeAvatar from '../components/EmployeeAvatar';
 import IconAgents from '../assets/icons/nav-agents.svg?react';
 import IconFolder from '../assets/icons/cap-folder.svg?react';
@@ -83,19 +83,19 @@ const PLATFORM_CONFIGS: PlatformConfig[] = [
   {
     kind: 'knowledge',
     title: '知识库广场',
-    subtitle: '发布到广场的知识库，可复制到你的数字员工。',
-    detail: '从广场复制到当前数字员工的知识库。',
-    useLabel: '复制到知识库',
+    subtitle: '发布到广场的知识库，可引用到你的数字员工。',
+    detail: '把广场知识库引用到当前数字员工。',
+    useLabel: '引用到知识库',
     metricLabel: '知识库',
-    signals: ['知识图谱', '引用来源', '可复制'],
+    signals: ['知识图谱', '引用来源', '可引用'],
     icon: <FileSearchOutlined />,
   },
   {
     kind: 'general-skills',
     title: '技能广场',
     subtitle: '浏览器、MCP、查询工具等可复用能力。',
-    detail: '从广场复制到当前数字员工的技能。',
-    useLabel: '复制到技能',
+    detail: '把广场技能引用到当前数字员工。',
+    useLabel: '引用到技能',
     metricLabel: '技能',
     signals: ['运行测试', 'MCP/浏览器', '能力复用'],
     icon: <SolutionOutlined />,
@@ -103,11 +103,11 @@ const PLATFORM_CONFIGS: PlatformConfig[] = [
   {
     kind: 'skills',
     title: 'SOP 广场',
-    subtitle: '可复制和复用的业务流程与执行规范。',
-    detail: '从广场复制到当前数字员工的 SOP。',
-    useLabel: '复制到 SOP',
+    subtitle: '可引用和复用的业务流程与执行规范。',
+    detail: '把广场 SOP 引用到当前数字员工。',
+    useLabel: '引用到 SOP',
     metricLabel: '业务 SOP',
-    signals: ['流程推进', '执行规范', '可复制'],
+    signals: ['流程推进', '执行规范', '可引用'],
     icon: <ProfileOutlined />,
   },
   {
@@ -203,19 +203,27 @@ export default function OpenPlatformPage({
     return () => window.removeEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
   }, []);
 
+  // 开放广场内容只对管理员可见可用：非管理员既不加载广场数据，也不渲染广场列。
+  const canViewPlaza = isEnterpriseAdmin(currentUser);
+
   const loadPlatformData = useCallback(async () => {
+    if (!canViewPlaza) {
+      setAgents([]);
+      setKnowledgeBases([]);
+      setGeneralSkills([]);
+      setSkills([]);
+      setTools([]);
+      return;
+    }
     setLoading(true);
     try {
       const agentRows = await api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`);
-      const overall = agentRows.find((item) => item.is_overall);
-      const overallSuffix = overall ? `&agent_id=${encodeURIComponent(overall.id)}` : '';
+      // 广场不是某个员工名下的资源：不带 agent_id 就是广场视角。
       const [kbRows, generalRows, skillRows, toolRows] = await Promise.all([
-        api.get<KnowledgeBaseRead[]>(`/api/enterprise/knowledge-bases?tenant_id=${TENANT_ID}${overallSuffix}`),
-        api.get<GeneralSkillRead[]>(`/api/enterprise/general-skills?tenant_id=${TENANT_ID}${overallSuffix}`),
-        overall
-          ? api.get<SkillRead[]>(`/api/enterprise/agents/${overall.id}/skills?tenant_id=${TENANT_ID}`)
-          : Promise.resolve([]),
-        api.get<ToolRead[]>(`/api/enterprise/tools?tenant_id=${TENANT_ID}${overallSuffix}`),
+        api.get<KnowledgeBaseRead[]>(`/api/enterprise/knowledge-bases?tenant_id=${TENANT_ID}`),
+        api.get<GeneralSkillRead[]>(`/api/enterprise/general-skills?tenant_id=${TENANT_ID}`),
+        api.get<SkillRead[]>(`/api/enterprise/skills?tenant_id=${TENANT_ID}`),
+        api.get<ToolRead[]>(`/api/enterprise/tools?tenant_id=${TENANT_ID}`),
       ]);
       setAgents(agentRows);
       setKnowledgeBases(kbRows);
@@ -227,22 +235,21 @@ export default function OpenPlatformPage({
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [canViewPlaza]);
 
   useEffect(() => {
     void loadPlatformData();
   }, [loadPlatformData]);
 
   const visibleAgents = useMemo(
-    () => agents.filter((item) => !item.is_overall && item.status === 'active' && isGalleryEmployee(item)),
+    () => agents.filter((item) => item.status === 'active' && isGalleryEmployee(item)),
     [agents],
   );
-  const overallAgent = agents.find((item) => item.is_overall) || null;
   const canManagePlatform = isAdmin;
   const currentAgent = agents.find((item) => item.id === agentId);
   const targetEmployee = currentAgent && canManageEmployeeAgent(currentAgent, currentUser)
     ? currentAgent
-    : agents.find((item) => canManageEmployeeAgent(item, currentUser) && !item.is_overall);
+    : agents.find((item) => canManageEmployeeAgent(item, currentUser));
 
   const platformItems = useMemo<Record<PlatformKind, PlatformItem[]>>(() => ({
     agents: visibleAgents.map((item) => {
@@ -269,7 +276,7 @@ export default function OpenPlatformPage({
         title: resourceDisplayNameWithCreator(item.name, item),
         description: item.description || '广场沉淀的知识库。',
         meta: `${item.document_count} 文档 / ${item.bucket_count} 目录 / ${item.chunk_count} 引用`,
-        tags: [item.version || 'v1.0.0', item.branch_sync_state || '广场版'],
+        tags: [item.version || 'v1.0.0', '广场版'],
       })),
     'general-skills': generalSkills
       .filter((item) => item.status === 'published')
@@ -277,7 +284,7 @@ export default function OpenPlatformPage({
         id: item.id,
         deleteKey: item.slug,
         title: resourceDisplayNameWithCreator(item.name, item),
-        description: item.description || '可复制到当前数字员工的技能。',
+        description: item.description || '可引用到当前数字员工的技能。',
         meta: item.slug,
         tags: [item.homepage ? '外部能力' : '内置能力', '已启用'],
       })),
@@ -310,7 +317,7 @@ export default function OpenPlatformPage({
 
   function ensureTargetEmployee(): boolean {
     if (!targetEmployee) {
-      notify.warning('请先选择一个员工，再从广场复制资源。');
+      notify.warning('请先选择一个员工，再引用广场资源。');
       return false;
     }
     if (targetEmployee.id !== agentId) {
@@ -373,12 +380,12 @@ export default function OpenPlatformPage({
 
   function platformDeleteUrl(platformKind: PlatformKind, item: PlatformItem): string {
     const resourceKey = encodeURIComponent(item.deleteKey || item.id);
-    const overallSuffix = overallAgent ? `&agent_id=${encodeURIComponent(overallAgent.id)}` : '';
+    // 广场资源不带 agent_id：管理员在广场作用域下架/删除它们。
     if (platformKind === 'agents') return `/api/enterprise/agents/${resourceKey}?tenant_id=${TENANT_ID}`;
-    if (platformKind === 'knowledge') return `/api/enterprise/knowledge-bases/${resourceKey}?tenant_id=${TENANT_ID}${overallSuffix}`;
-    if (platformKind === 'general-skills') return `/api/enterprise/general-skills/${resourceKey}?tenant_id=${TENANT_ID}${overallSuffix}`;
-    if (platformKind === 'skills') return `/api/enterprise/skills/${resourceKey}?tenant_id=${TENANT_ID}${overallSuffix}`;
-    return `/api/enterprise/tools/${resourceKey}?tenant_id=${TENANT_ID}${overallSuffix}`;
+    if (platformKind === 'knowledge') return `/api/enterprise/knowledge-bases/${resourceKey}?tenant_id=${TENANT_ID}`;
+    if (platformKind === 'general-skills') return `/api/enterprise/general-skills/${resourceKey}?tenant_id=${TENANT_ID}`;
+    if (platformKind === 'skills') return `/api/enterprise/skills/${resourceKey}?tenant_id=${TENANT_ID}`;
+    return `/api/enterprise/tools/${resourceKey}?tenant_id=${TENANT_ID}`;
   }
 
   async function runDelete() {
@@ -506,11 +513,31 @@ export default function OpenPlatformPage({
           : ''}
         description={confirmTarget?.kind === 'agents'
           ? '下线后该员工不再出现在开放广场，也不能被新用户添加；员工本体及其资源、已有使用记录都会保留。'
-          : '删除后该广场内容会从开放平台移除，已复制到员工侧的引用可能不再可同步。'}
+          : '删除后该广场内容会从开放平台移除，已引用它的数字员工可能不再可同步。'}
         confirmText={confirmTarget?.kind === 'agents' ? '确认下线' : '删除'}
         loading={Boolean(confirmTarget) && deletingItemKey === (confirmTarget ? platformItemDeleteKey(confirmTarget.kind, confirmTarget.item) : '')}
         onConfirm={() => void runDelete()}
       />
+    );
+  }
+
+  // 广场整页本质是广场管理页：非管理员看到明确空态，而不是广场数据。
+  if (!canViewPlaza) {
+    return (
+      <div className="flex min-h-full flex-col box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
+        <AppHeader
+          className="mb-[24px]"
+          onLogout={onLogout}
+          userName={currentUser?.username}
+          title="开放广场平台"
+        />
+        <div className="empty-workspace-card p-[24px]">
+          <h3 className="m-0 text-[20px] font-semibold text-foreground">仅管理员可查看</h3>
+          <p className="mt-[8px] text-[14px] text-muted-foreground">
+            开放广场内容只对企业管理员开放，请联系管理员查看或管理广场资源。
+          </p>
+        </div>
+      </div>
     );
   }
 
@@ -532,15 +559,7 @@ export default function OpenPlatformPage({
           onBack={() => navigate('/enterprise/platform')}
           onRefresh={() => void loadPlatformData()}
           onCreate={selectedKind === 'general-skills' ? () => {
-            const overall = agents.find((item) => item.is_overall);
-            if (!overall) {
-              notify.error('暂时无法找到开放广场');
-              return;
-            }
-            window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, overall.id);
-            window.dispatchEvent(new CustomEvent('ultrarag-enterprise-agent-scope-change', {
-              detail: { agentId: overall.id },
-            }));
+            // 直接落在广场视角新建：广场不是一条员工记录，用 ?scope=gallery 表达。
             navigate('/enterprise/general-skills/new?scope=gallery');
           } : undefined}
           onOpenItem={(item) => setDetailItem({ kind: selectedKind, item })}

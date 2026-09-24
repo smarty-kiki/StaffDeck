@@ -9,7 +9,9 @@ function agent(id: string, name: string): AgentProfileRead {
     id,
     tenant_id: 'tenant-demo',
     name,
-    is_overall: false,
+    owner_user_id: 'user-1',
+    owner_display_name: 'demo',
+    is_published: false,
     status: 'active',
     metadata: {},
     resources: [],
@@ -38,10 +40,11 @@ describe('chat session filter options', () => {
       session('session-b1', 'agent-b'),
     ];
 
+    // 创建人来自 `owner_display_name` 列，名字后面固定带 `@创建人`（同名消歧）。
     expect(buildSessionFilterOptions(agents, sessions)).toEqual([
       { value: 'all', label: '全部会话 · 3' },
-      { value: 'agent-a', label: 'Alpha · 2' },
-      { value: 'agent-b', label: 'Beta · 1' },
+      { value: 'agent-a', label: 'Alpha @demo · 2' },
+      { value: 'agent-b', label: 'Beta @demo · 1' },
     ]);
     expect(agents.map((item) => item.id)).toEqual(originalOrder);
   });
@@ -53,7 +56,7 @@ describe('chat session filter options', () => {
       'agent-draft',
     );
 
-    expect(options).toContainEqual({ value: 'agent-draft', label: 'Draft Agent' });
+    expect(options).toContainEqual({ value: 'agent-draft', label: 'Draft Agent @demo' });
     expect(options.some((option) => option.label.includes('· 0'))).toBe(false);
   });
 

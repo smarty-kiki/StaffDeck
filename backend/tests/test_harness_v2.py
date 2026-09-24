@@ -62,8 +62,8 @@ from app.core.task_request_compiler import (
 )
 from app.core.turn_planner import TurnPlanner
 from app.db.models import (
+    GALLERY_SCOPE,
     AgentEvent,
-    AgentProfile,
     ChatSession,
     GeneralSkill,
     HarnessAgentLoopRecord,
@@ -127,7 +127,7 @@ def test_first_harness_turn_derives_a_recoverable_session_id() -> None:
 
 
 def test_team_tl_turn_keeps_leader_sops_routable() -> None:
-    purchase = Skill(
+    purchase = Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
         id="skill-purchase-row",
         tenant_id="tenant-demo",
         skill_id="purchase",
@@ -561,7 +561,7 @@ def test_turn_planner_routes_handoff_human_to_sop_handoff_node() -> None:
     the planner should create an SOP frame targeting that node instead of a
     conversation frame. This ensures harness executes the handoff node and
     reads its assignee_user_id for Feishu notification."""
-    skill = Skill(
+    skill = Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
         id="skill-repair",
         tenant_id="tenant-demo",
         skill_id="repair_sop",
@@ -624,7 +624,7 @@ def test_turn_planner_handoff_human_falls_back_to_conversation_without_handoff_n
     """When router decides handoff_human but the active SOP has no handoff
     node, the planner falls back to a conversation frame so the harness
     conversation-handoff path still fires."""
-    skill = Skill(
+    skill = Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
         id="skill-refund",
         tenant_id="tenant-demo",
         skill_id="refund",
@@ -672,7 +672,7 @@ def test_turn_planner_handoff_human_falls_back_to_conversation_without_handoff_n
 def test_turn_planner_handoff_human_picks_reachable_handoff_node() -> None:
     """When multiple handoff nodes exist, the planner should pick the one
     reachable from the current node via edges, not the first in array order."""
-    skill = Skill(
+    skill = Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
         id="skill-multi-handoff",
         tenant_id="tenant-demo",
         skill_id="multi_handoff_sop",
@@ -1067,7 +1067,7 @@ def test_sibling_task_intents_only_returns_other_frames_from_same_turn() -> None
 
 
 def test_task_requirement_only_marks_explicitly_required_node_capabilities() -> None:
-    skill = Skill(
+    skill = Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
         id="skill-http-chain",
         tenant_id="tenant-demo",
         skill_id="http-chain",
@@ -1241,18 +1241,10 @@ def test_capability_manifest_only_exposes_current_step_sop_specific_resources() 
     engine = _test_engine()
     with Session(engine) as db:
         db.add(Tenant(id="tenant-demo", name="Demo"))
-        db.add(
-            AgentProfile(
-                id="agent-overall",
-                tenant_id="tenant-demo",
-                name="整体智能体",
-                is_overall=True,
-            )
-        )
         resources: list[tuple[str, object]] = [
             (
                 "general_skill",
-                GeneralSkill(
+                GeneralSkill(scope=GALLERY_SCOPE, owner_agent_id=None,
                     id="general-shared",
                     tenant_id="tenant-demo",
                     slug="shared",
@@ -1264,7 +1256,7 @@ def test_capability_manifest_only_exposes_current_step_sop_specific_resources() 
             ),
             (
                 "general_skill",
-                GeneralSkill(
+                GeneralSkill(scope=GALLERY_SCOPE, owner_agent_id=None,
                     id="specific-first",
                     tenant_id="tenant-demo",
                     slug="first-only",
@@ -1276,7 +1268,7 @@ def test_capability_manifest_only_exposes_current_step_sop_specific_resources() 
             ),
             (
                 "general_skill",
-                GeneralSkill(
+                GeneralSkill(scope=GALLERY_SCOPE, owner_agent_id=None,
                     id="specific-second",
                     tenant_id="tenant-demo",
                     slug="second-only",
@@ -1288,7 +1280,7 @@ def test_capability_manifest_only_exposes_current_step_sop_specific_resources() 
             ),
             (
                 "tool",
-                Tool(
+                Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
                     id="tool-first",
                     tenant_id="tenant-demo",
                     name="refund.lookup",
@@ -1313,19 +1305,19 @@ def test_capability_manifest_only_exposes_current_step_sop_specific_resources() 
         skill = _scope_skill()
         first = CapabilityManifestBuilder(db).build(
             "tenant-demo",
-            "agent-overall",
+            None,
             skill,
             "first",
         )
         second = CapabilityManifestBuilder(db).build(
             "tenant-demo",
-            "agent-overall",
+            None,
             skill,
             "second",
         )
         conversation = CapabilityManifestBuilder(db).build(
             "tenant-demo",
-            "agent-overall",
+            None,
             None,
             None,
         )
@@ -1360,15 +1352,7 @@ def test_nested_sop_tool_grant_survives_parent_expansion() -> None:
     engine = _test_engine()
     with Session(engine) as db:
         db.add(Tenant(id="tenant-demo", name="Demo"))
-        db.add(
-            AgentProfile(
-                id="agent-overall",
-                tenant_id="tenant-demo",
-                name="整体智能体",
-                is_overall=True,
-            )
-        )
-        tool = Tool(
+        tool = Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
             id="tool-child",
             tenant_id="tenant-demo",
             name="child.lookup",
@@ -1382,7 +1366,7 @@ def test_nested_sop_tool_grant_survives_parent_expansion() -> None:
         ensure_open_gallery_binding(db, "tenant-demo", "tool", tool.id)
         db.commit()
 
-        child = Skill(
+        child = Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
             id="skill-child",
             tenant_id="tenant-demo",
             skill_id="child",
@@ -1403,7 +1387,7 @@ def test_nested_sop_tool_grant_survives_parent_expansion() -> None:
                 "edges": [],
             },
         )
-        parent = Skill(
+        parent = Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
             id="skill-parent",
             tenant_id="tenant-demo",
             skill_id="parent",
@@ -1427,7 +1411,7 @@ def test_nested_sop_tool_grant_survives_parent_expansion() -> None:
         expanded = expand_sop_for_execution(parent, [parent, child])
         manifest = CapabilityManifestBuilder(db).build(
             "tenant-demo",
-            "agent-overall",
+            None,
             expanded,
             "nested::child::lookup",
         )
@@ -1439,16 +1423,8 @@ def test_general_tools_remain_discoverable_across_sop_steps() -> None:
     engine = _test_engine()
     with Session(engine) as db:
         db.add(Tenant(id="tenant-demo", name="Demo"))
-        db.add(
-            AgentProfile(
-                id="agent-overall",
-                tenant_id="tenant-demo",
-                name="整体智能体",
-                is_overall=True,
-            )
-        )
         tools = [
-            Tool(
+            Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
                 id="tool-ocr",
                 tenant_id="tenant-demo",
                 name="ocr_parse",
@@ -1456,7 +1432,7 @@ def test_general_tools_remain_discoverable_across_sop_steps() -> None:
                 url="https://example.test/ocr",
                 capability_scope="general",
             ),
-            Tool(
+            Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
                 id="tool-final",
                 tenant_id="tenant-demo",
                 name="expense_rule_execute",
@@ -1464,7 +1440,7 @@ def test_general_tools_remain_discoverable_across_sop_steps() -> None:
                 url="https://example.test/final",
                 capability_scope="general",
             ),
-            Tool(
+            Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
                 id="tool-unrelated",
                 tenant_id="tenant-demo",
                 name="send_notice",
@@ -1478,7 +1454,7 @@ def test_general_tools_remain_discoverable_across_sop_steps() -> None:
         for tool in tools:
             ensure_open_gallery_binding(db, "tenant-demo", "tool", tool.id)
         db.commit()
-        skill = Skill(
+        skill = Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
             id="skill-chain",
             tenant_id="tenant-demo",
             skill_id="chain",
@@ -1503,10 +1479,10 @@ def test_general_tools_remain_discoverable_across_sop_steps() -> None:
             },
         )
 
-        first = CapabilityManifestBuilder(db).build("tenant-demo", "agent-overall", skill, "ocr")
-        final = CapabilityManifestBuilder(db).build("tenant-demo", "agent-overall", skill, "final")
+        first = CapabilityManifestBuilder(db).build("tenant-demo", None, skill, "ocr")
+        final = CapabilityManifestBuilder(db).build("tenant-demo", None, skill, "final")
         conversation = CapabilityManifestBuilder(db).build(
-            "tenant-demo", "agent-overall", None, None
+            "tenant-demo", None, None, None
         )
 
     assert "ocr_parse" in first.allowed_names()
@@ -2079,21 +2055,21 @@ def test_large_external_json_result_uses_sandbox_reference_and_auto_resolves(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("ULTRARAG_DATA_DIR", str(tmp_path / "data"))
-    large_tool = Tool(
+    large_tool = Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
         id="tool-large-json",
         tenant_id="tenant-demo",
         name="large_json",
         method="GET",
         url="https://example.test/large",
     )
-    small_tool = Tool(
+    small_tool = Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
         id="tool-small-json",
         tenant_id="tenant-demo",
         name="small_json",
         method="GET",
         url="https://example.test/small",
     )
-    sink_tool = Tool(
+    sink_tool = Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
         id="tool-json-sink",
         tenant_id="tenant-demo",
         name="json_sink",
@@ -2205,7 +2181,7 @@ def test_mcp_app_descriptor_is_host_only_and_emitted_as_trace(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("ULTRARAG_DATA_DIR", str(tmp_path / "data"))
-    app_tool = Tool(
+    app_tool = Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
         id="tool-mcp-app",
         tenant_id="tenant-demo",
         name="apps.render",
@@ -2331,7 +2307,7 @@ def test_external_idempotency_key_is_stable_per_task_not_entire_session(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("ULTRARAG_DATA_DIR", str(tmp_path / "data"))
-    tool = Tool(
+    tool = Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
         id="tool-write",
         tenant_id="tenant-demo",
         name="orders.create",
@@ -2395,7 +2371,7 @@ def test_general_skill_harness_tool_reads_full_package_when_requested(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("ULTRARAG_DATA_DIR", str(tmp_path / "data"))
-    skill = GeneralSkill(
+    skill = GeneralSkill(scope=GALLERY_SCOPE, owner_agent_id=None,
         id="general-runner",
         tenant_id="tenant-demo",
         slug="runner",
@@ -2514,7 +2490,7 @@ def test_general_skill_harness_tool_defaults_to_read_instead_of_generating_code(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("ULTRARAG_DATA_DIR", str(tmp_path / "data"))
-    skill = GeneralSkill(
+    skill = GeneralSkill(scope=GALLERY_SCOPE, owner_agent_id=None,
         id="instruction-only",
         tenant_id="tenant-demo",
         slug="policy-guide",
@@ -2604,7 +2580,7 @@ def test_general_skill_harness_tool_treats_legacy_execute_as_instruction_load(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("ULTRARAG_DATA_DIR", str(tmp_path / "data"))
-    skill = GeneralSkill(
+    skill = GeneralSkill(scope=GALLERY_SCOPE, owner_agent_id=None,
         id="guarded-runner",
         tenant_id="tenant-demo",
         slug="guarded-runner",
@@ -2721,7 +2697,7 @@ def test_general_skill_harness_tool_never_executes_generated_runner(
         "app.general_skills.runner.GeneralSkillRunner.run",
         fake_run,
     )
-    skill = GeneralSkill(
+    skill = GeneralSkill(scope=GALLERY_SCOPE, owner_agent_id=None,
         id="general-weather",
         tenant_id="tenant-demo",
         slug="weather",
@@ -2806,7 +2782,7 @@ def test_general_skill_harness_tool_does_not_enter_legacy_sandbox_runner(
         "app.general_skills.runner.GeneralSkillRunner.run",
         fail_run,
     )
-    skill = GeneralSkill(
+    skill = GeneralSkill(scope=GALLERY_SCOPE, owner_agent_id=None,
         id="general-sandbox-failure",
         tenant_id="tenant-demo",
         slug="sandbox-failure",
@@ -2907,7 +2883,7 @@ def test_general_skill_harness_tool_does_not_publish_legacy_runner_artifacts(
         "app.general_skills.runner.GeneralSkillRunner.run",
         fake_run,
     )
-    skill = GeneralSkill(
+    skill = GeneralSkill(scope=GALLERY_SCOPE, owner_agent_id=None,
         id="general-mixed-artifacts",
         tenant_id="tenant-demo",
         slug="mixed-artifacts",
@@ -5326,7 +5302,7 @@ def _chat_session(**updates: object) -> ChatSession:
 
 
 def _refund_skill() -> Skill:
-    return Skill(
+    return Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
         id="skill-refund",
         tenant_id="tenant-demo",
         skill_id="refund",
@@ -5355,7 +5331,7 @@ def _refund_skill() -> Skill:
 
 
 def _scope_skill() -> Skill:
-    return Skill(
+    return Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
         id="skill-scope",
         tenant_id="tenant-demo",
         skill_id="scope-demo",

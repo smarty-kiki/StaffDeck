@@ -9,15 +9,12 @@ from fastapi import HTTPException
 from sqlmodel import Session, select
 
 from app.agents.branching import (
-    ensure_private_resource_binding,
     is_open_gallery_resource,
-    mark_resource_private_for_agent,
-    update_branch_skill,
     visible_skill_rows,
 )
 from app.db.models import (
     AgentEvent,
-    AgentResourceBinding,
+    AgentResourceReference,
     ChatSession,
     EvolutionProposal,
     GeneralSkill,
@@ -32,10 +29,11 @@ from app.db.models import (
 from app.evolution.schema import EvolutionAnalyzeRequest
 from app.llm import LLMClient
 from app.llm.model_config_resolver import resolve_model_config_for_runtime
+from app.security.permissions import ensure_open_gallery_admin
 from app.skills import SkillEditor
 from app.skills.nesting import SopNestingError, validate_sop_nesting
 from app.skills.skill_schema import SkillCard, SkillRewriteRequest, skill_card_from_persisted
-
+from app.skills.step_ids import skill_card_with_unique_step_ids
 
 GENERAL_SKILL_EVOLUTION_PROMPT = """
 你是 StaffDeck 的通用技能改进器。根据当前 SKILL.md 和真实用户反馈，生成一次最小、可审核的改进。
@@ -172,15 +170,11 @@ class EvolutionService:
                 ),
                 source,
             )
+            if is_open_gallery_resource(self.db, row.tenant_id, "skill", source):
+                # 广场 SOP 归广场所有：直接改写需要管理员权限，不再复制私有副本。
+                ensure_open_gallery_admin(row.tenant_id, current_user)
             row.published_snapshot_json = deepcopy(visible_source.content_json or {})
-            update_branch_skill(
-                self.db,
-                row.tenant_id,
-                row.agent_id,
-                source,
-                deepcopy(row.candidate_json),
-                change_summary=f"反馈自进化：{row.hypothesis[:120]}",
-            )
+            _apply_sop_content(self.db, source, deepcopy(row.candidate_json))
         else:
             skill = self.db.get(GeneralSkill, row.resource_id)
             if not skill or skill.tenant_id != row.tenant_id:
@@ -190,49 +184,9 @@ class EvolutionService:
                     "未找到对应的通用技能",
                 )
             if is_open_gallery_resource(self.db, row.tenant_id, "general_skill", skill):
-                source = skill
-                skill = GeneralSkill(
-                    tenant_id=source.tenant_id,
-                    slug=self._private_skill_slug(row.tenant_id, source.slug, row.agent_id),
-                    name=source.name,
-                    description=source.description,
-                    homepage=source.homepage,
-                    skill_markdown=source.skill_markdown,
-                    skill_files_json=deepcopy(source.skill_files_json or []),
-                    metadata_json=deepcopy(source.metadata_json or {}),
-                    status=source.status,
-                    capability_scope=source.capability_scope,
-                    permissions_json=deepcopy(source.permissions_json or {}),
-                    runtime_config_json=deepcopy(source.runtime_config_json or {}),
-                )
-                mark_resource_private_for_agent(
-                    skill,
-                    row.agent_id,
-                    {
-                        "evolved_from_resource_id": source.id,
-                        "evolution_proposal_id": row.id,
-                    },
-                )
-                self.db.add(skill)
-                self.db.flush()
-                ensure_private_resource_binding(
-                    self.db,
-                    row.tenant_id,
-                    row.agent_id,
-                    "general_skill",
-                    skill.id,
-                    "active" if skill.status == "published" else "inactive",
-                    metadata_json=skill.metadata_json,
-                    revive=True,
-                )
-                row.published_snapshot_json = {
-                    "created_private_copy": True,
-                    "source_resource_id": source.id,
-                }
-                row.resource_id = skill.id
-                row.resource_key = skill.slug
-            else:
-                row.published_snapshot_json = self._general_skill_snapshot(skill)
+                # 广场技能归广场所有：直接改写需要管理员权限，不再复制私有副本。
+                ensure_open_gallery_admin(row.tenant_id, current_user)
+            row.published_snapshot_json = self._general_skill_snapshot(skill)
             skill.skill_markdown = str(row.candidate_json.get("skill_markdown") or "")
             skill.description = str(
                 row.candidate_json.get("description") or skill.description or ""
@@ -284,14 +238,7 @@ class EvolutionService:
             source = self.db.get(Skill, row.resource_id)
             if not source:
                 raise _evolution_http_error(404, "EVOLUTION_SOP_NOT_FOUND", "未找到对应的 SOP")
-            update_branch_skill(
-                self.db,
-                row.tenant_id,
-                row.agent_id,
-                source,
-                deepcopy(row.published_snapshot_json),
-                change_summary=f"回滚自进化候选 {row.id}",
-            )
+            _apply_sop_content(self.db, source, deepcopy(row.published_snapshot_json))
         else:
             skill = self.db.get(GeneralSkill, row.resource_id)
             if not skill:
@@ -301,21 +248,9 @@ class EvolutionService:
                     "未找到对应的通用技能",
                 )
             snapshot = row.published_snapshot_json
-            if snapshot.get("created_private_copy") is True:
-                skill.status = "archived"
-                ensure_private_resource_binding(
-                    self.db,
-                    row.tenant_id,
-                    row.agent_id,
-                    "general_skill",
-                    skill.id,
-                    "inactive",
-                    metadata_json=skill.metadata_json,
-                )
-            else:
-                skill.skill_markdown = str(snapshot.get("skill_markdown") or "")
-                skill.description = snapshot.get("description")
-                skill.metadata_json = dict(snapshot.get("metadata") or {})
+            skill.skill_markdown = str(snapshot.get("skill_markdown") or "")
+            skill.description = snapshot.get("description")
+            skill.metadata_json = dict(snapshot.get("metadata") or {})
             skill.updated_at = utc_now()
             self.db.add(skill)
         row.status = "rolled_back"
@@ -406,13 +341,13 @@ class EvolutionService:
         request: EvolutionAnalyzeRequest,
         feedback_rows: list[MessageFeedback],
     ) -> GeneralSkill | None:
+        # 引用行的存在即状态：取消引用会直接删除该行，不再有 status 字段可过滤。
         bindings = list(
             self.db.exec(
-                select(AgentResourceBinding).where(
-                    AgentResourceBinding.tenant_id == request.tenant_id,
-                    AgentResourceBinding.agent_id == agent_id,
-                    AgentResourceBinding.resource_type == "general_skill",
-                    AgentResourceBinding.status == "active",
+                select(AgentResourceReference).where(
+                    AgentResourceReference.tenant_id == request.tenant_id,
+                    AgentResourceReference.agent_id == agent_id,
+                    AgentResourceReference.resource_type == "general_skill",
                 )
             ).all()
         )
@@ -643,6 +578,22 @@ def _hypothesis(evidence: list[dict[str, Any]], fallback: str) -> str:
         if text:
             return text[:300]
     return fallback
+
+
+def _apply_sop_content(db: Session, source: Skill, content: dict[str, Any]) -> None:
+    """把改写后的内容写回 SOP 本身。
+
+    引用模型下 SOP 只有一份 —— 不存在"员工分支副本"。改写广场 SOP 需要管理员
+    权限（由调用方在写入前校验）。
+    """
+    card, _warnings = skill_card_with_unique_step_ids(skill_card_from_persisted(content))
+    source.version = card.version
+    source.name = card.name
+    source.business_domain = card.business_domain
+    source.description = card.description
+    source.content_json = card.model_dump()
+    source.updated_at = utc_now()
+    db.add(source)
 
 
 def _evolution_http_error(status_code: int, code: str, message: str) -> HTTPException:

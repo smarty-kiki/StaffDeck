@@ -94,22 +94,20 @@ def _client(monkeypatch):
         )
         db.add(admin)
         db.add(
-            AgentProfile(
+            AgentProfile(owner_user_id=admin.id,
                 id="agent_api",
                 tenant_id="tenant_api",
                 name="API Employee",
                 status="active",
-                is_overall=False,
                 metadata_json={"owner_user_id": admin.id, "owner_username": admin.username},
             )
         )
         db.add(
-            AgentProfile(
+            AgentProfile(owner_user_id=admin.id,
                 id="agent_other",
                 tenant_id="tenant_api",
                 name="Other Employee",
                 status="active",
-                is_overall=False,
                 metadata_json={"owner_user_id": admin.id, "owner_username": admin.username},
             )
         )
@@ -791,39 +789,26 @@ def test_account_master_key_follows_user_visible_agents(monkeypatch) -> None:
         db.add(member)
         db.add_all(
             [
-                AgentProfile(
+                AgentProfile(owner_user_id=member.id,
                     id="agent_member_owned",
                     tenant_id="tenant_api",
                     name="Member Employee",
                     status="active",
-                    is_overall=False,
                     metadata_json={"owner_user_id": member.id},
                 ),
-                AgentProfile(
+                AgentProfile(owner_user_id=admin.id,
                     id="agent_published",
                     tenant_id="tenant_api",
                     name="Published Employee",
                     status="active",
-                    is_overall=False,
-                    metadata_json={
-                        "owner_user_id": admin.id,
-                        "published_to_gallery": True,
-                    },
+                    is_published=True,
+                    metadata_json={"owner_user_id": admin.id},
                 ),
-                AgentProfile(
+                AgentProfile(owner_user_id=admin.id,
                     id="agent_private",
                     tenant_id="tenant_api",
                     name="Private Employee",
                     status="active",
-                    is_overall=False,
-                    metadata_json={"owner_user_id": admin.id},
-                ),
-                AgentProfile(
-                    id="agent_overall",
-                    tenant_id="tenant_api",
-                    name="Overall Employee",
-                    status="active",
-                    is_overall=True,
                     metadata_json={"owner_user_id": admin.id},
                 ),
             ]
@@ -849,11 +834,11 @@ def test_account_master_key_follows_user_visible_agents(monkeypatch) -> None:
     listed_agents = client.get("/agents", headers=auth)
     assert listed_agents.status_code == 200, listed_agents.text
     agent_ids = {row["id"] for row in listed_agents.json()["data"]}
-    assert {"agent_member_owned", "agent_published", "agent_overall"} <= agent_ids
+    assert {"agent_member_owned", "agent_published"} <= agent_ids
     assert "agent_private" not in agent_ids
     assert "agent_api" not in agent_ids
 
-    for agent_id in ("agent_member_owned", "agent_published", "agent_overall"):
+    for agent_id in ("agent_member_owned", "agent_published"):
         response = client.get(f"/agents/{agent_id}/capabilities", headers=auth)
         assert response.status_code == 200, response.text
     private_response = client.get("/agents/agent_private/capabilities", headers=auth)
@@ -886,7 +871,7 @@ def test_account_master_key_follows_user_visible_agents(monkeypatch) -> None:
     created_agent = client.post(
         "/agents",
         headers={**auth, "Idempotency-Key": "create-member-agent-1"},
-        json={"name": "Member API Employee", "source_mode": "blank"},
+        json={"name": "Member API Employee"},
     )
     assert created_agent.status_code == 201, created_agent.text
     assert created_agent.json()["metadata"]["owner_user_id"] == "user_api_member"
@@ -902,10 +887,7 @@ def test_account_master_key_follows_user_visible_agents(monkeypatch) -> None:
     # Visibility is evaluated on every request, not frozen into the key.
     with Session(engine) as db:
         private = db.get(AgentProfile, "agent_private")
-        private.metadata_json = {
-            **dict(private.metadata_json or {}),
-            "published_to_gallery": True,
-        }
+        private.is_published = True
         db.add(private)
         db.commit()
     refreshed_agents = client.get("/agents", headers=auth)
@@ -933,42 +915,39 @@ def test_gallery_directory_supports_search_and_cursor_pagination(monkeypatch) ->
         assert admin is not None
         db.add_all(
             [
-                AgentProfile(
+                AgentProfile(owner_user_id=admin.id,
                     id="gallery_hr",
                     tenant_id="tenant_api",
                     name="人事助手",
                     description="查询员工休假与薪酬制度",
                     status="active",
-                    is_overall=False,
+                    is_published=True,
                     metadata_json={
                         "owner_user_id": admin.id,
-                        "published_to_gallery": True,
                         "expertise_tags": ["年假", "薪酬"],
                     },
                 ),
-                AgentProfile(
+                AgentProfile(owner_user_id=admin.id,
                     id="gallery_legal",
                     tenant_id="tenant_api",
                     name="法务助手",
                     description="处理合同、用印和合规问题",
                     status="active",
-                    is_overall=False,
+                    is_published=True,
                     metadata_json={
                         "owner_user_id": admin.id,
-                        "published_to_gallery": True,
                         "expertise_tags": ["合同", "用印"],
                     },
                 ),
-                AgentProfile(
+                AgentProfile(owner_user_id=admin.id,
                     id="gallery_finance",
                     tenant_id="tenant_api",
                     name="财务助手",
                     description="处理报销与预算问题",
                     status="active",
-                    is_overall=False,
+                    is_published=True,
                     metadata_json={
                         "owner_user_id": admin.id,
-                        "published_to_gallery": True,
                         "expertise_tags": ["报销", "预算"],
                     },
                 ),
@@ -1016,12 +995,11 @@ def test_admin_account_master_key_sees_all_visible_tenant_agents(monkeypatch) ->
     with Session(engine) as db:
         admin = db.get(User, "user_api_admin")
         db.add(
-            AgentProfile(
+            AgentProfile(owner_user_id=admin.id,
                 id="agent_hidden",
                 tenant_id="tenant_api",
                 name="Hidden Employee",
                 status="active",
-                is_overall=False,
                 metadata_json={
                     "owner_user_id": admin.id,
                     "hidden_from_staffdeck": True,

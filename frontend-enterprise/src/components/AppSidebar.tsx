@@ -258,8 +258,8 @@ function AgentSwitcher({
   selectedAgentId,
   onSelectAgent,
 }: Pick<AppSidebarManagementProps, 'sidebarAgent' | 'scopeAgents' | 'scopeTeams' | 'selectedAgentId' | 'onSelectAgent'>) {
-  const employeeAgents = scopeAgents.filter((agent) => !agent.is_overall);
-  const currentAgent = sidebarAgent && !sidebarAgent.is_overall ? sidebarAgent : undefined;
+  const employeeAgents = scopeAgents;
+  const currentAgent = sidebarAgent;
   const selectedTeamId = teamIdFromScope(selectedAgentId);
   const currentTeam = selectedTeamId
     ? scopeTeams.find((team) => team.id === selectedTeamId)
@@ -433,8 +433,8 @@ function CollapsedAgentSwitcher({
 }: Pick<AppSidebarManagementProps, 'sidebarAgent' | 'scopeAgents' | 'scopeTeams' | 'selectedAgentId' | 'onSelectAgent'> & {
   nameLabel: string;
 }) {
-  const employeeAgents = scopeAgents.filter((agent) => !agent.is_overall);
-  const currentAgent = sidebarAgent && !sidebarAgent.is_overall ? sidebarAgent : undefined;
+  const employeeAgents = scopeAgents;
+  const currentAgent = sidebarAgent;
   const selectedTeamId = teamIdFromScope(selectedAgentId);
   return (
     <DropdownMenu>
@@ -508,9 +508,7 @@ function CollapsedSidebar({
   const nameLabel = selectedTeamId
     ? selectedTeam?.name || '团队'
     : sidebarAgent
-      ? sidebarAgent.is_overall
-        ? '未选择'
-        : employeeDisplayNameWithCreator(sidebarAgent)
+      ? employeeDisplayNameWithCreator(sidebarAgent)
       : '未选择';
   const primaryItems = primaryNavItems(isAdmin);
 

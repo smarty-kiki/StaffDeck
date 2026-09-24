@@ -8,18 +8,12 @@ from typing import Any, TypeVar
 
 from sqlmodel import Session, SQLModel, select
 
-from app.agents.branching import (
-    agent_private_metadata,
-    ensure_open_gallery_binding,
-    open_gallery_metadata,
-)
+from app.agents.branching import ensure_open_gallery_binding
 from app.capability_scope import normalize_capability_scope
 from app.db.models import (
-    AgentKnowledgeBranch,
+    GALLERY_SCOPE,
     AgentProfile,
-    AgentResourceBinding,
-    AgentSkillBranch,
-    AgentSkillBranchVersion,
+    AgentResourceReference,
     GeneralSkill,
     KnowledgeBase,
     KnowledgeBaseVersion,
@@ -65,6 +59,17 @@ USER_EDITABLE_AGENT_METADATA_KEYS = {
     "avatar_text",
     "avatar_tone",
 }
+# 归属化改造前的「状态类」metadata 键。新结构里它们分别由
+# `resources.scope` / `resources.owner_agent_id` / `agent_profiles.is_published`
+# 三处列承载，metadata 里再留一份就是两处真相。
+_LEGACY_OWNERSHIP_METADATA_KEYS = (
+    "scope",
+    "visibility",
+    "owner_agent_id",
+    "published_to_gallery",
+    "created_from_agent",
+    "created_from_upload",
+)
 
 JsonDict = dict[str, Any]
 ModelT = TypeVar("ModelT", bound=SQLModel)
@@ -92,10 +97,11 @@ def seed_staffdeck_admin_gallery(session: Session) -> None:
         row for row in data.get("agent_profiles", []) if row.get("name") in SELECTED_AGENT_NAMES
     ]
     selected_agent_ids = {str(row.get("id") or "") for row in agents}
+    # 引用行没有 status —— 行存在即为引用（取消引用就是删行）。
     active_bindings = [
         row
-        for row in data.get("agent_resource_bindings", [])
-        if row.get("status") == "active" and str(row.get("agent_id") or "") in selected_agent_ids
+        for row in data.get("agent_resource_references", [])
+        if str(row.get("agent_id") or "") in selected_agent_ids
     ]
     resource_ids = _resource_ids_by_type(active_bindings)
 
@@ -105,14 +111,7 @@ def seed_staffdeck_admin_gallery(session: Session) -> None:
     _seed_tools(session, data.get("tools", []), resource_ids, id_maps)
     _seed_knowledge(session, data, resource_ids, id_maps)
     session.flush()
-    _seed_agent_resource_bindings(session, active_bindings, id_maps)
-    _seed_skill_branches(
-        session,
-        data.get("agent_skill_branches", []),
-        data.get("agent_skill_branch_versions", []),
-        id_maps,
-    )
-    _seed_knowledge_branches(session, active_bindings, id_maps)
+    _seed_agent_resource_references(session, active_bindings, id_maps)
     session.flush()
     _publish_gallery_resources(session, id_maps)
     _sync_seed_agents_to_current_admin(session, id_maps)
@@ -130,15 +129,29 @@ def _load_seed_fixtures(paths: Iterable[Path]) -> JsonDict:
     return merged
 
 
+def _seed_admin_user_id(session: Session) -> str:
+    """种子资源归当前租户的管理员账号所有；管理员尚未落库时回落到常量 id。"""
+    admin = session.exec(
+        select(User).where(User.tenant_id == TENANT_ID, User.username == ADMIN_USERNAME)
+    ).first()
+    return admin.id if admin else ADMIN_USER_ID
+
+
 def _seed_agents(session: Session, rows: Iterable[JsonDict], id_maps: dict[str, dict[str, str]]) -> None:
+    admin_user_id = _seed_admin_user_id(session)
     for row in rows:
         source_id = str(row.get("id") or "")
         name = str(row.get("name") or "").strip()
         if not source_id or not name:
             continue
         existing_by_id = session.get(AgentProfile, source_id)
+        # 员工名只在同一归属内唯一：查找冲突必须带上归属，否则会把别人同名的员工当成自己人。
         existing_by_name = session.exec(
-            select(AgentProfile).where(AgentProfile.tenant_id == TENANT_ID, AgentProfile.name == name)
+            select(AgentProfile).where(
+                AgentProfile.tenant_id == TENANT_ID,
+                AgentProfile.owner_user_id == admin_user_id,
+                AgentProfile.name == name,
+            )
         ).first()
         existing = _seed_update_target(existing_by_id, existing_by_name, source_id)
         metadata = _agent_metadata(row.get("metadata_json"))
@@ -156,9 +169,11 @@ def _seed_agents(session: Session, rows: Iterable[JsonDict], id_maps: dict[str, 
             "name": name,
             "description": row.get("description"),
             "persona_prompt": row.get("persona_prompt"),
-            "is_overall": bool(row.get("is_overall", False)),
             "status": row.get("status") or "active",
             "metadata_json": metadata,
+            # 种子员工归管理员账号所有，且视为已发布到广场。
+            "owner_user_id": admin_user_id,
+            "is_published": True,
         }
         if existing:
             _apply_payload(existing, payload)
@@ -199,6 +214,7 @@ def _seed_skills(
         content.update({"skill_id": skill_id, "name": row.get("name"), "version": row.get("version") or "1.0.0"})
         payload = {
             "tenant_id": TENANT_ID,
+            "scope": GALLERY_SCOPE,
             "skill_id": skill_id,
             "version": row.get("version") or "1.0.0",
             "name": row.get("name") or skill_id,
@@ -282,6 +298,7 @@ def _seed_general_skills(
         existing = _seed_update_target(existing_by_id, existing_by_slug, source_id)
         payload = {
             "tenant_id": TENANT_ID,
+            "scope": GALLERY_SCOPE,
             "slug": slug,
             "name": row.get("name") or slug,
             "description": row.get("description"),
@@ -334,6 +351,7 @@ def _seed_tools(
             config = {**config, "execution": {"timeout_seconds": 20}}
         payload = {
             "tenant_id": TENANT_ID,
+            "scope": GALLERY_SCOPE,
             "name": name,
             "display_name": row.get("display_name"),
             "description": row.get("description"),
@@ -407,6 +425,7 @@ def _seed_knowledge(
         existing = _seed_update_target(existing_by_id, existing_by_name, source_id)
         payload = {
             "tenant_id": TENANT_ID,
+            "scope": GALLERY_SCOPE,
             "name": name,
             "description": row.get("description"),
             "status": row.get("status") or "active",
@@ -691,181 +710,38 @@ def _seed_knowledge_jobs(
             session.add(KnowledgeIngestJob(id=str(row.get("id") or ""), **payload))
 
 
-def _seed_agent_resource_bindings(
+def _seed_agent_resource_references(
     session: Session, rows: Iterable[JsonDict], id_maps: dict[str, dict[str, str]]
 ) -> None:
+    """种子引用行：引用 = 行存在，没有 status/metadata 可改。"""
     for row in rows:
         agent_id = id_maps["agent"].get(str(row.get("agent_id") or ""))
         resource_type = str(row.get("resource_type") or "")
         resource_id = _mapped_resource_id(resource_type, str(row.get("resource_id") or ""), id_maps)
         if not agent_id or not resource_id:
             continue
-        metadata = agent_private_metadata(agent_id, _seed_metadata(row.get("metadata_json")))
         existing = session.exec(
-            select(AgentResourceBinding).where(
-                AgentResourceBinding.tenant_id == TENANT_ID,
-                AgentResourceBinding.agent_id == agent_id,
-                AgentResourceBinding.resource_type == resource_type,
-                AgentResourceBinding.resource_id == resource_id,
+            select(AgentResourceReference).where(
+                AgentResourceReference.tenant_id == TENANT_ID,
+                AgentResourceReference.agent_id == agent_id,
+                AgentResourceReference.resource_type == resource_type,
+                AgentResourceReference.resource_id == resource_id,
             )
         ).first()
-        payload = {
-            "tenant_id": TENANT_ID,
-            "agent_id": agent_id,
-            "resource_type": resource_type,
-            "resource_id": resource_id,
-            "status": "active",
-            "metadata_json": metadata,
-        }
         if existing:
-            _apply_payload(existing, payload)
             existing.updated_at = utc_now()
             session.add(existing)
         else:
-            session.add(AgentResourceBinding(id=str(row.get("id") or ""), **payload))
-
-
-def _seed_skill_branches(
-    session: Session,
-    branch_rows: Iterable[JsonDict],
-    version_rows: Iterable[JsonDict],
-    id_maps: dict[str, dict[str, str]],
-) -> None:
-    branch_keys: set[tuple[str, str]] = set()
-    for row in branch_rows:
-        agent_id = id_maps["agent"].get(str(row.get("agent_id") or ""))
-        skill_id = str(row.get("skill_id") or "")
-        if not agent_id or skill_id not in id_maps["skill_business"]:
-            continue
-        branch_keys.add((agent_id, skill_id))
-        existing = session.get(AgentSkillBranch, str(row.get("id") or "")) or session.exec(
-            select(AgentSkillBranch).where(
-                AgentSkillBranch.tenant_id == TENANT_ID,
-                AgentSkillBranch.agent_id == agent_id,
-                AgentSkillBranch.skill_id == skill_id,
+            session.add(
+                AgentResourceReference(
+                    id=str(row.get("id") or ""),
+                    tenant_id=TENANT_ID,
+                    agent_id=agent_id,
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    created_by_user_id=ADMIN_USER_ID,
+                )
             )
-        ).first()
-        payload = {
-            "tenant_id": TENANT_ID,
-            "agent_id": agent_id,
-            "skill_id": skill_id,
-            "source_skill_id": row.get("source_skill_id") or skill_id,
-            "base_version": row.get("base_version") or "1.0.0",
-            "head_version": row.get("head_version") or row.get("base_version") or "1.0.0",
-            "content_json": _json_object(row.get("content_json")),
-            "status": row.get("status") or "active",
-            "sync_state": row.get("sync_state") or "synced",
-            "metadata_json": agent_private_metadata(agent_id, _seed_metadata(row.get("metadata_json"))),
-        }
-        if existing:
-            _apply_payload(existing, payload)
-            existing.updated_at = utc_now()
-            session.add(existing)
-        else:
-            session.add(AgentSkillBranch(id=str(row.get("id") or ""), **payload))
-    session.flush()
-
-    for row in version_rows:
-        agent_id = id_maps["agent"].get(str(row.get("agent_id") or ""))
-        skill_id = str(row.get("skill_id") or "")
-        version = str(row.get("version") or "1.0.0")
-        if not agent_id or (agent_id, skill_id) not in branch_keys:
-            continue
-        existing = session.get(AgentSkillBranchVersion, str(row.get("id") or "")) or session.exec(
-            select(AgentSkillBranchVersion).where(
-                AgentSkillBranchVersion.tenant_id == TENANT_ID,
-                AgentSkillBranchVersion.agent_id == agent_id,
-                AgentSkillBranchVersion.skill_id == skill_id,
-                AgentSkillBranchVersion.version == version,
-            )
-        ).first()
-        payload = {
-            "tenant_id": TENANT_ID,
-            "agent_id": agent_id,
-            "skill_id": skill_id,
-            "source_skill_id": row.get("source_skill_id") or skill_id,
-            "version": version,
-            "base_version": row.get("base_version") or "1.0.0",
-            "content_json": _json_object(row.get("content_json")),
-            "status": row.get("status") or "active",
-            "sync_state": row.get("sync_state") or "synced",
-            "change_summary": row.get("change_summary"),
-        }
-        if existing:
-            _apply_payload(existing, payload)
-            existing.updated_at = utc_now()
-            session.add(existing)
-        else:
-            session.add(AgentSkillBranchVersion(id=str(row.get("id") or ""), **payload))
-
-
-def _seed_knowledge_branches(
-    session: Session, binding_rows: Iterable[JsonDict], id_maps: dict[str, dict[str, str]]
-) -> None:
-    for row in binding_rows:
-        if row.get("resource_type") != "knowledge_base":
-            continue
-        agent_id = id_maps["agent"].get(str(row.get("agent_id") or ""))
-        kb_id = id_maps["knowledge_base"].get(str(row.get("resource_id") or ""))
-        if not agent_id or not kb_id:
-            continue
-        kb = session.get(KnowledgeBase, kb_id)
-        current_version = _knowledge_version_with_seed_content(session, kb_id, agent_id)
-        if kb:
-            kb_metadata = dict(kb.metadata_json or {})
-            kb_metadata["current_version"] = current_version
-            kb.metadata_json = kb_metadata
-            kb.updated_at = utc_now()
-            session.add(kb)
-        existing = session.exec(
-            select(AgentKnowledgeBranch).where(
-                AgentKnowledgeBranch.tenant_id == TENANT_ID,
-                AgentKnowledgeBranch.agent_id == agent_id,
-                AgentKnowledgeBranch.knowledge_base_id == kb_id,
-            )
-        ).first()
-        payload = {
-            "tenant_id": TENANT_ID,
-            "agent_id": agent_id,
-            "knowledge_base_id": kb_id,
-            "base_version": current_version,
-            "head_version": current_version,
-            "status": "active",
-            "sync_state": "synced",
-            "metadata_json": agent_private_metadata(agent_id, _seed_metadata(row.get("metadata_json"))),
-        }
-        if existing:
-            _apply_payload(existing, payload)
-            existing.updated_at = utc_now()
-            session.add(existing)
-        else:
-            session.add(AgentKnowledgeBranch(**payload))
-
-
-def _knowledge_version_with_seed_content(session: Session, kb_id: str, agent_id: str) -> str:
-    documents = session.exec(
-        select(KnowledgeDocument).where(
-            KnowledgeDocument.tenant_id == TENANT_ID,
-            KnowledgeDocument.knowledge_base_id == kb_id,
-            KnowledgeDocument.knowledge_base_version_id != None,  # noqa: E711
-        )
-    ).all()
-    fallback_version: str | None = None
-    for document in documents:
-        version = session.get(KnowledgeBaseVersion, document.knowledge_base_version_id)
-        if not version:
-            continue
-        fallback_version = fallback_version or version.version
-        if (version.metadata_json or {}).get("owner_agent_id") == agent_id:
-            return version.version
-        if f"branch.{agent_id}." in version.version:
-            return version.version
-    if fallback_version:
-        return fallback_version
-    kb = session.get(KnowledgeBase, kb_id)
-    if kb:
-        return str((kb.metadata_json or {}).get("current_version") or "1.0.0")
-    return "1.0.0"
 
 
 def _publish_gallery_resources(session: Session, id_maps: dict[str, dict[str, str]]) -> None:
@@ -884,6 +760,10 @@ def _publish_gallery_resources(session: Session, id_maps: dict[str, dict[str, st
                 resource.metadata_json = _open_gallery_seed_metadata(getattr(resource, "metadata_json", None))
                 resource.updated_at = utc_now()
                 session.add(resource)
+            if hasattr(resource, "scope"):
+                resource.scope = GALLERY_SCOPE
+            if hasattr(resource, "owner_agent_id"):
+                resource.owner_agent_id = None
             ensure_open_gallery_binding(
                 session,
                 TENANT_ID,
@@ -918,11 +798,13 @@ def _sync_seed_agents_to_current_admin(
             continue
         metadata = dict(agent.metadata_json or {})
         metadata.update(admin_metadata)
-        metadata["published_to_gallery"] = True
-        metadata["gallery_published_by"] = admin.username
         metadata["seed_source"] = SEED_SOURCE
         metadata["managed_by_seed"] = True
         agent.metadata_json = metadata
+        # 归属与发布状态提升为列。
+        agent.owner_user_id = admin.id
+        agent.is_published = True
+        agent.published_by = admin.username
         agent.updated_at = utc_now()
         session.add(agent)
 
@@ -952,24 +834,20 @@ def _mapped_resource_id(
 
 
 def _agent_metadata(value: Any) -> JsonDict:
+    """员工 metadata 只留署名与种子标记：发布状态由 `is_published` 列表达。"""
     metadata = _seed_metadata(value)
     metadata.update(
         {
-            "published_to_gallery": True,
-            "gallery_published_by": ADMIN_USERNAME,
             "seed_source": SEED_SOURCE,
             "managed_by_seed": True,
         }
     )
-    metadata.pop("scope", None)
-    metadata.pop("visibility", None)
-    metadata.pop("owner_agent_id", None)
-    metadata.pop("created_from_agent", None)
     return metadata
 
 
 def _open_gallery_seed_metadata(value: Any) -> JsonDict:
-    metadata = open_gallery_metadata(_seed_metadata(value))
+    """广场资源的 metadata 不再写 scope/visibility —— 那是 `scope` 列的事。"""
+    metadata = _seed_metadata(value)
     metadata["seed_source"] = SEED_SOURCE
     metadata["managed_by_seed"] = True
     return metadata
@@ -977,6 +855,10 @@ def _open_gallery_seed_metadata(value: Any) -> JsonDict:
 
 def _seed_metadata(value: Any) -> JsonDict:
     metadata = _json_object(value)
+    # 老 fixture 里带着「归属化改造前」的状态键；新结构下它们由列承载，
+    # 留在 metadata 会形成两处真相，所以在唯一的入口处统一剔除。
+    for key in _LEGACY_OWNERSHIP_METADATA_KEYS:
+        metadata.pop(key, None)
     metadata.update(
         {
             "owner_user_id": ADMIN_USER_ID,

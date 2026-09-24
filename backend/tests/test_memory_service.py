@@ -356,15 +356,15 @@ def test_list_memories_for_gallery_agent_only_returns_current_user_for_non_creat
         db.add(owner)
         db.add(viewer)
         db.add(
-            AgentProfile(
+            AgentProfile(owner_user_id=owner.id,
                 id="agent_gallery",
                 tenant_id="tenant_demo",
                 name="广场员工",
                 status="active",
+                is_published=True,
                 metadata_json={
                     "owner_user_id": owner.id,
                     "owner_username": owner.username,
-                    "published_to_gallery": True,
                 },
             )
         )
@@ -412,7 +412,7 @@ def test_list_memories_non_creator_cannot_filter_into_other_user_memories() -> N
         db.add(owner)
         db.add(viewer)
         db.add(
-            AgentProfile(
+            AgentProfile(owner_user_id=owner.id,
                 id="agent_gallery",
                 tenant_id="tenant_demo",
                 name="广场员工",
@@ -452,7 +452,7 @@ def test_list_memories_agent_creator_can_view_all_users_for_owned_agent() -> Non
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.add(owner)
         db.add(
-            AgentProfile(
+            AgentProfile(owner_user_id=owner.id,
                 id="agent_owned",
                 tenant_id="tenant_demo",
                 name="创建者员工",

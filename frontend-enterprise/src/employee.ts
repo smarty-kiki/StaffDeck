@@ -1,4 +1,8 @@
-import type { AgentProfileRead, AgentResourceBindingRead, AgentResourceType } from './types';
+import type {
+  AgentProfileRead,
+  AgentResourceReferenceRead,
+  AgentResourceType,
+} from './types';
 import {
   isEmployeeOwnedBy,
   isEnterpriseAdmin,
@@ -13,7 +17,6 @@ import avatarDefault from './assets/staffdeck/staffdeck-avatar-default.png';
 import avatarKnowledge from './assets/staffdeck/staffdeck-avatar-knowledge.png';
 import avatarMarketing from './assets/staffdeck/staffdeck-avatar-marketing.png';
 import avatarOps from './assets/staffdeck/staffdeck-avatar-ops.png';
-import avatarOverall from './assets/staffdeck/staffdeck-avatar-overall.png';
 import avatarProcurement from './assets/staffdeck/staffdeck-avatar-procurement.png';
 import avatarProject from './assets/staffdeck/staffdeck-avatar-project.png';
 import avatarQuality from './assets/staffdeck/staffdeck-avatar-quality.png';
@@ -56,7 +59,6 @@ export type EmployeeTemplate = {
 type EmployeeAgentLike = {
   id?: string;
   name?: string;
-  is_overall?: boolean;
   metadata?: Record<string, unknown>;
 };
 
@@ -88,7 +90,6 @@ const PRESET_AVATAR_IMAGES: Record<string, string> = {
   'procurement-check': avatarProcurement,
   'project-board': avatarProject,
   'data-insight': avatarData,
-  overall: avatarOverall,
 };
 
 type AvatarSource = Pick<EmployeeProfile, 'avatarKind' | 'avatarImage' | 'avatarPreset'>;
@@ -210,20 +211,19 @@ export function staffdeckDisplayText(value: string): string {
 }
 
 export function isDefaultEmployeeAgent(agent?: EmployeeAgentLike | null): boolean {
-  if (!agent || agent.is_overall) return false;
+  if (!agent) return false;
   const metadata = agent.metadata || {};
   return metadata.is_default_employee === true;
 }
 
 export function preferredEmployeeAgent<T extends EmployeeAgentLike>(agents: T[]): T | undefined {
-  return agents.find(isDefaultEmployeeAgent) || agents.find((item) => !item.is_overall);
+  return agents.find(isDefaultEmployeeAgent) || agents[0];
 }
 
 export type EmployeeVisibilityOptions = {
   activeOnly?: boolean;
   excludeAgentId?: string;
   includeDefault?: boolean;
-  includeOverall?: boolean;
 };
 
 export function canAccessEmployeeAgent(
@@ -233,10 +233,7 @@ export function canAccessEmployeeAgent(
 ): boolean {
   if (options.excludeAgentId && agent.id === options.excludeAgentId) return false;
   if (options.activeOnly && agent.status !== 'active') return false;
-
-  const includeOverall = options.includeOverall ?? false;
-  if (isEnterpriseAdmin(user)) return includeOverall || !agent.is_overall;
-  if (agent.is_overall) return false;
+  if (isEnterpriseAdmin(user)) return true;
 
   const includeDefault = options.includeDefault ?? false;
   return (
@@ -259,15 +256,12 @@ export function canSelectCurrentEmployeeAgent(
   if (options.excludeAgentId && agent.id === options.excludeAgentId) return false;
   if (options.activeOnly && agent.status !== 'active') return false;
 
-  const includeOverall = options.includeOverall ?? false;
   if (isEnterpriseAdmin(user)) {
-    if (agent.is_overall) return includeOverall;
     if (isGalleryEmployee(agent) && !isEmployeeOwnedBy(agent, user)) {
       return isEmployeeUsedByCurrentUser(agent);
     }
     return true;
   }
-  if (agent.is_overall) return false;
 
   const includeDefault = options.includeDefault ?? false;
   return (
@@ -281,15 +275,35 @@ export function canManageEmployeeAgent(
   agent: AgentProfileRead,
   user?: EnterpriseAuthUser | null,
 ): boolean {
-  if (agent.is_overall) return isEnterpriseAdmin(user);
-  return isEnterpriseAdmin(user) || isEmployeeOwnedBy(agent, user);
+  // 数字员工的写权限**只看归属人** —— 管理员也不能改别人的员工。
+  // 管理员额外拥有的「从广场下架」由 canUnpublishAgent 单独表达。
+  return isEmployeeOwnedBy(agent, user);
+}
+
+/**
+ * 下架 = 把已发布的员工从广场撤下。这是管理员相对归属人的唯一额外权限：
+ * 归属人可以下架自己的员工，管理员可以下架任何人的。
+ */
+export function canUnpublishAgent(
+  agent: AgentProfileRead,
+  user?: EnterpriseAuthUser | null,
+): boolean {
+  if (!isGalleryEmployee(agent)) return false;
+  return isEmployeeOwnedBy(agent, user) || isEnterpriseAdmin(user);
+}
+
+export function canPublishAgentToGallery(
+  agent: AgentProfileRead,
+  user?: EnterpriseAuthUser | null,
+): boolean {
+  return isEmployeeOwnedBy(agent, user);
 }
 
 export function isMyEmployeeAgent(
   agent: AgentProfileRead,
   user?: EnterpriseAuthUser | null,
 ): boolean {
-  return !agent.is_overall && isEmployeeOwnedBy(agent, user);
+  return isEmployeeOwnedBy(agent, user);
 }
 
 export function visibleEmployeeAgents(
@@ -306,22 +320,6 @@ export function currentEmployeeAgents(
   options: EmployeeVisibilityOptions = {},
 ): AgentProfileRead[] {
   return rows.filter((agent) => canSelectCurrentEmployeeAgent(agent, user, options));
-}
-
-export function openGalleryAgent(rows: AgentProfileRead[]): AgentProfileRead | undefined {
-  return rows.find((agent) => agent.is_overall);
-}
-
-export function openGalleryAgentId(rows: AgentProfileRead[]): string {
-  return openGalleryAgent(rows)?.id || '';
-}
-
-export function openGalleryImportSourceOptions(
-  rows: AgentProfileRead[],
-  label: string,
-): Array<{ value: string; label: string }> {
-  const agentId = openGalleryAgentId(rows);
-  return agentId ? [{ value: agentId, label }] : [];
 }
 
 function asStringArray(value: unknown): string[] {
@@ -345,6 +343,7 @@ export function creatorNameFromMetadata(
   fallback = '',
 ): string {
   const meta = metadata || {};
+  // 发布状态已进列（`is_published` / `published_by`），metadata 里不再有发布者字段。
   const creator = firstString(
     meta.creator_name,
     meta.created_by,
@@ -352,7 +351,6 @@ export function creatorNameFromMetadata(
     meta.created_by_username,
     meta.owner_display_name,
     meta.owner_username,
-    meta.gallery_published_by,
     meta.created_by_user_id,
     meta.owner_user_id,
   );
@@ -374,18 +372,17 @@ export function employeeProfile(agent?: AgentProfileRead | null): EmployeeProfil
   const preset = EMPLOYEE_AVATAR_PRESETS.find((item) => item.key === metadata.avatar_preset)
     || (template ? EMPLOYEE_AVATAR_PRESETS.find((item) => item.key === template.avatarPreset) : undefined)
     || EMPLOYEE_AVATAR_PRESETS[0];
-  const isOverall = Boolean(agent?.is_overall);
   const avatarKind = stringFromMeta(metadata, 'avatar_kind') === 'upload' && stringFromMeta(metadata, 'avatar_image')
     ? 'upload'
     : 'preset';
   return {
     roleKey: stringFromMeta(metadata, 'role_key') || template?.key || '',
-    roleName: isOverall ? '开放广场' : stringFromMeta(metadata, 'role_name') || template?.roleName || '待补充岗位',
-    avatarText: isOverall ? '广' : stringFromMeta(metadata, 'avatar_text') || preset.text || template?.avatarText || '员',
-    avatarTone: isOverall ? 'overall' : stringFromMeta(metadata, 'avatar_tone') || preset.tone || template?.avatarTone || 'teal',
-    avatarKind: isOverall ? 'preset' : avatarKind,
-    avatarPreset: isOverall ? 'overall' : stringFromMeta(metadata, 'avatar_preset') || preset.key,
-    avatarImage: isOverall ? '' : stringFromMeta(metadata, 'avatar_image'),
+    roleName: stringFromMeta(metadata, 'role_name') || template?.roleName || '待补充岗位',
+    avatarText: stringFromMeta(metadata, 'avatar_text') || preset.text || template?.avatarText || '员',
+    avatarTone: stringFromMeta(metadata, 'avatar_tone') || preset.tone || template?.avatarTone || 'teal',
+    avatarKind,
+    avatarPreset: stringFromMeta(metadata, 'avatar_preset') || preset.key,
+    avatarImage: stringFromMeta(metadata, 'avatar_image'),
     onboardedAt: stringFromMeta(metadata, 'onboarded_at') || agent?.created_at?.slice(0, 10) || '-',
     workStyles: asStringArray(metadata.work_styles),
     expertiseTags: asStringArray(metadata.expertise_tags),
@@ -394,13 +391,16 @@ export function employeeProfile(agent?: AgentProfileRead | null): EmployeeProfil
 }
 
 export function employeeDisplayName(agent?: AgentProfileRead | null): string {
-  if (!agent) return '数字员工';
-  if (agent.is_overall) return '开放广场';
-  return agent.name || '数字员工';
+  return agent?.name || '数字员工';
 }
 
 export function employeeCreatorName(agent?: AgentProfileRead | null): string {
-  return creatorNameFromMetadata(agent?.metadata);
+  // 归属人展示名已进列（`owner_display_name`），metadata 只作过渡期兜底 ——
+  // 广场同名员工靠它做 `@创建人` 消歧，读列才拿得到别人的名字。
+  const columnName = typeof agent?.owner_display_name === 'string'
+    ? agent.owner_display_name.trim()
+    : '';
+  return columnName || creatorNameFromMetadata(agent?.metadata);
 }
 
 export function employeeDisplayNameWithCreator(agent?: AgentProfileRead | null): string {
@@ -418,12 +418,12 @@ export function resourceDisplayNameWithCreator(
   return displayNameWithCreator(name, resourceCreatorName(resource));
 }
 
-export function resourceCount(resources: AgentResourceBindingRead[] | undefined, type: AgentResourceBindingRead['resource_type']): number {
-  return (resources || []).filter((item) => (
-    item.resource_type === type
-    && item.status !== 'deleted'
-    && item.status !== 'inactive'
-  )).length;
+export function resourceCount(
+  resources: AgentResourceReferenceRead[] | undefined,
+  type: AgentResourceType,
+): number {
+  // 引用行没有状态：出现在列表里就算数（取消引用会直接删行）。
+  return (resources || []).filter((item) => item.resource_type === type).length;
 }
 
 /** Employees selectable in the chat sidebar: active employees visible to the current user. */
@@ -435,15 +435,14 @@ export function visibleChatEmployees(
 }
 
 export function agentResourceCount(agent: AgentProfileRead, resourceType: AgentResourceType): number {
-  return (agent.resources || []).filter((resource) => (
-    resource.resource_type === resourceType
-    && resource.status !== 'deleted'
-    && resource.status !== 'inactive'
-  )).length;
+  return resourceCount(agent.resources, resourceType);
 }
 
-export function activeResourceCount(resources: AgentResourceBindingRead[] | undefined): number {
-  return (resources || []).filter((item) => item.status === 'active').length;
+/** 引用的资源条数（引用行没有状态，有行即生效）。 */
+export function referencedResourceCount(
+  resources: AgentResourceReferenceRead[] | undefined,
+): number {
+  return (resources || []).length;
 }
 
 export function employeeMetadataFromTemplate(templateKey: string, currentMetadata: Record<string, unknown> = {}): Record<string, unknown> {

@@ -19,7 +19,8 @@ from app.api.knowledge import (
 )
 from app.api.knowledge_bases import knowledge_base_read
 from app.db.models import (
-    AgentProfile,
+    AGENT_SCOPE,
+    GALLERY_SCOPE,
     KnowledgeBase,
     KnowledgeBaseVersion,
     KnowledgeBucket,
@@ -110,7 +111,7 @@ def test_skill_card_rejects_legacy_steps_and_accepts_graph() -> None:
 def test_knowledge_ingest_creates_document_buckets_and_chunks_without_auto_discovery() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        db.add(KnowledgeBase(scope=GALLERY_SCOPE, owner_agent_id=None, id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
         db.commit()
         service = KnowledgeService(db)
         job = service.create_ingest_job(
@@ -323,7 +324,7 @@ def test_long_section_continuations_share_one_related_section() -> None:
 def test_knowledge_ingest_cancel_queued_job_clears_embedded_content() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        db.add(KnowledgeBase(scope=GALLERY_SCOPE, owner_agent_id=None, id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
         db.commit()
         service = KnowledgeService(db)
         job = service.create_ingest_job(
@@ -348,7 +349,7 @@ def test_knowledge_ingest_cancel_queued_job_clears_embedded_content() -> None:
 def test_knowledge_ingest_cancel_running_job_cleans_partial_artifacts() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        db.add(KnowledgeBase(scope=GALLERY_SCOPE, owner_agent_id=None, id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
         document = KnowledgeDocument(
             id="kdoc_partial",
             tenant_id="tenant_demo",
@@ -443,7 +444,7 @@ def test_knowledge_ingest_cancel_running_job_cleans_partial_artifacts() -> None:
 def test_knowledge_ingest_stale_cancel_request_finalizes_without_worker() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        db.add(KnowledgeBase(scope=GALLERY_SCOPE, owner_agent_id=None, id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
         document = KnowledgeDocument(
             id="kdoc_stale_cancel",
             tenant_id="tenant_demo",
@@ -484,7 +485,7 @@ def test_knowledge_ingest_stale_cancel_request_finalizes_without_worker() -> Non
 def test_knowledge_search_without_model_uses_relevance_rank_order() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        db.add(KnowledgeBase(scope=GALLERY_SCOPE, owner_agent_id=None, id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
         document = KnowledgeDocument(
             id="kdoc_frontend",
             tenant_id="tenant_demo",
@@ -566,7 +567,7 @@ def test_knowledge_search_without_model_uses_relevance_rank_order() -> None:
 def test_model_driven_document_route_does_not_fall_back_to_lexical_matching(monkeypatch) -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        db.add(KnowledgeBase(scope=GALLERY_SCOPE, owner_agent_id=None, id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
         db.add(
             KnowledgeDocument(
                 id="kdoc_frontend",
@@ -600,7 +601,7 @@ def test_model_driven_document_route_does_not_fall_back_to_lexical_matching(monk
 def test_model_route_failure_falls_back_to_lexical_matching(monkeypatch) -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        db.add(KnowledgeBase(scope=GALLERY_SCOPE, owner_agent_id=None, id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
         document = KnowledgeDocument(
             id="kdoc_leave",
             tenant_id="tenant_demo",
@@ -658,7 +659,7 @@ def test_model_route_failure_falls_back_to_lexical_matching(monkeypatch) -> None
 def test_document_loading_does_not_hide_relevant_rows_after_first_40() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        db.add(KnowledgeBase(scope=GALLERY_SCOPE, owner_agent_id=None, id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
         relevant = KnowledgeDocument(
             id="kdoc_relevant_old",
             tenant_id="tenant_demo",
@@ -736,7 +737,7 @@ def test_knowledge_search_records_persistent_substep_spans() -> None:
     events: list[tuple[str, dict]] = []
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        db.add(KnowledgeBase(scope=GALLERY_SCOPE, owner_agent_id=None, id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
         document = KnowledgeDocument(
             id="kdoc_frontend",
             tenant_id="tenant_demo",
@@ -812,7 +813,7 @@ def test_knowledge_search_records_persistent_substep_spans() -> None:
 def test_legacy_knowledge_without_new_metadata_remains_searchable() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        db.add(KnowledgeBase(scope=GALLERY_SCOPE, owner_agent_id=None, id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
         document = KnowledgeDocument(
             id="kdoc_legacy",
             tenant_id="tenant_demo",
@@ -885,8 +886,7 @@ def test_knowledge_search_api_uses_selected_model_config(monkeypatch) -> None:
 
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(AgentProfile(id="agent_overall", tenant_id="tenant_demo", name="开放广场", is_overall=True))
-        db.add(KnowledgeBase(id="kb_search", tenant_id="tenant_demo", name="检索知识库"))
+        db.add(KnowledgeBase(scope=GALLERY_SCOPE, owner_agent_id=None, id="kb_search", tenant_id="tenant_demo", name="检索知识库"))
         db.add(
             ModelConfig(
                 id="model_default",
@@ -925,7 +925,7 @@ def test_knowledge_search_api_uses_selected_model_config(monkeypatch) -> None:
 
 
 def test_knowledge_base_read_keeps_archived_rows_visible_despite_active_versions() -> None:
-    row = KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库", status="archived")
+    row = KnowledgeBase(scope=GALLERY_SCOPE, owner_agent_id=None, id="kb_demo", tenant_id="tenant_demo", name="默认知识库", status="archived")
     version = KnowledgeBaseVersion(
         tenant_id="tenant_demo",
         knowledge_base_id=row.id,
@@ -934,24 +934,17 @@ def test_knowledge_base_read_keeps_archived_rows_visible_despite_active_versions
         status="active",
     )
 
-    overall_read = knowledge_base_read(row, {}, version_row=version)
-    branch_read = knowledge_base_read(
-        row,
-        {},
-        version_row=version,
-        branch_meta={"status": "inactive", "base_version": "1.0.0", "head_version": "1.0.0", "sync_state": "synced"},
-    )
+    read = knowledge_base_read(row, {}, version_row=version)
 
-    assert overall_read.status == "archived"
-    assert branch_read.status == "archived"
+    # 知识库只有一个版本，归档状态跟随知识库本身 —— 不再有"分支状态"覆盖层。
+    assert read.status == "archived"
 
 
 def test_list_documents_without_agent_scope_returns_only_open_gallery_documents() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(AgentProfile(id="agent_overall", tenant_id="tenant_demo", name="开放广场", is_overall=True))
-        db.add(KnowledgeBase(id="kb_open", tenant_id="tenant_demo", name="开放知识库"))
-        db.add(KnowledgeBase(id="kb_private", tenant_id="tenant_demo", name="私有知识库"))
+        db.add(KnowledgeBase(scope=GALLERY_SCOPE, owner_agent_id=None, id="kb_open", tenant_id="tenant_demo", name="开放知识库"))
+        db.add(KnowledgeBase(id="kb_private", tenant_id="tenant_demo", name="私有知识库", scope=AGENT_SCOPE, owner_agent_id="agent_private_kb"))
         db.add(
             KnowledgeBaseVersion(
                 id="kbv_open",
@@ -1006,7 +999,7 @@ def test_list_documents_without_agent_scope_returns_only_open_gallery_documents(
 def test_update_document_syncs_document_card_and_okf_source_concept() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        db.add(KnowledgeBase(scope=GALLERY_SCOPE, owner_agent_id=None, id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
         db.add(
             KnowledgeBaseVersion(
                 id="kbv_demo",
@@ -1072,6 +1065,7 @@ def test_update_document_syncs_document_card_and_okf_source_concept() -> None:
             document.id,
             KnowledgeDocumentUpdateRequest(tenant_id="tenant_demo", title="新标题"),
             db,
+            current_user=_admin_user(),
         )
 
         assert updated.title == "新标题"
@@ -1091,7 +1085,7 @@ def test_update_document_syncs_document_card_and_okf_source_concept() -> None:
 def test_update_document_content_rebuilds_all_derived_knowledge() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        db.add(KnowledgeBase(scope=GALLERY_SCOPE, owner_agent_id=None, id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
         db.add(
             KnowledgeBaseVersion(
                 id="kbv_demo",
@@ -1163,6 +1157,7 @@ def test_update_document_content_rebuilds_all_derived_knowledge() -> None:
                 expected_updated_at=document.updated_at.isoformat(),
             ),
             db,
+            current_user=_admin_user(),
         )
 
         assert updated.title == "新版制度"
@@ -1187,7 +1182,7 @@ def test_update_document_content_rebuilds_all_derived_knowledge() -> None:
 def test_update_document_content_rejects_stale_editor_revision() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        db.add(KnowledgeBase(scope=GALLERY_SCOPE, owner_agent_id=None, id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
         document = KnowledgeDocument(
             id="kdoc_demo",
             tenant_id="tenant_demo",
@@ -1217,7 +1212,7 @@ def test_update_document_content_rejects_stale_editor_revision() -> None:
 def test_update_chunk_refreshes_bucket_content_and_okf_topic() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        db.add(KnowledgeBase(scope=GALLERY_SCOPE, owner_agent_id=None, id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
         db.add(
             KnowledgeBaseVersion(
                 id="kbv_demo",
@@ -1273,6 +1268,7 @@ def test_update_chunk_refreshes_bucket_content_and_okf_topic() -> None:
             chunk.id,
             KnowledgeChunkUpdateRequest(tenant_id="tenant_demo", content="新退款规则内容", summary="新摘要"),
             db,
+            current_user=_admin_user(),
         )
 
         refreshed_bucket = db.get(KnowledgeBucket, bucket.id)
@@ -1291,7 +1287,7 @@ def test_update_chunk_refreshes_bucket_content_and_okf_topic() -> None:
 def test_confirm_discovery_is_required_before_tool_or_skill_enters_runtime() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        db.add(KnowledgeBase(scope=GALLERY_SCOPE, owner_agent_id=None, id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
         suggestion = KnowledgeDiscoverySuggestion(
             tenant_id="tenant_demo",
             knowledge_base_id="kb_demo",
@@ -1320,7 +1316,7 @@ def test_confirm_discovery_is_required_before_tool_or_skill_enters_runtime() -> 
 def test_confirm_discovery_rejects_tool_without_url() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        db.add(KnowledgeBase(scope=GALLERY_SCOPE, owner_agent_id=None, id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
         suggestion = KnowledgeDiscoverySuggestion(
             tenant_id="tenant_demo",
             knowledge_base_id="kb_demo",
@@ -1343,7 +1339,7 @@ def test_confirm_discovery_rejects_tool_without_url() -> None:
 def test_confirm_discovery_api_returns_422_for_invalid_skill() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        db.add(KnowledgeBase(scope=GALLERY_SCOPE, owner_agent_id=None, id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
         user = User(
             id="user_admin",
             tenant_id="tenant_demo",
@@ -1373,7 +1369,7 @@ def test_confirm_discovery_api_returns_422_for_invalid_skill() -> None:
 def test_confirm_discovery_api_returns_409_for_non_pending_status() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        db.add(KnowledgeBase(scope=GALLERY_SCOPE, owner_agent_id=None, id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
         user = User(
             id="user_admin",
             tenant_id="tenant_demo",
@@ -1403,7 +1399,7 @@ def test_confirm_discovery_api_returns_409_for_non_pending_status() -> None:
 def test_confirm_discovery_rejects_noncanonical_skill_graph() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        db.add(KnowledgeBase(scope=GALLERY_SCOPE, owner_agent_id=None, id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
         suggestion = KnowledgeDiscoverySuggestion(
             tenant_id="tenant_demo",
             knowledge_base_id="kb_demo",
@@ -1458,8 +1454,8 @@ def test_confirm_discovery_does_not_overwrite_existing_skill() -> None:
     )
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
-        existing = Skill(
+        db.add(KnowledgeBase(scope=GALLERY_SCOPE, owner_agent_id=None, id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        existing = Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
             tenant_id="tenant_demo",
             skill_id=card.skill_id,
             name="生产技能",
@@ -1494,7 +1490,7 @@ def test_confirm_discovery_does_not_overwrite_existing_skill() -> None:
 def test_confirm_discovery_only_allows_pending_status(status: str) -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        db.add(KnowledgeBase(scope=GALLERY_SCOPE, owner_agent_id=None, id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
         suggestion = KnowledgeDiscoverySuggestion(
             tenant_id="tenant_demo",
             knowledge_base_id="kb_demo",
@@ -1516,7 +1512,7 @@ def test_confirm_discovery_only_allows_pending_status(status: str) -> None:
 def test_confirm_discovery_rolls_back_resource_when_status_commit_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        db.add(KnowledgeBase(scope=GALLERY_SCOPE, owner_agent_id=None, id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
         suggestion = KnowledgeDiscoverySuggestion(
             tenant_id="tenant_demo",
             knowledge_base_id="kb_demo",
@@ -1650,7 +1646,7 @@ def test_discovery_only_marks_valid_skill_as_pending(monkeypatch: pytest.MonkeyP
 
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        db.add(KnowledgeBase(scope=GALLERY_SCOPE, owner_agent_id=None, id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
         db.add(
             ModelConfig(
                 id="model_demo",
@@ -1707,6 +1703,16 @@ def test_discovery_only_marks_valid_skill_as_pending(monkeypatch: pytest.MonkeyP
 
 def _b64(text: str) -> str:
     return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+
+def _admin_user() -> User:
+    return User(
+        id="user_admin",
+        tenant_id="tenant_demo",
+        username="admin",
+        role="admin",
+        password_hash="x",
+    )
 
 
 def _test_session():

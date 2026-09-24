@@ -56,11 +56,10 @@ def _seed_users(engine) -> dict[str, User]:
         owner = User(id="user_owner", tenant_id="tenant_demo", username="owner", password_hash="x")
         other = User(id="user_other", tenant_id="tenant_demo", username="other", password_hash="x")
         admin = User(id="user_admin", tenant_id="tenant_demo", username="admin", role="admin", password_hash="x")
-        agent = AgentProfile(
+        agent = AgentProfile(owner_user_id=owner.id,
             id="agent_1",
             tenant_id="tenant_demo",
             name="客服员工",
-            is_overall=False,
             metadata_json={"owner_user_id": owner.id, "owner_username": owner.username},
         )
         db.add_all([owner, other, admin, agent])
@@ -261,12 +260,14 @@ def test_non_creator_cannot_create_binding() -> None:
     assert created.json()["status"] == "pending"
     assert created.json()["channel"] == "wechat"
 
+    # 管理员也不持有他人的数字员工：给别人的员工建渠道绑定同样 403。
+    # （管理员仅额外拥有「从广场下架」这一项权限，不在 `ensure_agent_scope_manager` 里放行。）
     by_admin = client.post(
         "/api/enterprise/channels",
         json={"tenant_id": "tenant_demo", "agent_id": "agent_1", "channel": "wechat"},
         headers=_auth(users["admin"]),
     )
-    assert by_admin.status_code == 200
+    assert by_admin.status_code == 403
 
 
 def test_unsupported_channel_rejected() -> None:
@@ -979,7 +980,7 @@ def test_list_bindings_visibility_scoped_for_non_admin() -> None:
     users = _seed_users(engine)
     with Session(engine) as db:
         db.add(
-            AgentProfile(
+            AgentProfile(owner_user_id=users["owner"].id,
                 id="agent_2",
                 tenant_id="tenant_demo",
                 name="财务员工",
@@ -1067,7 +1068,7 @@ def test_list_bindings_with_agent_id_unchanged() -> None:
     users = _seed_users(engine)
     with Session(engine) as db:
         db.add(
-            AgentProfile(
+            AgentProfile(owner_user_id=users["owner"].id,
                 id="agent_2",
                 tenant_id="tenant_demo",
                 name="财务员工",
@@ -2124,7 +2125,7 @@ def test_binding_manager_not_drifted_by_default_agent() -> None:
     with Session(engine) as db:
         # agent_3 属于 other;绑定由 owner 创建、默认员工是 agent_3
         db.add(
-            AgentProfile(
+            AgentProfile(owner_user_id=users["other"].id,
                 id="agent_3",
                 tenant_id="tenant_demo",
                 name="他人的员工",
@@ -2160,7 +2161,7 @@ def test_binding_manager_not_drifted_by_default_agent() -> None:
     # 创建者换默认员工后仍可管(PUT 换默认 → 再 PUT/DELETE 均放行)
     with Session(engine) as db:
         db.add(
-            AgentProfile(
+            AgentProfile(owner_user_id=users["other"].id,
                 id="agent_2",
                 tenant_id="tenant_demo",
                 name="财务员工",

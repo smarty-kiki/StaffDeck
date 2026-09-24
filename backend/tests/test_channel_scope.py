@@ -52,7 +52,7 @@ def _seed_wecom_binding(
         if not db.get(Tenant, tenant_id):
             db.add(Tenant(id=tenant_id, name=tenant_id))
         if not db.get(AgentProfile, agent_id):
-            db.add(AgentProfile(id=agent_id, tenant_id=tenant_id, name=agent_id, metadata_json={}))
+            db.add(AgentProfile(owner_user_id="user_admin", id=agent_id, tenant_id=tenant_id, name=agent_id, metadata_json={}))
         binding = ChannelBinding(
             tenant_id=tenant_id,
             agent_id=agent_id,
@@ -675,7 +675,7 @@ def test_wecom_credentials_accepts_corp_id_and_meta_lists_it(monkeypatch) -> Non
         owner = User(id="user_owner", tenant_id="tenant_demo", username="owner", password_hash="x")
         db.add(owner)
         db.add(
-            AgentProfile(
+            AgentProfile(owner_user_id=owner.id,
                 id="agent_1",
                 tenant_id="tenant_demo",
                 name="客服",
@@ -732,7 +732,7 @@ def _seed_owner(engine):
         owner = User(id="user_owner", tenant_id="tenant_demo", username="owner", password_hash="x")
         db.add(owner)
         db.add(
-            AgentProfile(
+            AgentProfile(owner_user_id=owner.id,
                 id="agent_1",
                 tenant_id="tenant_demo",
                 name="客服",

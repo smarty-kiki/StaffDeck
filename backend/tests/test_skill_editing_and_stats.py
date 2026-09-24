@@ -23,7 +23,7 @@ from app.api.skills import (
     update_skill,
 )
 from app.agents.branching import ensure_open_gallery_binding, visible_published_skills
-from app.db.models import AgentEvent, AgentProfile, ChannelBinding, ChannelIdentity, Message, Skill, SkillFeedback, SkillVersion, Tenant, Tool, User
+from app.db.models import GALLERY_SCOPE, AgentEvent, AgentProfile, ChannelBinding, ChannelIdentity, Message, Skill, SkillFeedback, SkillVersion, Tenant, Tool, User
 from app.db.models import ModelConfig
 from app.skills.skill_distiller import SkillDistiller
 from app.skills.skill_editor import SkillEditor
@@ -479,7 +479,7 @@ def test_skill_stats_counts_skill_entry_and_feedback() -> None:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         content = _skill_card()
         db.add(
-            Skill(
+            Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
                 tenant_id="tenant_demo",
                 skill_id="purchase",
                 version="1.5.0",
@@ -545,7 +545,7 @@ def test_skill_stats_count_one_negative_feedback_per_flow() -> None:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         content = _skill_card()
         db.add(
-            Skill(
+            Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
                 tenant_id="tenant_demo",
                 skill_id="purchase",
                 version="1.5.0",
@@ -587,9 +587,8 @@ def test_skill_stats_count_one_negative_feedback_per_flow() -> None:
 def test_skill_versions_are_snapshotted_with_version_stats() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(AgentProfile(id="agent_overall", tenant_id="tenant_demo", name="开放广场", is_overall=True))
         content = _skill_card()
-        row = Skill(
+        row = Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
             tenant_id="tenant_demo",
             skill_id=content.skill_id,
             version="1.5.0",
@@ -621,7 +620,7 @@ def test_skill_id_cannot_be_modified_after_create() -> None:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         content = _skill_card()
         db.add(
-            Skill(
+            Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
                 tenant_id="tenant_demo",
                 skill_id=content.skill_id,
                 version=content.version,
@@ -649,9 +648,8 @@ def test_skill_id_cannot_be_modified_after_create() -> None:
 def test_skill_can_return_to_draft_without_leaving_runtime_list() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(AgentProfile(id="agent_overall", tenant_id="tenant_demo", name="开放广场", is_overall=True))
         content = _skill_card()
-        row = Skill(
+        row = Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
             tenant_id="tenant_demo",
             skill_id=content.skill_id,
             version=content.version,
@@ -679,11 +677,12 @@ def test_skill_can_return_to_draft_without_leaving_runtime_list() -> None:
 def test_personal_created_skill_uses_agent_owner_as_creator() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        agent = AgentProfile(
+        # 创建人由 `skills.created_by_user_id` 列派生 —— 归属人必须真实存在。
+        db.add(_owner_user())
+        agent = AgentProfile(owner_user_id="user_owner",
             id="agent_owner",
             tenant_id="tenant_demo",
             name="个人员工",
-            is_overall=False,
             metadata_json={
                 "owner_user_id": "user_owner",
                 "owner_username": "owner",
@@ -712,17 +711,16 @@ def test_personal_created_skill_uses_agent_owner_as_creator() -> None:
 def test_personal_created_skill_binds_explicit_tools_to_its_skill_id() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        agent = AgentProfile(
+        agent = AgentProfile(owner_user_id="user_owner",
             id="agent_tool_owner",
             tenant_id="tenant_demo",
             name="个人员工",
-            is_overall=False,
             metadata_json={
                 "owner_user_id": "user_owner",
                 "owner_username": "owner",
             },
         )
-        tool = Tool(
+        tool = Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
             tenant_id="tenant_demo",
             name="product.price_query",
             method="POST",
@@ -767,11 +765,10 @@ def test_personal_created_skill_uses_current_admin_when_owner_missing() -> None:
             password_hash="test",
         )
         db.add(current_user)
-        agent = AgentProfile(
+        agent = AgentProfile(owner_user_id="user_admin",
             id="agent_legacy",
             tenant_id="tenant_demo",
             name="旧员工",
-            is_overall=False,
             metadata_json={},
         )
         db.add(agent)
@@ -794,11 +791,10 @@ def test_personal_created_skill_uses_current_admin_when_owner_missing() -> None:
 def test_unversioned_stats_remain_aggregate_without_guessing_a_version() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(AgentProfile(id="agent_overall", tenant_id="tenant_demo", name="开放广场", is_overall=True))
         content = _skill_card()
         old_content = content.model_copy(update={"version": "1.0.0"})
         new_content = content.model_copy(update={"version": "1.1.0"})
-        row = Skill(
+        row = Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
             tenant_id="tenant_demo",
             skill_id=content.skill_id,
             version="1.1.0",
@@ -875,7 +871,7 @@ def test_unversioned_stats_do_not_fall_back_to_current_version() -> None:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         content = _skill_card()
         db.add(
-            Skill(
+            Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
                 tenant_id="tenant_demo",
                 skill_id=content.skill_id,
                 version="1.0.0",
@@ -927,7 +923,7 @@ def test_rollback_skill_version_restores_content_without_copying_stats() -> None
         new_content.version = "1.1.0"
         new_content.name = "新版购买"
         db.add(
-            Skill(
+            Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
                 tenant_id="tenant_demo",
                 skill_id=old_content.skill_id,
                 version="1.1.0",
@@ -981,7 +977,7 @@ def test_rollback_skill_version_restores_content_without_copying_stats() -> None
 
 def test_skill_read_uses_current_version_stats_for_skill_list() -> None:
     content = _skill_card()
-    row = Skill(
+    row = Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
         tenant_id="tenant_demo",
         skill_id="purchase",
         version="1.5.0",
@@ -1017,10 +1013,9 @@ def test_skill_read_uses_current_version_stats_for_skill_list() -> None:
 def test_skill_read_includes_total_and_recent_version_ranking_stats() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(AgentProfile(id="agent_overall", tenant_id="tenant_demo", name="整体智能体", is_overall=True))
         content = _skill_card()
         current = content.model_copy(update={"version": "1.3.0"})
-        skill = Skill(
+        skill = Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
             tenant_id="tenant_demo",
             skill_id=content.skill_id,
             version="1.3.0",
@@ -1202,7 +1197,7 @@ def test_message_feedback_attribution_uses_router_skill_hint_for_legacy_step_eve
 
 def test_skill_read_preserves_graph_node_ids() -> None:
     content = _skill_card()
-    row = Skill(
+    row = Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
         tenant_id="tenant_demo",
         skill_id=content.skill_id,
         name=content.name,

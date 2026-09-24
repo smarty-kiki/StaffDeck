@@ -81,11 +81,15 @@ class WebhookRead(BaseModel):
 
 
 class AgentCreate(BaseModel):
+    """新建数字员工。
+
+    没有 `source_mode` / `copy_from_agent_id` —— 员工之间不复刻资源；需要广场资源
+    就用引用端点挂上去（引用而非复制，作者更新则使用者实时可见）。
+    """
+
     name: str = Field(min_length=1, max_length=120)
     description: str | None = None
     persona_prompt: str | None = None
-    source_mode: Literal["copy", "blank"] = "blank"
-    copy_from_agent_id: str | None = None
     harness_max_actions: int = Field(default=32, ge=1, le=100)
     metadata: dict[str, Any] = Field(default_factory=dict)
 

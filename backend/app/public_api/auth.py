@@ -133,9 +133,9 @@ def _agent_access_sets(
             continue
         if (
             is_admin_user(actor)
-            or row.is_overall
             or agent_owned_by_user(row, actor)
-            or metadata.get("published_to_gallery") is True
+            # 发布状态已进列：`is_published` 取代 metadata_json.published_to_gallery。
+            or row.is_published
         ):
             visible.add(row.id)
         if is_admin_user(actor) or agent_owned_by_user(row, actor):

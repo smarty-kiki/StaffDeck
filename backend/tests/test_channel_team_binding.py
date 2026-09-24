@@ -58,9 +58,9 @@ def _p2p_message(event_id: str = "evt_1", text: str = "你好") -> dict:
 
 def _seed_team(db: Session, *, with_leader: bool = True) -> Team:
     db.add(Tenant(id="tenant_demo", name="Demo"))
-    db.add(AgentProfile(id="agent_tl", tenant_id="tenant_demo", name="TL 小队长"))
-    db.add(AgentProfile(id="agent_worker", tenant_id="tenant_demo", name="工人甲"))
-    db.add(AgentProfile(id="agent_worker2", tenant_id="tenant_demo", name="工人乙"))
+    db.add(AgentProfile(owner_user_id="user_admin", id="agent_tl", tenant_id="tenant_demo", name="TL 小队长"))
+    db.add(AgentProfile(owner_user_id="user_admin", id="agent_worker", tenant_id="tenant_demo", name="工人甲"))
+    db.add(AgentProfile(owner_user_id="user_admin", id="agent_worker2", tenant_id="tenant_demo", name="工人乙"))
     db.commit()
     team = create_team(
         db,
@@ -307,9 +307,9 @@ def _seed_api_users(engine) -> dict[str, User]:
         member = User(
             id="user_member", tenant_id="tenant_demo", username="member", password_hash="x",
         )
-        db.add(AgentProfile(id="agent_tl", tenant_id="tenant_demo", name="TL 小队长"))
-        db.add(AgentProfile(id="agent_worker", tenant_id="tenant_demo", name="工人甲"))
-        db.add(AgentProfile(id="agent_outside", tenant_id="tenant_other", name="外部 TL"))
+        db.add(AgentProfile(owner_user_id="user_admin", id="agent_tl", tenant_id="tenant_demo", name="TL 小队长"))
+        db.add(AgentProfile(owner_user_id="user_admin", id="agent_worker", tenant_id="tenant_demo", name="工人甲"))
+        db.add(AgentProfile(owner_user_id="user_admin", id="agent_outside", tenant_id="tenant_other", name="外部 TL"))
         db.add_all([admin, member])
         db.commit()
         for user in (admin, member):

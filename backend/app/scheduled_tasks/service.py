@@ -275,7 +275,7 @@ def detect_scheduled_task_draft(
 ) -> ScheduledTaskDraftRead | None:
     ensure_tenant(db, tenant_id)
     agent = db.get(AgentProfile, agent_id)
-    if not agent or agent.tenant_id != tenant_id or agent.is_overall or agent.status != "active":
+    if not agent or agent.tenant_id != tenant_id or agent.status != "active":
         return None
     user_timezone = _safe_timezone(timezone)
     llm_draft = _detect_with_llm(db, tenant_id, agent_id, message, user_timezone)
@@ -597,8 +597,7 @@ def _ensure_scheduled_execution_agent(db: Session, task: ScheduledTask) -> Agent
     if (
         agent is None
         or agent.tenant_id != task.tenant_id
-        or agent.is_overall
-        or agent.status != "active"
+                or agent.status != "active"
     ):
         raise ScheduledTaskAgentUnavailable(
             "自动任务绑定的员工已不可用；请重新选择启用中的员工后再运行。"
@@ -1179,13 +1178,13 @@ def _dt(value: datetime | None) -> str | None:
 
 def _ensure_agent_access(db: Session, tenant_id: str, agent_id: str, current_user: User) -> AgentProfile:
     agent = db.get(AgentProfile, agent_id)
-    if not agent or agent.tenant_id != tenant_id or agent.is_overall or agent.status != "active":
+    if not agent or agent.tenant_id != tenant_id or agent.status != "active":
         raise HTTPException(status_code=404, detail="员工不可用")
     if _is_admin_user(current_user):
         return agent
-    metadata = agent.metadata_json or {}
     owns_agent = _agent_owned_by_user(agent, current_user)
-    in_gallery = metadata.get("published_to_gallery") is True
+    # 发布状态已进列：`is_published` 取代 metadata_json.published_to_gallery。
+    in_gallery = bool(agent.is_published)
     if not (owns_agent or in_gallery):
         raise HTTPException(status_code=403, detail="无权为该员工设置自动任务")
     return agent

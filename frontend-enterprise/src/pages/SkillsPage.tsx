@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { Ban, CircleCheck, Copy, Eye, RotateCcw, Upload, Users } from 'lucide-react';
+import { Ban, CircleCheck, Copy, Eye, RotateCcw } from 'lucide-react';
 
 import AppHeader from '@/components/AppHeader';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
@@ -32,9 +32,10 @@ import {
   SELECT_TRIGGER_CLASS,
 } from '@/lib/enterprise-ui';
 import { DetailField } from '@/components/DetailField';
-import { ResourceImportDialog } from '@/components/ResourceImportDialog';
+import { ResourceReferenceDialog } from '@/components/ResourceReferenceDialog';
 
 import { api, TENANT_ID } from '../api/client';
+import { listAgentReferences, replaceReferencedResources, unreferencePlazaResource } from '../api/agentResources';
 import IconAdd from '../assets/icons/add.svg?react';
 import IconChevronDown from '../assets/icons/chevron-down.svg?react';
 import IconClear from '../assets/icons/field-clear.svg?react';
@@ -49,10 +50,7 @@ import IconTrash from '../assets/icons/trash.svg?react';
 import { isEnterpriseAdmin, type EnterpriseAuthUser } from '../auth';
 import {
   canManageEmployeeAgent,
-  openGalleryAgentId,
-  openGalleryImportSourceOptions,
   resourceCreatorName,
-  visibleEmployeeAgents,
 } from '../employee';
 import { useClientPagination } from '../hooks/useClientPagination';
 import { isTeamScope, readEmployeeScope } from '../lib/agent-scope-storage';
@@ -74,7 +72,6 @@ type RankingScope = 'current' | 'total';
 type RankedSkill = SkillRead & { rank: number };
 type RankingModalState = { mode: RankingMode; scope: RankingScope };
 type SkillStatusFilter = 'all' | SkillRead['status'];
-type BranchFilter = 'all' | 'synced' | 'diverged' | 'inactive';
 type NumericSkillMetric =
   | 'call_count'
   | 'positive_feedback_count'
@@ -111,27 +108,26 @@ export default function SkillsPage({
   const [versionModalOpen, setVersionModalOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [agentId, setAgentId] = useState(readEmployeeScope);
-  const [isOverallAgent, setIsOverallAgent] = useState(() => {
+  const [isPlazaScope, setIsPlazaScope] = useState(() => {
     const stored = readEmployeeScope();
     return !stored || stored.includes('overall');
   });
   const [searchText, setSearchText] = useState('');
   const [statusFilter, setStatusFilter] = useState<SkillStatusFilter>('all');
-  const [branchFilter, setBranchFilter] = useState<BranchFilter>('all');
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
   const currentAgent = useMemo(() => agents.find((item) => item.id === agentId), [agents, agentId]);
   const canManageCurrentScope = currentAgent
     ? canManageEmployeeAgent(currentAgent, currentUser)
-    : isEnterpriseAdmin(currentUser) && isOverallAgent;
+    : isEnterpriseAdmin(currentUser) && isPlazaScope;
+  // 当前数字员工已引用的广场 SOP 主键集合（用于区分「引用的资源」与「自己的资源」）。
+  const [referencedSkillIds, setReferencedSkillIds] = useState<string[]>([]);
   const [importOpen, setImportOpen] = useState(false);
-  const [importMode, setImportMode] = useState<'plaza' | 'employee'>('plaza');
-  const [importSourceAgentId, setImportSourceAgentId] = useState('');
   const [importSourceSkills, setImportSourceSkills] = useState<SkillRead[]>([]);
   const [importSelectedSkillIds, setImportSelectedSkillIds] = useState<string[]>([]);
   const [importLoading, setImportLoading] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<SkillRead | null>(null);
+  const [unreferenceTarget, setUnreferenceTarget] = useState<SkillRead | null>(null);
   const [rollbackTarget, setRollbackTarget] = useState<SkillVersionRead | null>(null);
-  const [promoteTarget, setPromoteTarget] = useState<SkillRead | null>(null);
   const [confirmLoading, setConfirmLoading] = useState(false);
 
   const load = async () => {
@@ -142,7 +138,24 @@ export default function SkillsPage({
       setRows(result);
       const agentRows = await api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`);
       setAgents(agentRows);
-      setIsOverallAgent(Boolean(agentRows.find((item) => item.id === agentId)?.is_overall ?? true));
+      // 广场不再是一条「员工」记录：没选中已知员工就是广场视角。
+      const isPlaza = !agentRows.some((item) => item.id === agentId);
+      setIsPlazaScope(isPlaza);
+      // 只有员工作用域才可能引用广场资源；广场自身不做引用。
+      // 引用按 resource_id 记录，与列表行的主键一致，用于区分「引用的资源」和「自己的资源」。
+      if (agentId && !isPlaza) {
+        try {
+          const references = await listAgentReferences(agentId);
+          setReferencedSkillIds(
+            references.filter((item) => item.resource_type === 'skill').map((item) => item.resource_id),
+          );
+        } catch {
+          // 引用列表拉取失败不影响 SOP 主列表展示，降级为空集合。
+          setReferencedSkillIds([]);
+        }
+      } else {
+        setReferencedSkillIds([]);
+      }
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '加载失败');
     } finally {
@@ -159,17 +172,17 @@ export default function SkillsPage({
     if (searchParams.get('add') !== 'plaza') return;
     if (agents.length === 0) return;
     const resourceId = searchParams.get('resourceId') || undefined;
-    if (isOverallAgent) {
-      notify.warning('请先选择一个数字员工，再从广场复制 SOP');
+    if (isPlazaScope) {
+      notify.warning('请先选择一个数字员工，再引用广场 SOP');
     } else {
-      void openImport('plaza', resourceId);
+      void openImport(resourceId);
     }
     const next = new URLSearchParams(searchParams);
     next.delete('add');
     next.delete('resourceId');
     setSearchParams(next, { replace: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agents.length, isOverallAgent, searchParams, setSearchParams]);
+  }, [agents.length, isPlazaScope, searchParams, setSearchParams]);
 
   useEffect(() => {
     const onScopeChange = (event: Event) => {
@@ -194,13 +207,11 @@ export default function SkillsPage({
           resourceCreatorName(row),
         ].some((value) => value.toLowerCase().includes(keyword));
       const matchesStatus = statusFilter === 'all' || row.status === statusFilter;
-      const branchState = row.branch_status === 'inactive' ? 'inactive' : row.branch_sync_state || 'synced';
-      const matchesBranch = isOverallAgent || branchFilter === 'all' || branchState === branchFilter;
-      return matchesKeyword && matchesStatus && matchesBranch;
+      return matchesKeyword && matchesStatus;
     });
-  }, [branchFilter, isOverallAgent, rows, searchText, statusFilter]);
+  }, [rows, searchText, statusFilter]);
 
-  const pagination = useClientPagination(filteredRows, SKILL_PAGE_SIZE, `${searchText}|${statusFilter}|${branchFilter}`);
+  const pagination = useClientPagination(filteredRows, SKILL_PAGE_SIZE, `${searchText}|${statusFilter}`);
 
   const rankingRows = useMemo(
     () => ({
@@ -248,12 +259,6 @@ export default function SkillsPage({
     },
     { key: 'version', title: '版本', width: 80, render: (row) => row.version },
     {
-      key: 'branch',
-      title: '本地版本',
-      width: 110,
-      render: (row) => renderBranchBadge(row, isOverallAgent),
-    },
-    {
       key: 'creator',
       title: '创建者',
       width: 120,
@@ -286,7 +291,7 @@ export default function SkillsPage({
   ];
 
   function renderActions(row: SkillRead) {
-    if (isOverallAgent && !canManageCurrentScope) {
+    if (isPlazaScope && !canManageCurrentScope) {
       return (
         <DropdownMenu>
           <DropdownMenuTrigger
@@ -304,6 +309,8 @@ export default function SkillsPage({
         </DropdownMenu>
       );
     }
+    // 引自广场的 SOP 归属其作者：不能在本员工里编辑/停用/删除，只能取消引用。
+    const isReferenced = !isPlazaScope && referencedSkillIds.includes(row.id);
     return (
       <DropdownMenu>
         <DropdownMenuTrigger
@@ -313,52 +320,60 @@ export default function SkillsPage({
           <IconMore className="size-3.5" />
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end" className={MENU_CONTENT_CLASS}>
-          <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => openEdit(row)}>
-            <IconEdit />
-            {isOverallAgent ? '编辑' : '编辑本地版本'}
-          </DropdownMenuItem>
-          <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void openVersions(row)}>
-            <IconHistory />
-            版本管理
-          </DropdownMenuItem>
-          {isOverallAgent && row.status !== 'draft' && (
-            <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void markDraft(row)}>
-              <IconEdit />
-              转为草稿
-            </DropdownMenuItem>
-          )}
-          {row.status === 'published' ? (
-            <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void archive(row)}>
-              <Ban />
-              {isOverallAgent ? '停用' : '停用本地版本'}
-            </DropdownMenuItem>
-          ) : (
-            <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void publish(row)}>
-              <CircleCheck />
-              {isOverallAgent ? '启用' : '启用本地版本'}
-            </DropdownMenuItem>
-          )}
-          {!isOverallAgent && (
+          {isReferenced ? (
             <>
-              <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void syncFromOverall(row)}>
-                <IconRefresh />
-                从广场同步
+              <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void openVersions(row)}>
+                <IconHistory />
+                版本管理
               </DropdownMenuItem>
-              <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => setPromoteTarget(row)}>
-                <Upload />
-                发布到广场
+              <DropdownMenuSeparator className="my-[2px] bg-[#eef0f4]" />
+              <DropdownMenuItem
+                variant="destructive"
+                className={MENU_ITEM_DANGER_CLASS}
+                onSelect={() => setUnreferenceTarget(row)}
+              >
+                <IconTrash />
+                取消引用
+              </DropdownMenuItem>
+            </>
+          ) : (
+            <>
+              <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => openEdit(row)}>
+                <IconEdit />
+                编辑
+              </DropdownMenuItem>
+              <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void openVersions(row)}>
+                <IconHistory />
+                版本管理
+              </DropdownMenuItem>
+              {row.status !== 'draft' && (
+                <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void markDraft(row)}>
+                  <IconEdit />
+                  转为草稿
+                </DropdownMenuItem>
+              )}
+              {row.status === 'published' ? (
+                <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void archive(row)}>
+                  <Ban />
+                  停用
+                </DropdownMenuItem>
+              ) : (
+                <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void publish(row)}>
+                  <CircleCheck />
+                  启用
+                </DropdownMenuItem>
+              )}
+              <DropdownMenuSeparator className="my-[2px] bg-[#eef0f4]" />
+              <DropdownMenuItem
+                variant="destructive"
+                className={MENU_ITEM_DANGER_CLASS}
+                onSelect={() => setDeleteTarget(row)}
+              >
+                <IconTrash />
+                删除
               </DropdownMenuItem>
             </>
           )}
-          <DropdownMenuSeparator className="my-[2px] bg-[#eef0f4]" />
-          <DropdownMenuItem
-            variant="destructive"
-            className={MENU_ITEM_DANGER_CLASS}
-            onSelect={() => setDeleteTarget(row)}
-          >
-            <IconTrash />
-            {isOverallAgent ? '删除' : '移除'}
-          </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
     );
@@ -378,7 +393,6 @@ export default function SkillsPage({
         </div>
         <div className="mt-[10px] flex flex-wrap items-center gap-[4px]">
           <StatusBadge tone={preset.tone}>{preset.text}</StatusBadge>
-          {renderBranchBadge(row, isOverallAgent)}
           {row.business_domain && <StatusBadge tone="gray">{row.business_domain}</StatusBadge>}
         </div>
         <div className="mt-[10px] flex items-center justify-between gap-[10px] text-[12px] text-[#858b9c]">
@@ -391,43 +405,38 @@ export default function SkillsPage({
     );
   };
 
-  async function openImport(mode: 'plaza' | 'employee' = 'plaza', selectedResourceId?: string) {
+  // 打开「引用广场 SOP」对话框：候选 = 广场里已发布的 SOP。
+  async function openImport(selectedResourceId?: string) {
     try {
-      const agentRows = agents.length
-        ? agents
-        : await api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`);
-      setAgents(agentRows);
-      setImportMode(mode);
-      const firstSource = mode === 'plaza'
-        ? openGalleryAgentId(agentRows)
-        : visibleEmployeeAgents(agentRows, currentUser, { activeOnly: true, excludeAgentId: agentId })[0]?.id || '';
-      setImportSourceAgentId(firstSource);
-      setImportSelectedSkillIds([]);
-      setImportOpen(true);
-      if (firstSource) {
-        const sourceRows = await loadImportSourceSkills(firstSource);
-        if (selectedResourceId && sourceRows.some((item) => item.id === selectedResourceId)) {
-          setImportSelectedSkillIds([selectedResourceId]);
-        }
-      } else {
-        setImportSourceSkills([]);
+      if (!agents.length) {
+        setAgents(await api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`));
       }
+      setImportOpen(true);
+      const sourceRows = await loadImportSourceSkills();
+      // 提交是「整体替换该类型引用」的语义，所以用当前已引用回填勾选，
+      // 否则未重新勾选的既有引用会在提交时被清掉。
+      const availableIds = new Set(sourceRows.map((item) => item.id));
+      const selected = referencedSkillIds.filter((id) => availableIds.has(id));
+      if (selectedResourceId && availableIds.has(selectedResourceId) && !selected.includes(selectedResourceId)) {
+        selected.push(selectedResourceId);
+      }
+      setImportSelectedSkillIds(selected);
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '加载员工失败');
+      notify.error(error instanceof Error ? error.message : '加载广场 SOP 失败');
     }
   }
 
-  async function loadImportSourceSkills(sourceAgentId: string): Promise<SkillRead[]> {
+  async function loadImportSourceSkills(): Promise<SkillRead[]> {
     setImportSourceSkills([]);
-    setImportSelectedSkillIds([]);
-    if (!sourceAgentId) return [];
     try {
-      const sourceRows = await api.get<SkillRead[]>(`/api/enterprise/agents/${sourceAgentId}/skills?tenant_id=${TENANT_ID}`);
+      // 不带 agent_id 就是广场视角 —— 广场不是一条员工记录，而是资源自己的 scope。
+      const sourceRows = await api.get<SkillRead[]>(`/api/enterprise/skills?tenant_id=${TENANT_ID}`);
+      // 广场里未发布的 SOP 不可被引用。
       const publishedRows = sourceRows.filter((item) => item.status === 'published');
       setImportSourceSkills(publishedRows);
       return publishedRows;
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '加载来源 SOP 失败');
+      notify.error(error instanceof Error ? error.message : '加载广场 SOP 失败');
       return [];
     }
   }
@@ -437,32 +446,18 @@ export default function SkillsPage({
       notify.warning('请先选择一个数字员工');
       return;
     }
-    if (!importSourceAgentId) {
-      notify.warning(importMode === 'plaza' ? '请选择开放广场' : '请选择复制来源员工');
-      return;
-    }
     if (importSelectedSkillIds.length === 0) {
-      notify.warning('请选择要复制的 SOP');
+      notify.warning('请选择要引用的 SOP');
       return;
     }
     setImportLoading(true);
     try {
-      const result = await api.post<{ imported: Array<Record<string, unknown>>; missing: Array<Record<string, unknown>> }>(
-        `/api/enterprise/agents/${agentId}/resources/import`,
-        {
-          tenant_id: TENANT_ID,
-          source_agent_id: importSourceAgentId,
-          resource_type: 'skill',
-          resource_ids: importSelectedSkillIds,
-        },
-      );
-      const importedCount = result.imported?.length || 0;
-      const missingCount = result.missing?.length || 0;
-      notify.success(`已复制 ${importedCount} 个 SOP${missingCount ? `，${missingCount} 个未复制` : ''}`);
+      await replaceReferencedResources(agentId, 'skill', importSelectedSkillIds);
+      notify.success(`已引用 ${importSelectedSkillIds.length} 个 SOP`);
       setImportOpen(false);
       await load();
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '复制失败');
+      notify.error(error instanceof Error ? error.message : '引用失败');
     } finally {
       setImportLoading(false);
     }
@@ -537,31 +532,34 @@ export default function SkillsPage({
     }
   }
 
-  async function syncFromOverall(row: SkillRead) {
-    if (!agentId) return;
-    try {
-      await api.post(
-        `/api/enterprise/agents/${agentId}/skills/${encodeURIComponent(row.skill_id)}/sync-from-overall?tenant_id=${TENANT_ID}`,
-      );
-      notify.success('已从广场同步');
-      await load();
-    } catch (error) {
-      notify.error(error instanceof Error ? error.message : '同步失败');
-    }
-  }
-
   async function confirmDelete() {
     const row = deleteTarget;
     if (!row) return;
-    const branchMode = !isOverallAgent;
     setConfirmLoading(true);
     try {
       await api.delete(`/api/enterprise/skills/${row.skill_id}?tenant_id=${TENANT_ID}${agentQuery()}`);
-      notify.success(branchMode ? '已移除' : '已删除');
+      notify.success('已删除');
       setDeleteTarget(null);
       await load();
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : branchMode ? '移除失败' : '删除失败');
+      notify.error(error instanceof Error ? error.message : '删除失败');
+    } finally {
+      setConfirmLoading(false);
+    }
+  }
+
+  // 取消引用 = 删掉该员工对这条广场 SOP 的引用行，SOP 本身不受影响。
+  async function confirmUnreference() {
+    const row = unreferenceTarget;
+    if (!row || !agentId) return;
+    setConfirmLoading(true);
+    try {
+      await unreferencePlazaResource(agentId, 'skill', row.id);
+      notify.success('已取消引用');
+      setUnreferenceTarget(null);
+      await load();
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '取消引用失败');
     } finally {
       setConfirmLoading(false);
     }
@@ -586,31 +584,13 @@ export default function SkillsPage({
     }
   }
 
-  async function confirmPromote() {
-    const row = promoteTarget;
-    if (!row || !agentId) return;
-    setConfirmLoading(true);
-    try {
-      await api.post(
-        `/api/enterprise/agents/${agentId}/skills/${encodeURIComponent(row.skill_id)}/promote-to-overall?tenant_id=${TENANT_ID}`,
-      );
-      notify.success('已发布到广场');
-      setPromoteTarget(null);
-      await load();
-    } catch (error) {
-      notify.error(error instanceof Error ? error.message : '发布失败');
-    } finally {
-      setConfirmLoading(false);
-    }
-  }
-
   function agentQuery() {
     return agentId ? `&agent_id=${encodeURIComponent(agentId)}` : '';
   }
 
-  const listEmptyText = isOverallAgent
+  const listEmptyText = isPlazaScope
     ? canManageCurrentScope ? '暂无 SOP，点击「新增」创建一个吧' : '暂无 SOP'
-    : '当前员工暂无本地 SOP';
+    : '当前员工暂无 SOP';
 
   return (
     <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]" aria-busy={loading}>
@@ -638,16 +618,10 @@ export default function SkillsPage({
                 <IconAdd />
                 新建空白 SOP
               </DropdownMenuItem>
-              {!isOverallAgent && (
-                <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void openImport('plaza')}>
+              {!isPlazaScope && (
+                <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void openImport()}>
                   <Copy />
-                  从广场复制
-                </DropdownMenuItem>
-              )}
-              {!isOverallAgent && (
-                <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void openImport('employee')}>
-                  <Users />
-                  从数字员工复制
+                  引用广场 SOP
                 </DropdownMenuItem>
               )}
             </DropdownMenuContent>
@@ -659,7 +633,7 @@ export default function SkillsPage({
         <div className="flex flex-col gap-[18px]">
           <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
             <IconClipboard className="size-[14px] shrink-0" />
-            <span className="text-[14px] font-normal leading-none">{isOverallAgent ? 'SOP 广场列表' : '本地 SOP'}</span>
+            <span className="text-[14px] font-normal leading-none">{isPlazaScope ? 'SOP 广场列表' : '员工 SOP'}</span>
           </div>
 
           <div className="flex flex-wrap items-center gap-[16px]">
@@ -697,19 +671,6 @@ export default function SkillsPage({
                 <SelectItem value="archived">已停用</SelectItem>
               </SelectContent>
             </Select>
-            {!isOverallAgent && (
-              <Select value={branchFilter} onValueChange={(value) => setBranchFilter(value as BranchFilter)}>
-                <SelectTrigger className={cn(SELECT_TRIGGER_CLASS, 'w-[130px]')} aria-label="版本筛选">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">全部版本</SelectItem>
-                  <SelectItem value="synced">已同步</SelectItem>
-                  <SelectItem value="diverged">本地版本</SelectItem>
-                  <SelectItem value="inactive">已停用</SelectItem>
-                </SelectContent>
-              </Select>
-            )}
           </div>
 
           <div className="grid gap-[10px] md:hidden">
@@ -770,17 +731,11 @@ export default function SkillsPage({
         </div>
       </div>
 
-      <ResourceImportDialog
+      <ResourceReferenceDialog
         open={importOpen}
         loading={importLoading}
         icon={<IconSkill className="size-[14px] shrink-0" />}
-        title={importMode === 'plaza' ? '从广场复制 SOP' : '从数字员工复制 SOP'}
-        sourcePlaceholder={importMode === 'plaza' ? '选择开放广场' : '选择复制来源'}
-        sources={importMode === 'plaza'
-          ? openGalleryImportSourceOptions(agents, '开放广场')
-          : visibleEmployeeAgents(agents, currentUser, { activeOnly: true, excludeAgentId: agentId })
-            .map((item) => ({ value: item.id, label: item.name }))}
-        sourceId={importSourceAgentId}
+        title="引用广场 SOP"
         itemsLabel="选择 SOP"
         items={importSourceSkills.map((item) => ({
           id: item.id,
@@ -792,16 +747,8 @@ export default function SkillsPage({
           ),
         }))}
         selectedIds={importSelectedSkillIds}
-        emptyText="没有可复制的 SOP"
-        note={
-          importMode === 'plaza'
-            ? '从开放广场复制可用 SOP；不可复制内容不会出现在列表。'
-            : '从数字员工复制可用 SOP；不可见内容不会出现在列表。'
-        }
-        onSourceChange={(value) => {
-          setImportSourceAgentId(value);
-          void loadImportSourceSkills(value);
-        }}
+        emptyText="广场暂无可引用的 SOP"
+        note="引用不是复制：SOP 只有一份、归属其作者，作者更新后所有引用者立刻生效。"
         onSelectedChange={setImportSelectedSkillIds}
         onClose={() => setImportOpen(false)}
         onSubmit={() => void submitImportSkills()}
@@ -836,17 +783,9 @@ export default function SkillsPage({
         open={Boolean(deleteTarget)}
         onOpenChange={(open) => !open && setDeleteTarget(null)}
         loading={confirmLoading}
-        title={
-          deleteTarget
-            ? `${isOverallAgent ? '删除' : '移除'} SOP「${deleteTarget.name}」？`
-            : ''
-        }
-        description={
-          isOverallAgent
-            ? '删除后不会移除历史对话记录，但组织 SOP 列表中将不再显示该流程。'
-            : '这只会在当前数字员工中隐藏该 SOP；开放广场和其他数字员工仍然保留。'
-        }
-        confirmText={isOverallAgent ? '删除' : '移除'}
+        title={deleteTarget ? `删除 SOP「${deleteTarget.name}」？` : ''}
+        description="删除后不会移除历史对话记录，但列表中不再显示该 SOP。"
+        confirmText="删除"
         onConfirm={() => void confirmDelete()}
       />
 
@@ -866,14 +805,13 @@ export default function SkillsPage({
       />
 
       <ConfirmDialog
-        open={Boolean(promoteTarget)}
-        onOpenChange={(open) => !open && setPromoteTarget(null)}
+        open={Boolean(unreferenceTarget)}
+        onOpenChange={(open) => !open && setUnreferenceTarget(null)}
         loading={confirmLoading}
-        destructive={false}
-        title={promoteTarget ? `将「${promoteTarget.name}」发布到广场？` : ''}
-        description="这会把当前数字员工的本地版本发布为广场可复用的 SOP 新版本。"
-        confirmText="发布"
-        onConfirm={() => void confirmPromote()}
+        title={unreferenceTarget ? `取消引用 SOP「${unreferenceTarget.name}」？` : ''}
+        description="取消引用只会移除当前数字员工对该 SOP 的引用，SOP 本身和其他引用者不受影响。"
+        confirmText="取消引用"
+        onConfirm={() => void confirmUnreference()}
       />
     </div>
   );
@@ -884,17 +822,6 @@ function createDistillWorkspaceId(): string {
     return window.crypto.randomUUID();
   }
   return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
-}
-
-function renderBranchBadge(row: SkillRead, isOverallAgent: boolean) {
-  if (isOverallAgent) return <StatusBadge tone="gray">广场版</StatusBadge>;
-  if (row.branch_status === 'inactive') return <StatusBadge tone="gray">已停用</StatusBadge>;
-  const state = row.branch_sync_state || 'synced';
-  return state === 'diverged' ? (
-    <StatusBadge tone="orange">本地版本</StatusBadge>
-  ) : (
-    <StatusBadge tone="green">已同步</StatusBadge>
-  );
 }
 
 function ScopeToggle({ value, onChange }: { value: RankingScope; onChange: (scope: RankingScope) => void }) {

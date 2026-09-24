@@ -148,8 +148,6 @@ def _apply_forced_sop_snapshot(
         created_at=current.created_at,
         updated_at=current.updated_at,
     )
-    if hasattr(current, "agent_branch_meta"):
-        object.__setattr__(pinned, "agent_branch_meta", getattr(current, "agent_branch_meta"))
     return [pinned if skill.skill_id == target else skill for skill in source_skills]
 
 

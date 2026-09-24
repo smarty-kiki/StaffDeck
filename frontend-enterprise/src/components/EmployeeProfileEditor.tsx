@@ -18,7 +18,6 @@ import {
 } from '@/components/ui';
 import { SELECT_TRIGGER_CLASS } from '@/lib/enterprise-ui';
 import { api, TENANT_ID } from '../api/client';
-import type { EnterpriseAuthUser } from '../auth';
 import { employeeDisplayName, employeeProfile } from '../employee';
 import type { AgentProfileRead } from '../types';
 import EmployeeAvatar from './EmployeeAvatar';
@@ -62,13 +61,11 @@ export default function EmployeeProfileEditor({
   open,
   onClose,
   onSaved,
-  currentUser,
 }: {
   agent?: AgentProfileRead | null;
   open: boolean;
   onClose: () => void;
   onSaved?: (agent: AgentProfileRead) => void;
-  currentUser?: EnterpriseAuthUser;
 }) {
   const [form, setForm] = useState<EmployeeProfileFormValues>(BLANK_FORM);
   const [saving, setSaving] = useState(false);
@@ -90,7 +87,8 @@ export default function EmployeeProfileEditor({
       workModes: profile.workModes,
       harnessMaxActions: Math.max(1, Math.min(100, agent.harness_max_actions || 32)),
       status: agent.status === 'archived' ? 'archived' : 'active',
-      publishedToGallery: agent.metadata?.published_to_gallery === true,
+      // 发布状态已进列：读 `is_published`，不再读 metadata。
+      publishedToGallery: agent.is_published === true,
     });
   }, [agent, open, profile]);
 
@@ -102,7 +100,6 @@ export default function EmployeeProfileEditor({
     }
     setSaving(true);
     try {
-      const wasPublished = agent.metadata?.published_to_gallery === true;
       const metadata: Record<string, unknown> = {
         ...(agent.metadata || {}),
         blank_onboarding: false,
@@ -112,18 +109,9 @@ export default function EmployeeProfileEditor({
         work_styles: compactTags(form.workStyles),
         expertise_tags: compactTags(form.expertiseTags),
         work_modes: compactTags(form.workModes),
-        published_to_gallery: form.publishedToGallery,
       };
-      if (form.publishedToGallery && !wasPublished) {
-        metadata.gallery_published_at = new Date().toISOString();
-        metadata.gallery_published_by = currentUser?.username;
-      }
-      if (!form.publishedToGallery) {
-        delete metadata.gallery_published_at;
-        delete metadata.gallery_published_by;
-      }
 
-      const saved = await api.put<AgentProfileRead>(`/api/enterprise/agents/${agent.id}`, {
+      let saved = await api.put<AgentProfileRead>(`/api/enterprise/agents/${agent.id}`, {
         tenant_id: TENANT_ID,
         name: form.name.trim(),
         description: form.description.trim(),
@@ -132,6 +120,15 @@ export default function EmployeeProfileEditor({
         harness_max_actions: Math.max(1, Math.min(100, form.harnessMaxActions || 32)),
         metadata,
       });
+
+      // 发布状态是 `is_published` 这一列，只有专用端点能改；档案保存不碰它。
+      if (form.publishedToGallery !== (agent.is_published === true)) {
+        const action = form.publishedToGallery ? 'gallery:publish' : 'gallery:unpublish';
+        saved = await api.post<AgentProfileRead>(
+          `/api/enterprise/agents/${encodeURIComponent(agent.id)}/${action}?tenant_id=${encodeURIComponent(TENANT_ID)}`,
+          {},
+        );
+      }
       notify.success('数字员工档案已更新');
       onSaved?.(saved);
       onClose();

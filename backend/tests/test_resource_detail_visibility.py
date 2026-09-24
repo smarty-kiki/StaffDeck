@@ -6,7 +6,6 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
 from app.agents.branching import (
-    ensure_agent_private_knowledge_branch,
     ensure_knowledge_base_version,
     ensure_private_resource_binding,
 )
@@ -14,6 +13,7 @@ from app.api.knowledge import get_document, get_document_buckets, get_job, list_
 from app.api.knowledge_bases import get_knowledge_base, list_knowledge_base_versions
 from app.api.skills import get_skill, get_skill_version, list_skill_versions
 from app.db.models import (
+    AGENT_SCOPE,
     AgentProfile,
     KnowledgeBase,
     KnowledgeDocument,
@@ -35,6 +35,8 @@ def test_private_skill_detail_and_versions_require_the_bound_agent_scope() -> No
             name="私有流程",
             status="published",
             content_json=_skill_content("private_flow"),
+            scope=AGENT_SCOPE,
+            owner_agent_id=owner_agent.id,
         )
         db.add(skill)
         db.flush()
@@ -53,7 +55,9 @@ def test_private_skill_detail_and_versions_require_the_bound_agent_scope() -> No
         versions = list_skill_versions(skill.skill_id, "tenant_demo", db, owner_agent.id)
         assert detail.skill_id == skill.skill_id
         assert versions
-        version = get_skill_version(skill.skill_id, versions[0].version, "tenant_demo", owner_agent.id, db)
+        version = get_skill_version(
+            skill.skill_id, versions[0].version, "tenant_demo", owner_agent.id, db
+        )
         assert version.skill_id == skill.skill_id
 
 
@@ -64,17 +68,12 @@ def test_private_knowledge_details_documents_and_jobs_require_the_bound_agent_sc
             id="kb_private",
             tenant_id="tenant_demo",
             name="私有知识库",
+            scope=AGENT_SCOPE,
+            owner_agent_id=owner_agent.id,
         )
         db.add(knowledge_base)
         db.flush()
-        branch = ensure_agent_private_knowledge_branch(
-            db,
-            "tenant_demo",
-            owner_agent.id,
-            knowledge_base,
-        )
-        db.flush()
-        version = ensure_knowledge_base_version(db, knowledge_base, branch.head_version)
+        version = ensure_knowledge_base_version(db, knowledge_base)
         document = KnowledgeDocument(
             id="kdoc_private",
             tenant_id="tenant_demo",
@@ -113,11 +112,16 @@ def test_private_knowledge_details_documents_and_jobs_require_the_bound_agent_sc
             assert list_documents("tenant_demo", None, scope, True, db) == []
             assert list_jobs("tenant_demo", scope, None, 8, db) == []
 
-        assert get_knowledge_base(knowledge_base.id, "tenant_demo", owner_agent.id, db).id == knowledge_base.id
+        assert (
+            get_knowledge_base(knowledge_base.id, "tenant_demo", owner_agent.id, db).id
+            == knowledge_base.id
+        )
         assert list_knowledge_base_versions(knowledge_base.id, "tenant_demo", owner_agent.id, db)
         assert get_document(document.id, "tenant_demo", owner_agent.id, db).id == document.id
         assert get_job(job.id, "tenant_demo", owner_agent.id, db).id == job.id
-        assert [row.id for row in list_documents("tenant_demo", None, owner_agent.id, True, db)] == [document.id]
+        assert [
+            row.id for row in list_documents("tenant_demo", None, owner_agent.id, True, db)
+        ] == [document.id]
         assert [row.id for row in list_jobs("tenant_demo", owner_agent.id, None, 8, db)] == [job.id]
 
 
@@ -128,16 +132,19 @@ def test_visible_knowledge_history_has_consistent_list_and_detail_access() -> No
             id="kb_versioned",
             tenant_id="tenant_demo",
             name="版本知识库",
+            scope=AGENT_SCOPE,
+            owner_agent_id=owner_agent.id,
         )
         db.add(knowledge_base)
         db.flush()
-        branch = ensure_agent_private_knowledge_branch(db, "tenant_demo", owner_agent.id, knowledge_base)
-        db.flush()
-        historical_version = ensure_knowledge_base_version(db, knowledge_base, branch.head_version)
-        branch.base_version = branch.head_version
-        branch.head_version = f"{branch.head_version}.next"
-        db.add(branch)
-        current_version = ensure_knowledge_base_version(db, knowledge_base, branch.head_version)
+        # 知识库只有一份内容：多个版本共存，当前版本由 metadata.current_version 指定。
+        historical_version = ensure_knowledge_base_version(db, knowledge_base, "1.0.0")
+        current_version = ensure_knowledge_base_version(db, knowledge_base, "2.0.0")
+        knowledge_base.metadata_json = {
+            **(knowledge_base.metadata_json or {}),
+            "current_version": "2.0.0",
+        }
+        db.add(knowledge_base)
         historical_document = KnowledgeDocument(
             id="kdoc_historical",
             tenant_id="tenant_demo",
@@ -165,7 +172,12 @@ def test_visible_knowledge_history_has_consistent_list_and_detail_access() -> No
 
         assert [row.id for row in current_rows] == [current_document.id]
         assert {row.id for row in history_rows} == {historical_document.id, current_document.id}
-        assert get_document(historical_document.id, "tenant_demo", owner_agent.id, db).knowledge_base_version_id == historical_version.id
+        assert (
+            get_document(
+                historical_document.id, "tenant_demo", owner_agent.id, db
+            ).knowledge_base_version_id
+            == historical_version.id
+        )
         assert get_document_buckets(historical_document.id, "tenant_demo", owner_agent.id, db) == []
 
 
@@ -184,16 +196,18 @@ def _seed_private_scope(db: Session) -> tuple[AgentProfile, AgentProfile]:
         password_hash="x",
     )
     owner_agent = AgentProfile(
+        owner_user_id=owner.id,
         id="agent_owner",
         tenant_id="tenant_demo",
         name="Owner agent",
-        metadata_json={"owner_user_id": owner.id, "owner_username": owner.username},
+        metadata_json={"owner_username": owner.username},
     )
     other_agent = AgentProfile(
+        owner_user_id=other.id,
         id="agent_other",
         tenant_id="tenant_demo",
         name="Other agent",
-        metadata_json={"owner_user_id": other.id, "owner_username": other.username},
+        metadata_json={"owner_username": other.username},
     )
     db.add(owner)
     db.add(other)

@@ -25,10 +25,11 @@ from app.api.tools import (
 )
 from app.config import get_settings
 from app.db.models import (
+    GALLERY_SCOPE,
     A2ATaskEvent,
     A2ATaskRun,
     AgentProfile,
-    AgentResourceBinding,
+    AgentResourceReference,
     Tenant,
     Tool,
     User,
@@ -60,7 +61,7 @@ def probe_tool(request: ToolProbeRequest, db: Session):  # noqa: ANN201
 def test_delete_tool_removes_tenant_tool() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        tool = Tool(
+        tool = Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
             tenant_id="tenant_demo",
             name="product.lookup",
             display_name="商品查询",
@@ -80,12 +81,7 @@ def test_delete_tool_removes_tenant_tool() -> None:
 def test_a2a_run_listing_includes_events_and_cancel_is_persisted() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(
-            AgentProfile(
-                id="agent_overall", tenant_id="tenant_demo", name="开放广场", is_overall=True
-            )
-        )
-        tool = Tool(
+        tool = Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
             id="tool_a2a",
             tenant_id="tenant_demo",
             name="codex.remote",
@@ -232,7 +228,7 @@ def test_delete_tool_is_tenant_scoped() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.add(Tenant(id="tenant_other", name="Other"))
-        tool = Tool(
+        tool = Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
             tenant_id="tenant_other",
             name="product.lookup",
             display_name="商品查询",
@@ -250,20 +246,16 @@ def test_delete_tool_is_tenant_scoped() -> None:
         assert db.get(Tool, tool.id) is not None
 
 
-def test_open_gallery_delete_tool_hides_gallery_without_removing_agent_binding() -> None:
+def test_delete_gallery_tool_removes_it_and_purges_references() -> None:
+    """删除广场工具 = 真删：引用行被清掉，引用它的员工立刻失去这个工具。"""
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.add(
-            AgentProfile(
-                id="agent_overall", tenant_id="tenant_demo", name="开放广场", is_overall=True
+            AgentProfile(owner_user_id="user_admin",
+                id="agent_branch", tenant_id="tenant_demo", name="研发员工"
             )
         )
-        db.add(
-            AgentProfile(
-                id="agent_branch", tenant_id="tenant_demo", name="研发员工", is_overall=False
-            )
-        )
-        tool = Tool(
+        tool = Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
             id="tool_weather",
             tenant_id="tenant_demo",
             name="weather.forecast",
@@ -273,12 +265,12 @@ def test_open_gallery_delete_tool_hides_gallery_without_removing_agent_binding()
         )
         db.add(tool)
         db.add(
-            AgentResourceBinding(
+            AgentResourceReference(
+                id="ref_tool_weather",
                 tenant_id="tenant_demo",
                 agent_id="agent_branch",
                 resource_type="tool",
                 resource_id=tool.id,
-                status="active",
             )
         )
         db.commit()
@@ -289,22 +281,26 @@ def test_open_gallery_delete_tool_hides_gallery_without_removing_agent_binding()
             tool.id,
             "tenant_demo",
             db,
-            agent_id="agent_overall",
+            agent_id=None,
             current_user=_admin_user(),
         )
 
-        assert result == {"status": "hidden"}
-        assert db.get(Tool, tool.id) is not None
-        branch_binding = db.exec(
-            select(AgentResourceBinding).where(
-                AgentResourceBinding.tenant_id == "tenant_demo",
-                AgentResourceBinding.agent_id == "agent_branch",
-                AgentResourceBinding.resource_type == "tool",
-                AgentResourceBinding.resource_id == tool.id,
-            )
-        ).one()
-        assert branch_binding.status == "active"
-        assert list_tools("tenant_demo", bucket=None, agent_id="agent_overall", db=db) == []
+        assert result == {"status": "deleted"}
+        assert db.get(Tool, tool.id) is None
+        # 资源没了，指向它的引用行一并清空 —— 库里不留悬空引用。
+        assert (
+            db.exec(
+                select(AgentResourceReference).where(
+                    AgentResourceReference.tenant_id == "tenant_demo",
+                    AgentResourceReference.resource_type == "tool",
+                    AgentResourceReference.resource_id == tool.id,
+                )
+            ).all()
+            == []
+        )
+        assert list_tools("tenant_demo", bucket=None, agent_id=None, db=db) == []
+        assert list_tools("tenant_demo", bucket=None, agent_id="agent_branch", db=db) == []
+        assert list_tools("tenant_demo", bucket=None, agent_id=None, db=db) == []
         assert list_tools("tenant_demo", bucket=None, agent_id="agent_branch", db=db) == []
 
 
@@ -312,17 +308,23 @@ def test_open_gallery_tool_read_returns_persisted_creator_metadata() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.add(
-            AgentProfile(
-                id="agent_overall", tenant_id="tenant_demo", name="开放广场", is_overall=True
+            User(
+                id="user_admin",
+                tenant_id="tenant_demo",
+                username="admin",
+                password_hash="test",
+                role="admin",
             )
         )
-        tool = Tool(
+        # tools 没有 metadata 列 —— 创建人只能由 created_by_user_id 列派生。
+        tool = Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
             id="tool_weather",
             tenant_id="tenant_demo",
             name="weather.forecast",
             display_name="天气查询",
             method="POST",
             url="/api/mock/weather",
+            created_by_user_id="user_admin",
         )
         db.add(tool)
         db.commit()
@@ -332,11 +334,10 @@ def test_open_gallery_tool_read_returns_persisted_creator_metadata() -> None:
             "tool",
             tool.id,
             "active",
-            metadata_json={"creator_name": "admin", "created_by_username": "admin"},
         )
         db.commit()
 
-        rows = list_tools("tenant_demo", bucket=None, agent_id="agent_overall", db=db)
+        rows = list_tools("tenant_demo", bucket=None, agent_id=None, db=db)
 
         assert len(rows) == 1
         assert rows[0].metadata["creator_name"] == "admin"
@@ -346,8 +347,8 @@ def test_open_gallery_tool_read_returns_persisted_creator_metadata() -> None:
 def test_private_tool_is_not_visible_without_employee_scope() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        agent = AgentProfile(id="agent_private", tenant_id="tenant_demo", name="研发员工")
-        tool = Tool(
+        agent = AgentProfile(owner_user_id="user_admin", id="agent_private", tenant_id="tenant_demo", name="研发员工")
+        tool = Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
             id="tool_private",
             tenant_id="tenant_demo",
             name="private.lookup",
@@ -370,16 +371,11 @@ def test_agent_without_tool_binding_does_not_see_open_gallery_tools() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.add(
-            AgentProfile(
-                id="agent_overall", tenant_id="tenant_demo", name="开放广场", is_overall=True
+            AgentProfile(owner_user_id="user_admin",
+                id="agent_branch", tenant_id="tenant_demo", name="研发员工"
             )
         )
-        db.add(
-            AgentProfile(
-                id="agent_branch", tenant_id="tenant_demo", name="研发员工", is_overall=False
-            )
-        )
-        tool = Tool(
+        tool = Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
             id="tool_weather",
             tenant_id="tenant_demo",
             name="weather.forecast",
@@ -400,12 +396,7 @@ def test_agent_without_tool_binding_does_not_see_open_gallery_tools() -> None:
 def test_invalid_agent_id_does_not_fall_back_to_open_gallery_tools() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(
-            AgentProfile(
-                id="agent_overall", tenant_id="tenant_demo", name="开放广场", is_overall=True
-            )
-        )
-        tool = Tool(
+        tool = Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
             id="tool_weather",
             tenant_id="tenant_demo",
             name="weather.forecast",

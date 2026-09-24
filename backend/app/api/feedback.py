@@ -269,7 +269,6 @@ def _get_owned_chat_session(db: Session, tenant_id: str, current_user: User, ses
     if (
         agent
         and agent.tenant_id == tenant_id
-        and not agent.is_overall
         and agent_owned_by_user(agent, current_user)
     ):
         return row
@@ -287,7 +286,7 @@ def _can_view_all_agent_feedback(
     if not agent_id:
         return False
     agent = db.get(AgentProfile, agent_id)
-    if not agent or agent.tenant_id != tenant_id or agent.is_overall:
+    if not agent or agent.tenant_id != tenant_id:
         return False
     return agent_owned_by_user(agent, current_user)
 

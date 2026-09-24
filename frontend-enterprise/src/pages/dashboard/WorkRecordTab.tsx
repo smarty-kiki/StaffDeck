@@ -1115,13 +1115,14 @@ function growthTimeline(
   const events: GrowthEvent[] = [];
 
   sops.forEach((item) => {
-    const evolved = Boolean(item.branch_head_version && item.branch_head_version !== item.branch_base_version);
+    // 分支模型已下线：改用 recent_versions 判断是否存在与当前版本不同的版本，作为「进化」依据。
+    const newerVersion = (item.recent_versions || []).find((version) => version && version !== item.version);
     events.push({
       id: `sop-${item.id}`,
-      kind: evolved ? 'SOP 进化' : '新增 SOP',
+      kind: newerVersion ? 'SOP 进化' : '新增 SOP',
       title: item.name,
-      description: evolved
-        ? `本地版本从 ${item.branch_base_version || item.version} 进化到 ${item.branch_head_version || item.version}`
+      description: newerVersion
+        ? `已有更新版本 ${newerVersion}`
         : `新增 ${item.version} 版业务流程`,
       timestamp: stableGrowthTimestamp(item),
       icon: <StaffdeckIcon name="filter" />,

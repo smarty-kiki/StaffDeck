@@ -1208,10 +1208,8 @@ class AgentLoop:
 
     def _get_persona_prompt(self, tenant_id: str, agent_id: str | None = None) -> str | None:
         agent = self._get_agent_profile(tenant_id, agent_id)
-        if agent and not agent.is_overall:
+        if agent:
             return _agent_identity_prompt(agent)
-        if agent and agent.is_overall and agent.persona_prompt:
-            return agent.persona_prompt
         row = self.db.get(PersonaConfig, tenant_id)
         return row.system_prompt if row else None
 

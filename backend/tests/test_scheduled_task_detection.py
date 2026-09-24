@@ -8,7 +8,7 @@ from app.scheduled_tasks import service as scheduled_service
 def test_model_failure_does_not_create_keyword_based_draft(monkeypatch) -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(AgentProfile(id="agent_demo", tenant_id="tenant_demo", name="客服", is_overall=False))
+        db.add(AgentProfile(owner_user_id="user_admin", id="agent_demo", tenant_id="tenant_demo", name="客服"))
         db.commit()
         monkeypatch.setattr(scheduled_service, "_detect_with_llm", lambda *args, **kwargs: None)
 
@@ -27,7 +27,7 @@ def test_model_failure_does_not_create_keyword_based_draft(monkeypatch) -> None:
 def test_llm_draft_is_used_without_confidence_fallback(monkeypatch) -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(AgentProfile(id="agent_demo", tenant_id="tenant_demo", name="客服", is_overall=False))
+        db.add(AgentProfile(owner_user_id="user_admin", id="agent_demo", tenant_id="tenant_demo", name="客服"))
         db.commit()
 
         monkeypatch.setattr(
@@ -62,7 +62,7 @@ def test_llm_draft_is_used_without_confidence_fallback(monkeypatch) -> None:
 def test_llm_draft_defaults_to_requested_timezone(monkeypatch) -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(AgentProfile(id="agent_demo", tenant_id="tenant_demo", name="客服", is_overall=False))
+        db.add(AgentProfile(owner_user_id="user_admin", id="agent_demo", tenant_id="tenant_demo", name="客服"))
         db.commit()
 
         monkeypatch.setattr(
@@ -97,7 +97,7 @@ def test_llm_draft_defaults_to_requested_timezone(monkeypatch) -> None:
 def test_llm_negative_result_does_not_fallback(monkeypatch) -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(AgentProfile(id="agent_demo", tenant_id="tenant_demo", name="客服", is_overall=False))
+        db.add(AgentProfile(owner_user_id="user_admin", id="agent_demo", tenant_id="tenant_demo", name="客服"))
         db.commit()
 
         monkeypatch.setattr(

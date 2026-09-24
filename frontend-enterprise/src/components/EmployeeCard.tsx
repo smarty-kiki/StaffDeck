@@ -31,10 +31,15 @@ const MENU_ITEM_DANGER_CLASS =
 
 export type EmployeeCardProps = {
   employee: AgentProfileRead;
+  /** 编辑/上下线/删除等写操作：仅归属人。管理员也不能改别人的员工。 */
   canManage: boolean;
+  /** 发布到广场：仅归属人。默认跟随 `canManage`。 */
+  canPublish?: boolean;
+  /** 从广场下架：归属人或管理员。默认跟随 `canManage`。 */
+  canUnpublish?: boolean;
   selected?: boolean;
   busy?: boolean;
-  /** Show the top-right "更多" actions menu. Hidden on the 对话端 gallery. */
+  /** Show the top-right "更多" actions menu. Each item is gated per capability. */
   showMenu?: boolean;
   onOpen: () => void;
   onStatus: (status: 'active' | 'archived') => void;
@@ -49,6 +54,8 @@ export type EmployeeCardProps = {
 export default function EmployeeCard({
   employee,
   canManage,
+  canPublish,
+  canUnpublish,
   selected = false,
   busy = false,
   showMenu = true,
@@ -67,10 +74,14 @@ export default function EmployeeCard({
   const kbCount = resourceCount(employee.resources, 'knowledge_base');
   const galleryPublished = isGalleryEmployee(employee);
   const online = employee.status === 'active';
+  // 发布与下架是两条不同的权限：发布只看归属人，下架归属人或管理员都能做。
+  const allowGalleryAction = galleryPublished
+    ? (canUnpublish ?? canManage)
+    : (canPublish ?? canManage);
 
   // Show raw API values on the card (bypass the SD1 term relabeling in staffdeckDisplayText).
   const rawRoleName = (employee.metadata?.role_name as string | undefined) || profile.roleName;
-  const displayName = employee.is_overall ? '开放广场' : employeeDisplayNameWithCreator(employee);
+  const displayName = employeeDisplayNameWithCreator(employee);
   const displayDescription = employee.description || '暂无描述';
 
   const stats: Array<{ value: number; label: string }> = [
@@ -122,7 +133,7 @@ export default function EmployeeCard({
         {/* Name / role / status */}
         <div className="flex-1 flex flex-col gap-[2px]">
           <strong className="truncate text-[12px] font-bold text-[#18181A]">
-            {employee.is_overall ? displayName : <span data-i18n-ignore>{displayName}</span>}
+            <span data-i18n-ignore>{displayName}</span>
           </strong>
           <span className="truncate text-[10px] text-[#757F9C]">
             {rawRoleName === '待补充岗位' ? rawRoleName : <span data-i18n-ignore>{rawRoleName}</span>}
@@ -200,7 +211,7 @@ export default function EmployeeCard({
             )}
             <DropdownMenuItem
               className={MENU_ITEM_CLASS}
-              disabled={!canManage || busy}
+              disabled={!allowGalleryAction || busy}
               onClick={(event) => event.stopPropagation()}
               onSelect={() => onGallery(!galleryPublished)}
             >

@@ -12,52 +12,54 @@ from sqlalchemy import delete, func, text
 from sqlmodel import Session, select
 
 from app.agents.branching import (
-    ensure_agent_private_knowledge_branch,
+    ensure_knowledge_base_version,
     ensure_open_gallery_binding,
+    ensure_private_resource_binding,
     is_open_gallery_resource,
     knowledge_version_for_upload,
     mark_resource_open_gallery,
     mark_resource_private_for_agent,
     metadata_preserving_creator,
     user_creator_metadata,
-    visible_knowledge_base_versions,
     visible_knowledge_base_version_ids,
+    visible_knowledge_base_versions,
 )
 from app.async_jobs import enqueue_async_job
 from app.db import get_session
 from app.db.models import (
+    AGENT_SCOPE,
+    GALLERY_SCOPE,
+    KnowledgeBase,
+    KnowledgeBaseVersion,
     KnowledgeBucket,
     KnowledgeChunk,
     KnowledgeConcept,
     KnowledgeDiscoverySuggestion,
     KnowledgeDocument,
     KnowledgeIngestJob,
-    KnowledgeBase,
-    KnowledgeBaseVersion,
     ModelConfig,
     User,
     utc_now,
-)
-from app.llm.model_config_resolver import resolve_model_config_for_runtime
-from app.knowledge.schema import (
-    KnowledgeBucketRead,
-    KnowledgeChunkRead,
-    KnowledgeChunkUpdateRequest,
-    KnowledgeDiscoveryRead,
-    KnowledgeDocumentRead,
-    KnowledgeDocumentUpdateRequest,
-    KnowledgeDocumentUploadRequest,
-    KnowledgeBucketUpdateRequest,
-    KnowledgeOkfImportRequest,
-    KnowledgeIngestJobRead,
-    KnowledgeSearchRequest,
-    KnowledgeSearchResponse,
 )
 from app.knowledge.okf import (
     build_okf_for_document,
     create_concept_evidence_rows,
     parse_okf_bundle,
     upsert_concepts,
+)
+from app.knowledge.schema import (
+    KnowledgeBucketRead,
+    KnowledgeBucketUpdateRequest,
+    KnowledgeChunkRead,
+    KnowledgeChunkUpdateRequest,
+    KnowledgeDiscoveryRead,
+    KnowledgeDocumentRead,
+    KnowledgeDocumentUpdateRequest,
+    KnowledgeDocumentUploadRequest,
+    KnowledgeIngestJobRead,
+    KnowledgeOkfImportRequest,
+    KnowledgeSearchRequest,
+    KnowledgeSearchResponse,
 )
 from app.knowledge.service import (
     IngestPayload,
@@ -68,6 +70,7 @@ from app.knowledge.service import (
     chunk_read,
     validate_discovered_skill,
 )
+from app.llm.model_config_resolver import resolve_model_config_for_runtime
 from app.security.auth import ensure_current_user_tenant, get_current_user
 from app.security.permissions import (
     ensure_agent_scope_manager,
@@ -253,16 +256,19 @@ def _resolve_upload_knowledge_base(
             or knowledge_base.status == "archived"
         ):
             raise HTTPException(status_code=404, detail="Knowledge base not found")
-        if not (agent and not agent.is_overall):
+        if not agent:
             _ensure_open_gallery_knowledge_admin(
                 db, request.tenant_id, knowledge_base.id, current_user
             )
         return knowledge_base
 
-    if not (agent and not agent.is_overall):
+    if not agent:
         ensure_open_gallery_admin(request.tenant_id, current_user)
+    private_owner_agent_id = agent.id if agent else None
     base_name = _knowledge_base_name_from_upload(request)
-    name = _unique_knowledge_base_name(db, request.tenant_id, base_name)
+    name = _unique_knowledge_base_name(
+        db, request.tenant_id, base_name, owner_agent_id=private_owner_agent_id
+    )
     knowledge_base = KnowledgeBase(
         tenant_id=request.tenant_id,
         name=name,
@@ -278,15 +284,14 @@ def _resolve_upload_knowledge_base(
     db.add(knowledge_base)
     db.flush()
 
-    if agent and not agent.is_overall:
-        mark_resource_private_for_agent(knowledge_base, agent.id, creator_metadata)
-        ensure_agent_private_knowledge_branch(
-            db,
-            request.tenant_id,
-            agent.id,
-            knowledge_base,
-            metadata_json=creator_metadata,
+    if private_owner_agent_id:
+        mark_resource_private_for_agent(knowledge_base, private_owner_agent_id, creator_metadata)
+        ensure_private_resource_binding(
+            db, request.tenant_id, private_owner_agent_id, "knowledge_base", knowledge_base.id
         )
+        version = ensure_knowledge_base_version(db, knowledge_base)
+        if creator_metadata:
+            version.metadata_json = {**(version.metadata_json or {}), **creator_metadata}
     else:
         mark_resource_open_gallery(knowledge_base, creator_metadata)
         ensure_open_gallery_binding(
@@ -308,11 +313,24 @@ def _knowledge_base_name_from_upload(request: KnowledgeDocumentUploadRequest) ->
     return stem or request.filename.strip() or "未命名知识库"
 
 
-def _unique_knowledge_base_name(db: Session, tenant_id: str, base_name: str) -> str:
+def _unique_knowledge_base_name(
+    db: Session, tenant_id: str, base_name: str, owner_agent_id: str | None = None
+) -> str:
+    """名字在"同一归属内"唯一。
+
+    私有知识库只在所属员工内查重（不同员工可以有同名知识库）；广场知识库在整个
+    租户内查重。
+    """
     normalized_base = base_name.strip() or "未命名知识库"
-    existing_names = set(
-        db.exec(select(KnowledgeBase.name).where(KnowledgeBase.tenant_id == tenant_id)).all()
-    )
+    statement = select(KnowledgeBase.name).where(KnowledgeBase.tenant_id == tenant_id)
+    if owner_agent_id:
+        statement = statement.where(
+            KnowledgeBase.scope == AGENT_SCOPE,
+            KnowledgeBase.owner_agent_id == owner_agent_id,
+        )
+    else:
+        statement = statement.where(KnowledgeBase.scope == GALLERY_SCOPE)
+    existing_names = set(db.exec(statement).all())
     if normalized_base not in existing_names:
         return normalized_base
     index = 2
@@ -476,7 +494,7 @@ def update_document(
         if resolved_agent_id
         else None
     )
-    if agent and not agent.is_overall:
+    if agent:
         version = knowledge_version_for_upload(
             db,
             request.tenant_id,
@@ -1137,19 +1155,15 @@ def _ensure_open_gallery_knowledge_admin(
     knowledge_base_id: str,
     current_user: object | None,
 ) -> None:
+    """知识库写权限：私有知识库归归属员工，广场知识库归管理员。
+
+    归属直接读 `knowledge_bases.scope` / `owner_agent_id` 两列 —— metadata 里那份
+    在归属化改造后已被清除，读它只会永远拿到 None（等于漏判权限）。
+    """
     knowledge_base = db.get(KnowledgeBase, knowledge_base_id)
-    metadata = (
-        knowledge_base.metadata_json
-        if knowledge_base and isinstance(knowledge_base.metadata_json, dict)
-        else {}
-    )
-    owner_agent_id = metadata.get("owner_agent_id")
-    if isinstance(owner_agent_id, str) and owner_agent_id:
-        ensure_agent_scope_manager(db, tenant_id, owner_agent_id, current_user)
+    if knowledge_base is None or knowledge_base.tenant_id != tenant_id:
         return
-    if (
-        knowledge_base
-        and knowledge_base.tenant_id == tenant_id
-        and is_open_gallery_resource(db, tenant_id, "knowledge_base", knowledge_base)
-    ):
+    if is_open_gallery_resource(db, tenant_id, "knowledge_base", knowledge_base):
         ensure_open_gallery_admin(tenant_id, current_user)
+        return
+    ensure_agent_scope_manager(db, tenant_id, knowledge_base.owner_agent_id, current_user)

@@ -2,10 +2,11 @@ import { ApiOutlined, CheckOutlined, ExperimentOutlined, ToolOutlined } from '..
 import type { ReactNode } from 'react';
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { Activity, Copy, FlaskConical, RotateCcw, TerminalSquare, Users, XCircle } from 'lucide-react';
+import { Activity, FlaskConical, RotateCcw, TerminalSquare, XCircle } from 'lucide-react';
 import { pinyin } from 'pinyin-pro';
 
 import { api, TENANT_ID } from '../api/client';
+import { referencedResourceIdSet, replaceReferencedResources, unreferencePlazaResource } from '../api/agentResources';
 import { useToolTest } from '../hooks/useToolTest';
 import { isEnterpriseAdmin, type EnterpriseAuthUser } from '../auth';
 import AppHeader from '@/components/AppHeader';
@@ -18,7 +19,7 @@ import {
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { DataTable, type DataTableColumn } from '@/components/DataTable';
 import { Paginator } from '@/components/Paginator';
-import { ResourceImportDialog } from '@/components/ResourceImportDialog';
+import { ResourceReferenceDialog } from '@/components/ResourceReferenceDialog';
 import { StatCard } from '@/components/StatCard';
 import {
   DropdownMenu,
@@ -62,10 +63,7 @@ import IconTool from '../assets/icons/plaza-tool.svg?react';
 import IconTrash from '../assets/icons/trash.svg?react';
 import {
   canManageEmployeeAgent,
-  openGalleryAgentId,
-  openGalleryImportSourceOptions,
   resourceCreatorName,
-  visibleEmployeeAgents,
 } from '../employee';
 import { useClientPagination } from '../hooks/useClientPagination';
 import { isTeamScope, readEmployeeScope } from '../lib/agent-scope-storage';
@@ -82,7 +80,6 @@ import type {
   MCPSyncResponse,
   MCPAppsMode,
   MCPTransport,
-  MCPDiscoveredTool,
 } from '../types';
 
 type ToolPageProps = {
@@ -90,7 +87,6 @@ type ToolPageProps = {
   onLogout?: () => void;
 };
 
-const ENTERPRISE_AGENT_STORAGE_KEY = 'ultrarag_enterprise_agent_scope';
 const TOOL_PAGE_SIZE = 10;
 export const TOOL_FORM_INITIAL_VALUES = {
   tool_type: 'http' as 'http' | 'a2a' | 'mcp',
@@ -133,19 +129,20 @@ const TRANSPORT_OPTIONS: { value: MCPTransport; label: string; hint: string }[] 
 export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {}) {
   const [rows, setRows] = useState<ToolRead[]>([]);
   const [agentId, setAgentId] = useState(readEmployeeScope);
-  const [isOverallAgent, setIsOverallAgent] = useState(true);
+  const [isPlazaScope, setIsPlazaScope] = useState(true);
   const [agentScopeLoaded, setAgentScopeLoaded] = useState(false);
   const [bucketFilter, setBucketFilter] = useState('__all__');
   const [searchText, setSearchText] = useState('');
   const [loading, setLoading] = useState(false);
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
   const [importOpen, setImportOpen] = useState(false);
-  const [importMode, setImportMode] = useState<'plaza' | 'employee'>('plaza');
-  const [importTargetAgentId, setImportTargetAgentId] = useState('');
-  const [importSourceAgentId, setImportSourceAgentId] = useState('');
   const [importSourceTools, setImportSourceTools] = useState<ToolRead[]>([]);
   const [importSelectedToolIds, setImportSelectedToolIds] = useState<string[]>([]);
   const [importLoading, setImportLoading] = useState(false);
+  // 当前数字员工**引用**（而非自有）的广场工具 id 集合。
+  // 员工可见集 = 自有的（归属即生效）∪ 已引用的广场工具，列表接口不区分来源，
+  // 所以只有拿到这个集合才知道给哪几行挂「取消引用」。
+  const [referencedToolIds, setReferencedToolIds] = useState<string[]>([]);
   const [deleteTarget, setDeleteTarget] = useState<ToolRead | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [servers, setServers] = useState<MCPServerRead[]>([]);
@@ -154,12 +151,17 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
 
-  const pageTitle = isOverallAgent ? '工具广场' : '工具';
-  const listLabel = isOverallAgent ? '工具广场列表' : '员工工具';
   const currentAgent = useMemo(() => agents.find((item) => item.id === agentId), [agents, agentId]);
+  // 广场视图（isPlazaScope）只对管理员开放：非管理员既不加载也不展示工具广场。
+  // 这里优先用已加载的 agents 判定范围，避免切换范围瞬间用旧状态渲染出广场数据。
+  // 注意只挡「广场范围视图」，员工自带工具 / 引用来的工具不受影响。
+  const canViewPlaza = isEnterpriseAdmin(currentUser);
+  const plazaBlocked = !canViewPlaza && isPlazaScope;
+  const pageTitle = isPlazaScope && canViewPlaza ? '工具广场' : '工具';
+  const listLabel = isPlazaScope && canViewPlaza ? '工具广场列表' : '员工工具';
   const canManageCurrentScope = currentAgent
     ? canManageEmployeeAgent(currentAgent, currentUser)
-    : isEnterpriseAdmin(currentUser) && isOverallAgent;
+    : isEnterpriseAdmin(currentUser) && isPlazaScope;
   const canOpenCreateMenu = canManageCurrentScope;
 
   const agentQuery = agentId ? `&agent_id=${encodeURIComponent(agentId)}` : '';
@@ -168,16 +170,29 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
       setRows([]);
       return Promise.resolve();
     }
+    if (plazaBlocked) {
+      // 广场视图只对管理员开放：非管理员不加载广场数据，避免把广场内容渲染出来。
+      setRows([]);
+      setServers([]);
+      setReferencedToolIds([]);
+      return Promise.resolve();
+    }
     setLoading(true);
+    // 引用集合只有员工作用域才有意义（广场自身不做引用），拉取失败降级为空集合。
+    const referencesTask = agentId && !isPlazaScope
+      ? referencedResourceIdSet(agentId, 'tool').catch(() => new Set<string>())
+      : Promise.resolve(new Set<string>());
     return Promise.all([
       api.get<ToolRead[]>(`/api/enterprise/tools?tenant_id=${TENANT_ID}${agentQuery}`),
       api
         .get<MCPServerRead[]>(`/api/enterprise/mcp-servers?tenant_id=${TENANT_ID}`)
         .catch(() => [] as MCPServerRead[]),
+      referencesTask,
     ])
-      .then(([toolRows, serverRows]) => {
+      .then(([toolRows, serverRows, referencedIds]) => {
         setRows(toolRows);
         setServers(serverRows);
+        setReferencedToolIds([...referencedIds]);
       })
       .catch((error) => notify.error(error instanceof Error ? error.message : '加载工具失败'))
       .finally(() => setLoading(false));
@@ -187,7 +202,7 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
     if (!agentScopeLoaded) return;
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agentQuery, agentScopeLoaded]);
+  }, [agentQuery, agentScopeLoaded, isPlazaScope, plazaBlocked]);
 
   useEffect(() => {
     const loadAgentScope = async () => {
@@ -195,14 +210,14 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
         const agents = await api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`);
         setAgents(agents);
         const exactSelectedAgent = agents.find((agent) => agent.id === agentId) || null;
-        const selectedAgent = exactSelectedAgent || agents.find((agent) => agent.is_overall) || null;
-        if (agentId && !exactSelectedAgent) {
-          setAgentId(selectedAgent?.id || '');
+        if (agentId && !exactSelectedAgent && agents.length) {
+          setAgentId('');
         }
-        setIsOverallAgent(Boolean(selectedAgent?.is_overall));
+        // 广场不再是一条「员工」记录：没选中已知员工就是广场视角。
+        setIsPlazaScope(!exactSelectedAgent);
         setAgentScopeLoaded(true);
       } catch {
-        setIsOverallAgent(true);
+        setIsPlazaScope(true);
         setAgentScopeLoaded(true);
       }
     };
@@ -222,15 +237,20 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
     if (searchParams.get('add') !== 'plaza') return;
     if (!agentScopeLoaded) return;
     const resourceId = searchParams.get('resourceId') || undefined;
-    void openImportTools('plaza', resourceId);
+    // 引用只能落到具体的数字员工；广场范围本身不引用别人。
+    if (isPlazaScope) {
+      notify.warning('请先选择一个数字员工，再引用广场工具');
+    } else {
+      void openReferenceTools(resourceId);
+    }
     const next = new URLSearchParams(searchParams);
     next.delete('add');
     next.delete('resourceId');
     setSearchParams(next, { replace: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agentScopeLoaded, isOverallAgent, searchParams, setSearchParams]);
+  }, [agentScopeLoaded, isPlazaScope, searchParams, setSearchParams]);
 
-  const visibleRows = useMemo(() => (isOverallAgent ? rows : rows.filter((row) => row.enabled)), [isOverallAgent, rows]);
+  const visibleRows = useMemo(() => (isPlazaScope ? rows : rows.filter((row) => row.enabled)), [isPlazaScope, rows]);
   const bucketStats = useMemo(() => buildBucketStats(visibleRows), [visibleRows]);
   const bucketSelectOptions = useMemo(
     () => [
@@ -256,7 +276,7 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
     });
   }, [bucketFilter, searchText, visibleRows]);
 
-  const pagination = useClientPagination(filteredRows, TOOL_PAGE_SIZE, `${searchText}|${bucketFilter}|${isOverallAgent}`);
+  const pagination = useClientPagination(filteredRows, TOOL_PAGE_SIZE, `${searchText}|${bucketFilter}|${isPlazaScope}`);
 
   const stats = useMemo(
     () => ({
@@ -277,11 +297,11 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
     return counts;
   }, [rows]);
   const visibleServers = useMemo(
-    () => (isOverallAgent ? servers : servers.filter((row) => agentServerToolCounts.has(row.id))),
-    [agentServerToolCounts, isOverallAgent, servers],
+    () => (isPlazaScope ? servers : servers.filter((row) => agentServerToolCounts.has(row.id))),
+    [agentServerToolCounts, isPlazaScope, servers],
   );
   const serverToolCount = (row: MCPServerRead) =>
-    isOverallAgent ? row.tool_count : agentServerToolCounts.get(row.id) || 0;
+    isPlazaScope ? row.tool_count : agentServerToolCounts.get(row.id) || 0;
 
   async function confirmDelete() {
     const row = deleteTarget;
@@ -290,7 +310,7 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
     try {
       const agentSuffix = agentId ? `&agent_id=${encodeURIComponent(agentId)}` : '';
       await api.delete(`/api/enterprise/tools/${row.id}?tenant_id=${TENANT_ID}${agentSuffix}`);
-      notify.success(isOverallAgent ? '已删除工具' : '已从当前员工移除');
+      notify.success(isPlazaScope ? '已删除工具' : '已从当前员工移除');
       announceEnterpriseCapabilityCatalogChange({
         resourceType: 'tool',
         agentId: agentId || undefined,
@@ -298,7 +318,7 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
       setDeleteTarget(null);
       await load();
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : isOverallAgent ? '删除失败' : '移除失败');
+      notify.error(error instanceof Error ? error.message : isPlazaScope ? '删除失败' : '移除失败');
     } finally {
       setDeleting(false);
     }
@@ -314,11 +334,7 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
       return;
     }
     if (key === 'plaza') {
-      void openImportTools('plaza');
-      return;
-    }
-    if (key === 'employee') {
-      void openImportTools('employee');
+      void openReferenceTools();
     }
   }
 
@@ -330,7 +346,7 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
       await api.delete(
         `/api/enterprise/mcp-servers/${row.id}?tenant_id=${TENANT_ID}${agentQuery}&remove_tools=true`,
       );
-      notify.success(isOverallAgent ? '已删除' : '已从当前员工移除');
+      notify.success(isPlazaScope ? '已删除' : '已从当前员工移除');
       announceEnterpriseCapabilityCatalogChange({
         resourceType: 'tool',
         agentId: agentId || undefined,
@@ -338,133 +354,103 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
       setServerDeleteTarget(null);
       void load();
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : isOverallAgent ? '删除失败' : '移除失败');
+      notify.error(error instanceof Error ? error.message : isPlazaScope ? '删除失败' : '移除失败');
     } finally {
       setDeletingServer(false);
     }
   }
 
-  async function openImportTools(mode: 'plaza' | 'employee' = 'plaza', selectedResourceId?: string) {
+  /** 打开「引用广场工具」对话框：候选永远来自广场，引用到当前数字员工。 */
+  async function openReferenceTools(selectedResourceId?: string) {
     try {
       const agentRows = agents.length
         ? agents
         : await api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`);
       setAgents(agentRows);
-      setImportMode(mode);
-      const targetCandidates = importTargetCandidates(agentRows);
-      const nextTargetAgentId =
-        targetCandidates.find((item) => item.id === agentId)?.id
-        || targetCandidates[0]?.id
-        || '';
-      if (!nextTargetAgentId) {
-        notify.warning('请先创建或选择一个数字员工，再复制工具');
+      if (!agentId) {
+        notify.warning('请先选择一个数字员工，再引用广场工具');
         return;
       }
-      setImportTargetAgentId(nextTargetAgentId);
-      const firstSource = mode === 'plaza'
-        ? openGalleryAgentId(agentRows)
-        : visibleEmployeeAgents(agentRows, currentUser, { activeOnly: true, excludeAgentId: nextTargetAgentId })[0]?.id || '';
-      setImportSourceAgentId(firstSource);
-      setImportSelectedToolIds([]);
       setImportOpen(true);
-      if (firstSource) {
-        const sourceRows = await loadImportSourceTools(firstSource);
-        if (selectedResourceId && sourceRows.some((item) => item.id === selectedResourceId)) {
-          setImportSelectedToolIds([selectedResourceId]);
-        }
-      } else {
-        setImportSourceTools([]);
+      const sourceRows = await loadImportSourceTools();
+      // 提交是「整体替换该类型引用」的语义，所以用当前已引用回填勾选，
+      // 否则没重新勾上的既有引用会在提交时被清掉。
+      const availableIds = new Set(sourceRows.map((item) => item.id));
+      const selected = referencedToolIds.filter((id) => availableIds.has(id));
+      if (selectedResourceId && availableIds.has(selectedResourceId) && !selected.includes(selectedResourceId)) {
+        selected.push(selectedResourceId);
       }
+      setImportSelectedToolIds(selected);
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '加载员工失败');
     }
   }
 
-  async function loadImportSourceTools(sourceAgentId: string): Promise<ToolRead[]> {
+  /** 读取广场里可引用的工具：广场上未启用的工具不可被引用。 */
+  async function loadImportSourceTools(): Promise<ToolRead[]> {
     setImportSourceTools([]);
     setImportSelectedToolIds([]);
-    if (!sourceAgentId) return [];
     try {
+      // 不带 agent_id 就是广场视角 —— 广场不是一条员工记录，而是资源自己的 scope。
       const sourceRows = await api.get<ToolRead[]>(
-        `/api/enterprise/tools?tenant_id=${TENANT_ID}&agent_id=${encodeURIComponent(sourceAgentId)}`,
+        `/api/enterprise/tools?tenant_id=${TENANT_ID}`,
       );
       const enabledRows = sourceRows.filter((item) => item.enabled);
       setImportSourceTools(enabledRows);
       return enabledRows;
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '加载来源工具失败');
+      notify.error(error instanceof Error ? error.message : '加载广场工具失败');
       return [];
     }
   }
 
-  async function submitImportTools() {
-    const targetAgentId = importTargetAgentId || (!isOverallAgent ? agentId : '');
-    if (!targetAgentId) {
-      notify.warning('请选择要复制到的数字员工');
-      return;
-    }
-    if (!importSourceAgentId) {
-      notify.warning(importMode === 'plaza' ? '请选择开放广场' : '请选择复制来源员工');
+  /** 整体写回该员工的工具引用：引用不是复制，工具只有一份、归属其作者。 */
+  async function submitReferenceTools() {
+    if (!agentId) {
+      notify.warning('请先选择一个数字员工');
       return;
     }
     if (importSelectedToolIds.length === 0) {
-      notify.warning('请选择要复制的工具');
+      notify.warning('请选择要引用的工具');
       return;
     }
     setImportLoading(true);
     try {
-      const result = await api.post<{ imported: Array<Record<string, unknown>>; missing: Array<Record<string, unknown>> }>(
-        `/api/enterprise/agents/${targetAgentId}/resources/import`,
-        {
-          tenant_id: TENANT_ID,
-          source_agent_id: importSourceAgentId,
-          resource_type: 'tool',
-          resource_ids: importSelectedToolIds,
-        },
-      );
-      const importedCount = result.imported?.length || 0;
-      const missingCount = result.missing?.length || 0;
-      notify.success(`已复制 ${importedCount} 个工具${missingCount ? `，${missingCount} 个未复制` : ''}`);
+      await replaceReferencedResources(agentId, 'tool', importSelectedToolIds);
+      notify.success(`已引用 ${importSelectedToolIds.length} 个工具`);
       announceEnterpriseCapabilityCatalogChange({
         resourceType: 'tool',
         agentId: agentId || undefined,
       });
       setImportOpen(false);
-      if (targetAgentId !== agentId) {
-        window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, targetAgentId);
-        window.dispatchEvent(new CustomEvent('ultrarag-enterprise-agent-scope-change', { detail: { agentId: targetAgentId } }));
-        setAgentId(targetAgentId);
-      } else {
-        await load();
-      }
+      await load();
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '复制工具失败');
+      notify.error(error instanceof Error ? error.message : '引用失败');
     } finally {
       setImportLoading(false);
     }
   }
 
-  function importTargetCandidates(agentRows: AgentProfileRead[] = agents): AgentProfileRead[] {
-    return agentRows.filter((item) => (
-      !item.is_overall
-      && item.status === 'active'
-      && canManageEmployeeAgent(item, currentUser)
-    ));
-  }
-
-  function handleImportTargetChange(nextTargetAgentId: string) {
-    setImportTargetAgentId(nextTargetAgentId);
-    if (importMode !== 'employee' || importSourceAgentId !== nextTargetAgentId) return;
-    const nextSource = visibleEmployeeAgents(agents, currentUser, {
-      activeOnly: true,
-      excludeAgentId: nextTargetAgentId,
-    })[0]?.id || '';
-    setImportSourceAgentId(nextSource);
-    void loadImportSourceTools(nextSource);
+  /** 取消引用：只删引用行，工具本身、广场与其他员工都不受影响。 */
+  async function unreferenceTool(row: ToolRead) {
+    if (!agentId) return;
+    try {
+      await unreferencePlazaResource(agentId, 'tool', row.id);
+      notify.success('已取消引用');
+      announceEnterpriseCapabilityCatalogChange({
+        resourceType: 'tool',
+        agentId: agentId || undefined,
+      });
+      await load();
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '取消引用失败');
+    }
   }
 
   function renderActions(row: ToolRead) {
     const isMcpChild = row.tool_type === 'mcp' && Boolean(row.mcp_server_id);
+    // 引自广场的工具归属其作者：在当前员工里不能编辑/移除，只能取消引用。
+    const isReferenced = !isPlazaScope && referencedToolIds.includes(row.id);
     return (
       <DropdownMenu>
         <DropdownMenuTrigger
@@ -474,7 +460,7 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
           <IconMore className="size-3.5" />
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end" className={MENU_CONTENT_CLASS}>
-          {canManageCurrentScope && !isMcpChild && (
+          {canManageCurrentScope && !isMcpChild && !isReferenced && (
             <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => navigate(`/enterprise/tools/${row.id}/edit`)}>
               <IconEdit />
               编辑
@@ -484,18 +470,32 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
             <FlaskConical />
             测试
           </DropdownMenuItem>
-          {canManageCurrentScope && !isMcpChild && (
+          {isReferenced ? (
             <>
               <DropdownMenuSeparator className="my-[2px] bg-[#eef0f4]" />
               <DropdownMenuItem
                 variant="destructive"
                 className={MENU_ITEM_DANGER_CLASS}
-                onSelect={() => setDeleteTarget(row)}
+                onSelect={() => void unreferenceTool(row)}
               >
                 <IconTrash />
-                {isOverallAgent ? '删除' : '移除'}
+                取消引用
               </DropdownMenuItem>
             </>
+          ) : (
+            canManageCurrentScope && !isMcpChild && (
+              <>
+                <DropdownMenuSeparator className="my-[2px] bg-[#eef0f4]" />
+                <DropdownMenuItem
+                  variant="destructive"
+                  className={MENU_ITEM_DANGER_CLASS}
+                  onSelect={() => setDeleteTarget(row)}
+                >
+                  <IconTrash />
+                  {isPlazaScope ? '删除' : '移除'}
+                </DropdownMenuItem>
+              </>
+            )
           )}
         </DropdownMenuContent>
       </DropdownMenu>
@@ -664,7 +664,7 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
               onClick={() => setServerDeleteTarget(row)}
               className={cn(RETURN_BUTTON_CLASS, 'text-[#e5484d] hover:text-[#e5484d]')}
             >
-              {isOverallAgent ? '删除' : '移除'}
+              {isPlazaScope ? '删除' : '移除'}
             </UIButton>
           )}
         </div>
@@ -696,9 +696,11 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
     </article>
   );
 
-  const listEmptyText = isOverallAgent
-    ? canManageCurrentScope ? '暂无工具，点击「新增」创建一个吧' : '暂无工具'
-    : '当前员工暂无工具';
+  const listEmptyText = plazaBlocked
+    ? '工具广场仅管理员可查看，请选择一个数字员工查看它的工具'
+    : isPlazaScope
+      ? canManageCurrentScope ? '暂无工具，点击「新增」创建一个吧' : '暂无工具'
+      : '当前员工暂无工具';
 
   if (!agentScopeLoaded) return <CapabilityScopeLoading />;
 
@@ -730,16 +732,10 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
                   新建空白工具
                 </DropdownMenuItem>
               )}
-              {!isOverallAgent && (
+              {!isPlazaScope && (
                 <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => handleCreateAction('plaza')}>
                   <IconTool className="size-[14px]" />
-                  从广场复制
-                </DropdownMenuItem>
-              )}
-              {!isOverallAgent && (
-                <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => handleCreateAction('employee')}>
-                  <FlaskConical />
-                  从数字员工复制
+                  引用广场工具
                 </DropdownMenuItem>
               )}
             </DropdownMenuContent>
@@ -810,7 +806,7 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
                         onClick={() => setServerDeleteTarget(row)}
                         className={cn(RETURN_BUTTON_CLASS, 'text-[#e5484d] hover:text-[#e5484d]')}
                       >
-                        {isOverallAgent ? '删除' : '移除'}
+                        {isPlazaScope ? '删除' : '移除'}
                       </UIButton>
                     )}
                   </div>
@@ -895,21 +891,11 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
         </div>
       </div>
 
-      <ResourceImportDialog
+      <ResourceReferenceDialog
         open={importOpen}
         loading={importLoading}
         icon={<IconTool className="size-[14px] shrink-0" />}
-        title={importMode === 'plaza' ? '从广场复制工具' : '从数字员工复制工具'}
-        targetLabel="复制到"
-        targetPlaceholder="选择目标员工"
-        targets={importTargetCandidates().map((item) => ({ value: item.id, label: item.name }))}
-        targetId={importTargetAgentId}
-        sourcePlaceholder={importMode === 'plaza' ? '选择开放广场' : '选择复制来源'}
-        sources={importMode === 'plaza'
-          ? openGalleryImportSourceOptions(agents, '开放广场')
-          : visibleEmployeeAgents(agents, currentUser, { activeOnly: true, excludeAgentId: importTargetAgentId })
-            .map((item) => ({ value: item.id, label: item.name }))}
-        sourceId={importSourceAgentId}
+        title="引用广场工具"
         itemsLabel="选择工具"
         items={importSourceTools.map((item) => ({
           id: item.id,
@@ -921,33 +907,24 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
           ),
         }))}
         selectedIds={importSelectedToolIds}
-        emptyText="没有可复制的工具"
-        note={
-          importMode === 'plaza'
-            ? '从开放广场复制可用工具；复制后会成为当前员工的本地工具绑定。'
-            : '从数字员工复制可用工具；不可见内容不会出现在列表。'
-        }
-        onTargetChange={handleImportTargetChange}
-        onSourceChange={(value) => {
-          setImportSourceAgentId(value);
-          void loadImportSourceTools(value);
-        }}
+        emptyText="广场暂无可引用的工具"
+        note="引用不是复制：工具只有一份、归属其作者，作者更新后所有引用者立刻生效。"
         onSelectedChange={setImportSelectedToolIds}
         onClose={() => setImportOpen(false)}
-        onSubmit={() => void submitImportTools()}
+        onSubmit={() => void submitReferenceTools()}
       />
 
       <ConfirmDialog
         open={Boolean(deleteTarget)}
         onOpenChange={(open) => !open && setDeleteTarget(null)}
         loading={deleting}
-        title={deleteTarget ? `${isOverallAgent ? '删除' : '移除'}工具「${deleteTarget.display_name || deleteTarget.name}」？` : ''}
+        title={deleteTarget ? `${isPlazaScope ? '删除' : '移除'}工具「${deleteTarget.display_name || deleteTarget.name}」？` : ''}
         description={
-          isOverallAgent
+          isPlazaScope
             ? '删除后，引用该工具的技能将无法继续调用它，操作不可撤销。'
-            : '从当前员工移除后，工具广场中的原始工具不会被删除。'
+            : '取消引用后该工具不再出现在这个员工下，广场与其他员工不受影响。'
         }
-        confirmText={isOverallAgent ? '删除' : '移除'}
+        confirmText={isPlazaScope ? '删除' : '移除'}
         onConfirm={() => void confirmDelete()}
       />
 
@@ -959,15 +936,15 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
         loading={deletingServer}
         title={
           serverDeleteTarget
-            ? `${isOverallAgent ? '删除' : '移除'} MCP 服务器「${serverDeleteTarget.display_name || serverDeleteTarget.name}」？`
+            ? `${isPlazaScope ? '删除' : '移除'} MCP 服务器「${serverDeleteTarget.display_name || serverDeleteTarget.name}」？`
             : ''
         }
         description={
-          isOverallAgent
+          isPlazaScope
             ? `其下 ${serverDeleteTarget ? serverToolCount(serverDeleteTarget) : 0} 个已导入工具将一并删除，操作不可撤销。`
             : `将从当前员工移除该工具集的 ${serverDeleteTarget ? serverToolCount(serverDeleteTarget) : 0} 个工具，工具集本身和其他员工不受影响。`
         }
-        confirmText={isOverallAgent ? '删除' : '移除'}
+        confirmText={isPlazaScope ? '删除' : '移除'}
         onConfirm={() => void confirmDeleteServer()}
       />
     </div>

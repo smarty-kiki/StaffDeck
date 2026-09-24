@@ -15,12 +15,12 @@ import {
   PlayCircleOutlined,
   ReloadOutlined,
   RightOutlined,
-  TeamOutlined,
 } from '../icons';
 import type { HTMLAttributes, ReactNode } from 'react';
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { api, ApiError, TENANT_ID } from '../api/client';
+import { referencedResourceIdSet, replaceReferencedResources, unreferencePlazaResource } from '../api/agentResources';
 import { isEnterpriseAdmin, type EnterpriseAuthUser } from '../auth';
 import AppHeader from '@/components/AppHeader';
 import CapabilityScopeLoading from '@/components/CapabilityScopeLoading';
@@ -34,7 +34,7 @@ import { DataTable, type DataTableColumn } from '@/components/DataTable';
 import KnowledgeGraphCanvas from '@/components/KnowledgeGraphCanvas';
 import { ModelConfigDropdown } from '@/components/ModelConfigDropdown';
 import { Paginator } from '@/components/Paginator';
-import { ResourceImportDialog } from '@/components/ResourceImportDialog';
+import { ResourceReferenceDialog } from '@/components/ResourceReferenceDialog';
 import { StatCard } from '@/components/StatCard';
 import {
   Accordion,
@@ -77,8 +77,6 @@ import IconRefresh from '../assets/icons/refresh.svg?react';
 import IconSearch from '../assets/icons/search.svg?react';
 import {
   canManageEmployeeAgent,
-  openGalleryAgentId,
-  openGalleryImportSourceOptions,
   resourceCreatorName,
   visibleEmployeeAgents,
 } from '../employee';
@@ -158,16 +156,13 @@ function resolveKnowledgeAgentScope(
   currentAgentId: string,
 ): string {
   const currentAgent = rows.find((item) => item.id === currentAgentId);
-  if (currentAgent) {
-    if (!currentAgent.is_overall || isEnterpriseAdmin(currentUser)) return currentAgent.id;
-  }
+  if (currentAgent) return currentAgent.id;
   if (isEnterpriseAdmin(currentUser)) return '';
   return visibleEmployeeAgents(rows, currentUser, { activeOnly: true })[0]?.id || '';
 }
 
 function effectiveKnowledgeAgentId(rows: AgentProfileRead[], agentId: string): string {
-  const agent = rows.find((item) => item.id === agentId);
-  return agent && !agent.is_overall ? agent.id : '';
+  return rows.some((item) => item.id === agentId) ? agentId : '';
 }
 
 export default function KnowledgeManagePage({ currentUser, onLogout }: KnowledgePageProps = {}) {
@@ -181,14 +176,17 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
   const [agentId, setAgentId] = useState(readEmployeeScope);
   const [agentScopeLoaded, setAgentScopeLoaded] = useState(false);
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
-  const [importOpen, setImportOpen] = useState(false);
-  const [importMode, setImportMode] = useState<'plaza' | 'employee'>('plaza');
-  const [importSourceAgentId, setImportSourceAgentId] = useState('');
-  const [importSourceKnowledgeBases, setImportSourceKnowledgeBases] = useState<KnowledgeBaseRead[]>([]);
-  const [importSelectedKnowledgeBaseIds, setImportSelectedKnowledgeBaseIds] = useState<string[]>([]);
-  const [importLoading, setImportLoading] = useState(false);
+  // 引用广场知识库：候选永远来自广场，引用到当前数字员工。
+  const [referenceOpen, setReferenceOpen] = useState(false);
+  const [referencePlazaKnowledgeBases, setReferencePlazaKnowledgeBases] = useState<KnowledgeBaseRead[]>([]);
+  const [referenceSelectedKnowledgeBaseIds, setReferenceSelectedKnowledgeBaseIds] = useState<string[]>([]);
+  const [referenceLoading, setReferenceLoading] = useState(false);
   const [editingKnowledgeBase, setEditingKnowledgeBase] = useState<KnowledgeBaseRead | null>(null);
   const [deleteKbTarget, setDeleteKbTarget] = useState<KnowledgeBaseRead | null>(null);
+  const [unreferenceKbTarget, setUnreferenceKbTarget] = useState<KnowledgeBaseRead | null>(null);
+  // 当前员工**引用**（而非自有）的知识库 id 集合：列表接口不区分来源，
+  // 员工可见集 = 自有的（归属即生效）∪ 已引用的广场知识库，所以「取消引用」要据此判定。
+  const [referencedKnowledgeBaseIds, setReferencedKnowledgeBaseIds] = useState<Set<string>>(() => new Set());
   const [knowledgeBaseDraft, setKnowledgeBaseDraft] = useState({
     name: '',
     description: '',
@@ -235,11 +233,12 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
     : '';
 
   const currentAgent = useMemo(() => agents.find((item) => item.id === agentId), [agents, agentId]);
-  const isOverallAgent = !currentAgent || currentAgent.is_overall;
+  // 广场不再是一条「员工」记录：没选中已知员工就是广场视角。
+  const isPlazaScope = !currentAgent;
   const canManageCurrentScope = currentAgent
     ? canManageEmployeeAgent(currentAgent, currentUser)
     : isEnterpriseAdmin(currentUser);
-  const effectiveAgentId = currentAgent && !currentAgent.is_overall ? agentId : '';
+  const effectiveAgentId = currentAgent ? agentId : '';
   const visibleKnowledgeBases = useMemo(
     () => knowledgeBases.filter((item) => !isEmptyDefaultKnowledgeBase(item)),
     [knowledgeBases],
@@ -263,7 +262,6 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         item.status,
         item.version,
         resourceCreatorName(item),
-        item.branch_sync_state,
         item.document_count,
         item.bucket_count,
         item.chunk_count,
@@ -275,9 +273,9 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
     });
   }, [documentSearch, visibleKnowledgeBases]);
 
-  const pageTitle = isOverallAgent ? '知识库广场' : '知识库';
-  const listLabel = isOverallAgent ? '知识库广场列表' : '知识库列表';
-  const listEmptyText = isOverallAgent ? '暂无知识库，点击「新增」创建一个吧' : '当前员工暂无知识库';
+  const pageTitle = isPlazaScope ? '知识库广场' : '知识库';
+  const listLabel = isPlazaScope ? '知识库广场列表' : '知识库列表';
+  const listEmptyText = isPlazaScope ? '暂无知识库，点击「新增」创建一个吧' : '当前员工暂无知识库';
 
   const stats = useMemo(() => ({
     total: visibleKnowledgeBases.length,
@@ -329,16 +327,16 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
     if (searchParams.get('add') !== 'plaza') return;
     if (agents.length === 0) return;
     const resourceId = searchParams.get('resourceId') || undefined;
-    if (isOverallAgent) {
-      notify.warning('请先选择一个数字员工，再从广场复制知识库');
+    if (isPlazaScope) {
+      notify.warning('请先选择一个数字员工，再从广场引用知识库');
     } else {
-      void openImportKnowledgeBases('plaza', resourceId);
+      void openReferenceKnowledgeBases(resourceId);
     }
     const next = new URLSearchParams(searchParams);
     next.delete('add');
     next.delete('resourceId');
     setSearchParams(next, { replace: true });
-  }, [agents.length, isOverallAgent, searchParams, setSearchParams]);
+  }, [agents.length, isPlazaScope, searchParams, setSearchParams]);
 
   useEffect(() => {
     if (knowledgeBaseFilter !== '__all__' && !visibleKnowledgeBases.some((item) => item.id === knowledgeBaseFilter)) {
@@ -369,6 +367,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
   function clearKnowledgeViewState() {
     setDocuments([]);
     setKnowledgeBases([]);
+    setReferencedKnowledgeBaseIds(new Set());
     setSelectedDocument(null);
     setBuckets([]);
     setOkfConcepts([]);
@@ -406,12 +405,18 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
     setLoading(true);
     try {
       const suffix = scopedAgentId ? `&agent_id=${encodeURIComponent(scopedAgentId)}` : '';
-      const [docRows, kbRows] = await Promise.all([
+      // 引用集合只有员工作用域才有意义（广场自身不做引用），拉取失败降级为空集合，不让整页加载失败。
+      const referencedIdsTask = scopedAgentId
+        ? referencedResourceIdSet(scopedAgentId, 'knowledge_base').catch(() => new Set<string>())
+        : Promise.resolve(new Set<string>());
+      const [docRows, kbRows, referencedIds] = await Promise.all([
         api.get<KnowledgeDocumentRead[]>(`/api/enterprise/knowledge/documents?tenant_id=${TENANT_ID}${suffix}`),
         api.get<KnowledgeBaseRead[]>(`/api/enterprise/knowledge-bases?tenant_id=${TENANT_ID}${suffix}`),
+        referencedIdsTask,
       ]);
       setDocuments(docRows);
       setKnowledgeBases(kbRows);
+      setReferencedKnowledgeBaseIds(referencedIds);
       const scopedDocRows =
         knowledgeBaseFilter === '__all__'
           ? docRows
@@ -533,80 +538,60 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
     }
   }
 
-  async function openImportKnowledgeBases(mode: 'plaza' | 'employee' = 'plaza', selectedResourceId?: string) {
+  /** 打开「引用广场知识库」对话框：候选永远来自广场，引用到当前数字员工。 */
+  async function openReferenceKnowledgeBases(selectedResourceId?: string) {
     try {
-      const agentRows = agents.length ? agents : await api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`);
-      setAgents(agentRows);
-      setImportMode(mode);
-      const firstSource = mode === 'plaza'
-        ? openGalleryAgentId(agentRows)
-        : visibleEmployeeAgents(agentRows, currentUser, { activeOnly: true, excludeAgentId: agentId })[0]?.id || '';
-      setImportSourceAgentId(firstSource);
-      setImportSelectedKnowledgeBaseIds([]);
-      setImportOpen(true);
-      if (firstSource) {
-        const sourceRows = await loadImportSourceKnowledgeBases(firstSource);
-        if (selectedResourceId && sourceRows.some((item) => item.id === selectedResourceId)) {
-          setImportSelectedKnowledgeBaseIds([selectedResourceId]);
-        }
-      } else {
-        setImportSourceKnowledgeBases([]);
+      if (!agents.length) {
+        setAgents(await api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`));
+      }
+      setReferenceSelectedKnowledgeBaseIds([]);
+      setReferenceOpen(true);
+      const plazaRows = await loadPlazaKnowledgeBases();
+      if (selectedResourceId && plazaRows.some((item) => item.id === selectedResourceId)) {
+        setReferenceSelectedKnowledgeBaseIds([selectedResourceId]);
       }
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '加载员工失败');
+      notify.error(error instanceof Error ? error.message : '加载广场知识库失败');
     }
   }
 
-  async function loadImportSourceKnowledgeBases(sourceAgentId: string): Promise<KnowledgeBaseRead[]> {
-    setImportSourceKnowledgeBases([]);
-    setImportSelectedKnowledgeBaseIds([]);
-    if (!sourceAgentId) return [];
+  /** 读取广场上可引用的知识库（只有在线的可以被引用）。 */
+  async function loadPlazaKnowledgeBases(): Promise<KnowledgeBaseRead[]> {
+    setReferencePlazaKnowledgeBases([]);
     try {
+      // 不带 agent_id 就是广场视角 —— 广场不是一条员工记录，而是资源自己的 scope。
       const rows = await api.get<KnowledgeBaseRead[]>(
-        `/api/enterprise/knowledge-bases?tenant_id=${TENANT_ID}&agent_id=${encodeURIComponent(sourceAgentId)}`,
+        `/api/enterprise/knowledge-bases?tenant_id=${TENANT_ID}`,
       );
       const activeRows = rows.filter((item) => item.status === 'active');
-      setImportSourceKnowledgeBases(activeRows);
+      setReferencePlazaKnowledgeBases(activeRows);
       return activeRows;
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '加载来源知识库失败');
+      notify.error(error instanceof Error ? error.message : '加载广场知识库失败');
       return [];
     }
   }
 
-  async function submitImportKnowledgeBases() {
+  /** 整体写回该员工的知识库引用：引用不是复制，资源只有一份、归属其作者。 */
+  async function submitReferenceKnowledgeBases() {
     if (!agentId) {
       notify.warning('请先选择一个数字员工');
       return;
     }
-    if (!importSourceAgentId) {
-      notify.warning(importMode === 'plaza' ? '请选择开放广场' : '请选择来源员工');
+    if (referenceSelectedKnowledgeBaseIds.length === 0) {
+      notify.warning('请选择要引用的知识库');
       return;
     }
-    if (importSelectedKnowledgeBaseIds.length === 0) {
-      notify.warning('请选择要复制的知识库');
-      return;
-    }
-    setImportLoading(true);
+    setReferenceLoading(true);
     try {
-      const result = await api.post<{ imported: Array<Record<string, unknown>>; missing: Array<Record<string, unknown>> }>(
-        `/api/enterprise/agents/${agentId}/resources/import`,
-        {
-          tenant_id: TENANT_ID,
-          source_agent_id: importSourceAgentId,
-          resource_type: 'knowledge_base',
-          resource_ids: importSelectedKnowledgeBaseIds,
-        },
-      );
-      const importedCount = result.imported?.length || 0;
-      const missingCount = result.missing?.length || 0;
-      notify.success(`已复制 ${importedCount} 个知识库${missingCount ? `，${missingCount} 个未复制` : ''}`);
-      setImportOpen(false);
+      await replaceReferencedResources(agentId, 'knowledge_base', referenceSelectedKnowledgeBaseIds);
+      notify.success(`已引用 ${referenceSelectedKnowledgeBaseIds.length} 个知识库`);
+      setReferenceOpen(false);
       await refresh();
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '复制知识库失败');
+      notify.error(error instanceof Error ? error.message : '引用知识库失败');
     } finally {
-      setImportLoading(false);
+      setReferenceLoading(false);
     }
   }
 
@@ -620,11 +605,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       return;
     }
     if (key === 'plaza') {
-      void openImportKnowledgeBases('plaza');
-      return;
-    }
-    if (key === 'employee') {
-      void openImportKnowledgeBases('employee');
+      void openReferenceKnowledgeBases();
     }
   }
 
@@ -788,15 +769,27 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
   async function runDeleteKnowledgeBase() {
     const row = deleteKbTarget;
     if (!row) return;
-    const branchMode = !isOverallAgent;
-    const suffix = effectiveAgentId ? `&agent_id=${encodeURIComponent(effectiveAgentId)}` : '';
     try {
-      await api.delete(`/api/enterprise/knowledge-bases/${row.id}?tenant_id=${TENANT_ID}${suffix}`);
-      notify.success(branchMode ? '已移除知识库' : '已删除知识库');
+      await api.delete(`/api/enterprise/knowledge-bases/${row.id}?tenant_id=${TENANT_ID}`);
+      notify.success('已删除知识库');
       setDeleteKbTarget(null);
       await refresh();
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '删除失败');
+    }
+  }
+
+  /** 取消引用：只删引用行，知识库本身、其他员工与广场都不受影响。 */
+  async function runUnreferenceKnowledgeBase() {
+    const row = unreferenceKbTarget;
+    if (!row || !agentId) return;
+    try {
+      await unreferencePlazaResource(agentId, 'knowledge_base', row.id);
+      notify.success('已取消引用');
+      setUnreferenceKbTarget(null);
+      await refresh();
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '取消引用失败');
     }
   }
 
@@ -810,34 +803,6 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       setKnowledgeBaseVersions(versions);
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '加载版本失败');
-    }
-  }
-
-  async function syncKnowledgeBaseFromOverall(row: KnowledgeBaseRead) {
-    if (!agentId) {
-      notify.warning('请先选择员工');
-      return;
-    }
-    try {
-      await api.post(`/api/enterprise/knowledge-bases/${row.id}/sync-from-overall?tenant_id=${TENANT_ID}&agent_id=${encodeURIComponent(agentId)}`);
-      notify.success('已从广场同步');
-      await refresh();
-    } catch (error) {
-      notify.error(error instanceof Error ? error.message : '同步失败');
-    }
-  }
-
-  async function promoteKnowledgeBaseToOverall(row: KnowledgeBaseRead) {
-    if (!agentId) {
-      notify.warning('请先选择员工');
-      return;
-    }
-    try {
-      await api.post(`/api/enterprise/knowledge-bases/${row.id}/promote-to-overall?tenant_id=${TENANT_ID}&agent_id=${encodeURIComponent(agentId)}`);
-      notify.success('已发布到广场');
-      await refresh();
-    } catch (error) {
-      notify.error(error instanceof Error ? error.message : '推送失败');
     }
   }
 
@@ -941,6 +906,14 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
     }
   }
 
+  /**
+   * 该行是否为「引用来的广场知识库」。
+   * 员工可见集不区分来源，必须问引用集合才能区分：自有知识库（归属即生效）不该出现「取消引用」。
+   */
+  function isReferencedKnowledgeBase(id: string): boolean {
+    return Boolean(agentId) && !isPlazaScope && referencedKnowledgeBaseIds.has(id);
+  }
+
   function renderKnowledgeBaseActions(item: KnowledgeBaseRead) {
     return (
       <DropdownMenu>
@@ -970,36 +943,32 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
             <AuditOutlined />
             知识图谱检查
           </DropdownMenuItem>
-          {!isOverallAgent && (
-            <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void syncKnowledgeBaseFromOverall(item)}>
-              从广场同步
-            </DropdownMenuItem>
-          )}
-          {!isOverallAgent && (
-            <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void promoteKnowledgeBaseToOverall(item)}>
-              发布到广场
-            </DropdownMenuItem>
-          )}
-          {canManageCurrentScope && (
-            <>
-              {item.status === 'archived' ? (
-                <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void setKnowledgeBaseStatus(item, true)}>
-                  <PlayCircleOutlined />
-                  上线
+          {isPlazaScope
+            ? canManageCurrentScope && (
+              <>
+                {item.status === 'archived' ? (
+                  <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void setKnowledgeBaseStatus(item, true)}>
+                    <PlayCircleOutlined />
+                    上线
+                  </DropdownMenuItem>
+                ) : (
+                  <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void setKnowledgeBaseStatus(item, false)}>
+                    <PauseCircleOutlined />
+                    下线
+                  </DropdownMenuItem>
+                )}
+                <DropdownMenuSeparator className="my-[2px] bg-[#eef0f4]" />
+                <DropdownMenuItem variant="destructive" className={MENU_ITEM_DANGER_CLASS} onSelect={() => deleteKnowledgeBase(item)}>
+                  <DeleteOutlined />
+                  删除
                 </DropdownMenuItem>
-              ) : (
-                <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void setKnowledgeBaseStatus(item, false)}>
-                  <PauseCircleOutlined />
-                  下线
-                </DropdownMenuItem>
-              )}
-              <DropdownMenuSeparator className="my-[2px] bg-[#eef0f4]" />
-              <DropdownMenuItem variant="destructive" className={MENU_ITEM_DANGER_CLASS} onSelect={() => deleteKnowledgeBase(item)}>
-                <DeleteOutlined />
-                {isOverallAgent ? '删除' : '移除'}
+              </>
+            )
+            : canManageCurrentScope && isReferencedKnowledgeBase(item.id) && (
+              <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => setUnreferenceKbTarget(item)}>
+                取消引用
               </DropdownMenuItem>
-            </>
-          )}
+            )}
         </DropdownMenuContent>
       </DropdownMenu>
     );
@@ -1102,7 +1071,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         onLogout={onLogout}
         userName={currentUser?.username}
         title={pageTitle}
-        description={isOverallAgent
+        description={isPlazaScope
           ? '维护知识库广场中的知识库、知识图谱与检索调试。'
           : '维护当前数字员工的知识库、知识图谱与检索调试。'}
       />
@@ -1133,16 +1102,10 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
                 <FileMarkdownOutlined />
                 导入知识库备份包
               </DropdownMenuItem>
-              {!isOverallAgent && (
+              {!isPlazaScope && (
                 <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => handleCreateAction('plaza')}>
                   <DownloadOutlined />
-                  从广场复制
-                </DropdownMenuItem>
-              )}
-              {!isOverallAgent && (
-                <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => handleCreateAction('employee')}>
-                  <TeamOutlined />
-                  从数字员工复制
+                  引用广场知识库
                 </DropdownMenuItem>
               )}
             </DropdownMenuContent>
@@ -1281,19 +1244,13 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         </KCard>
       </div>
 
-      <ResourceImportDialog
-        open={importOpen}
-        loading={importLoading}
+      <ResourceReferenceDialog
+        open={referenceOpen}
+        loading={referenceLoading}
         icon={<DatabaseOutlined />}
-        title={importMode === 'plaza' ? '从广场复制知识库' : '从数字员工复制知识库'}
-        sourcePlaceholder={importMode === 'plaza' ? '选择开放广场' : '选择来源员工'}
-        sources={importMode === 'plaza'
-          ? openGalleryImportSourceOptions(agents, '开放广场')
-          : visibleEmployeeAgents(agents, currentUser, { activeOnly: true, excludeAgentId: agentId })
-            .map((item) => ({ value: item.id, label: item.name }))}
-        sourceId={importSourceAgentId}
+        title="引用广场知识库"
         itemsLabel="选择知识库"
-        items={importSourceKnowledgeBases.map((item) => ({
+        items={referencePlazaKnowledgeBases.map((item) => ({
           id: item.id,
           label: (
             <>
@@ -1302,19 +1259,13 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
             </>
           ),
         }))}
-        selectedIds={importSelectedKnowledgeBaseIds}
-        emptyText="没有可复制的知识库"
-        note={importMode === 'plaza'
-          ? '从开放广场复制可用知识库；不可复制内容不会出现在列表。'
-          : '从数字员工复制可用知识库；不可见内容不会出现在列表。'}
-        submitText="复制"
-        onSourceChange={(value) => {
-          setImportSourceAgentId(value);
-          void loadImportSourceKnowledgeBases(value);
-        }}
-        onSelectedChange={setImportSelectedKnowledgeBaseIds}
-        onClose={() => setImportOpen(false)}
-        onSubmit={() => void submitImportKnowledgeBases()}
+        selectedIds={referenceSelectedKnowledgeBaseIds}
+        emptyText="没有可引用的知识库"
+        note="引用不是复制：知识库只有一份、归属其作者，作者更新后所有引用者立刻生效。"
+        submitText="引用"
+        onSelectedChange={setReferenceSelectedKnowledgeBaseIds}
+        onClose={() => setReferenceOpen(false)}
+        onSubmit={() => void submitReferenceKnowledgeBases()}
       />
       <KDialog open={okfImportOpen} title="导入知识库备份包" onClose={() => setOkfImportOpen(false)}>
         <FileDropzone
@@ -1545,7 +1496,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
               title: '操作',
               width: 96,
               render: (row) =>
-                !isOverallAgent && !row.is_head ? (
+                !isPlazaScope && !row.is_head ? (
                   <UIButton variant="outline" size="sm" onClick={() => void rollbackKnowledgeBaseVersion(row)}>
                     回滚
                   </UIButton>
@@ -1692,12 +1643,19 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       <ConfirmDialog
         open={Boolean(deleteKbTarget)}
         onOpenChange={(open) => !open && setDeleteKbTarget(null)}
-        title={deleteKbTarget ? `${isOverallAgent ? '删除' : '移除'}知识库：${deleteKbTarget.name}` : ''}
-        description={!isOverallAgent
-          ? '这只会在当前数字员工中隐藏该知识库；开放广场和其他数字员工仍然保留。'
-          : '开放广场会永久删除该知识库及其文档、内部索引、引用来源和版本记录。'}
-        confirmText={isOverallAgent ? '删除' : '移除'}
+        title={deleteKbTarget ? `删除知识库：${deleteKbTarget.name}` : ''}
+        description="开放广场会永久删除该知识库及其文档、内部索引、引用来源和版本记录，所有引用它的数字员工会同时失去该知识库。"
+        confirmText="删除"
         onConfirm={() => void runDeleteKnowledgeBase()}
+      />
+
+      <ConfirmDialog
+        open={Boolean(unreferenceKbTarget)}
+        onOpenChange={(open) => !open && setUnreferenceKbTarget(null)}
+        title={unreferenceKbTarget ? `取消引用知识库：${unreferenceKbTarget.name}` : ''}
+        description="取消引用后该知识库不再出现在这个员工下，广场与其他员工不受影响。"
+        confirmText="取消引用"
+        onConfirm={() => void runUnreferenceKnowledgeBase()}
       />
     </div>
   );

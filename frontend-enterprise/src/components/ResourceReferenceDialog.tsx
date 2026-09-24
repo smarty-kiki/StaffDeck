@@ -1,6 +1,4 @@
-import { useEffect } from 'react';
 import type { ReactNode } from 'react';
-import { ChevronDown } from 'lucide-react';
 
 import {
   Checkbox,
@@ -17,10 +15,10 @@ import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import { SELECT_TRIGGER_CLASS } from '@/lib/enterprise-ui';
 
-export type ImportSourceOption = { value: string; label: string };
-export type ImportChoiceItem = { id: string; label: ReactNode };
+export type ReferenceTargetOption = { value: string; label: string };
+export type ReferenceChoiceItem = { id: string; label: ReactNode };
 
-export type ResourceImportDialogProps = {
+export type ResourceReferenceDialogProps = {
   open: boolean;
   loading: boolean;
   /** Header icon (14px). */
@@ -29,66 +27,50 @@ export type ResourceImportDialogProps = {
   /** Optional target select for flows where the destination is not implied by page scope. */
   targetPlaceholder?: string;
   targetLabel?: string;
-  targets?: ImportSourceOption[];
+  targets?: ReferenceTargetOption[];
   targetId?: string;
-  /** Placeholder for the "copy source" select. */
-  sourcePlaceholder: string;
-  sources: ImportSourceOption[];
-  sourceId: string;
   /** Caption above the checkbox list, e.g. "选择 SOP" / "选择技能". */
   itemsLabel: string;
-  items: ImportChoiceItem[];
+  items: ReferenceChoiceItem[];
   selectedIds: string[];
-  /** Shown when a source is selected but has no importable items. */
+  /** Shown when the plaza has no referable items. */
   emptyText: string;
-  /** Shown before any source is selected. Defaults to "请先选择复制来源". */
-  emptySourceText?: string;
   /** Explanatory footer note. */
   note: ReactNode;
   submitText?: string;
   onTargetChange?: (value: string) => void;
-  onSourceChange: (value: string) => void;
   onSelectedChange: (ids: string[]) => void;
   onClose: () => void;
   onSubmit: () => void;
 };
 
 /**
- * Generic "copy resources from another scope" dialog shared by the SOP and 技能
- * pages: a copy-source select plus a checkbox list of importable resources.
+ * 「引用广场资源到某个员工」对话框。
+ *
+ * 只从**广场**取资源：私有资源归属即生效，不能被别人引用。勾选 = 建立引用行，
+ * 作者之后更新资源，所有引用者立刻看到最新内容（不是复制）。
  */
-export function ResourceImportDialog({
+export function ResourceReferenceDialog({
   open,
   loading,
   icon,
   title,
   targetPlaceholder,
-  targetLabel = '复制到',
+  targetLabel = '引用到',
   targets,
   targetId,
-  sourcePlaceholder,
-  sources,
-  sourceId,
   itemsLabel,
   items,
   selectedIds,
   emptyText,
-  emptySourceText = '请先选择复制来源',
   note,
-  submitText = '复制',
+  submitText = '引用',
   onTargetChange,
-  onSourceChange,
   onSelectedChange,
   onClose,
   onSubmit,
-}: ResourceImportDialogProps) {
+}: ResourceReferenceDialogProps) {
   const showTargetSelect = Boolean(targets && onTargetChange);
-  const effectiveSourceId = sourceId || (sources.length === 1 ? sources[0].value : '');
-
-  useEffect(() => {
-    if (!open || sourceId || sources.length !== 1) return;
-    onSourceChange(sources[0].value);
-  }, [onSourceChange, open, sourceId, sources]);
 
   const toggle = (id: string, checked: boolean) => {
     onSelectedChange(checked ? [...selectedIds, id] : selectedIds.filter((value) => value !== id));
@@ -126,36 +108,10 @@ export function ResourceImportDialog({
           )}
 
           <div className="flex flex-col gap-[6px]">
-            <span className="text-[11px] font-semibold text-[#858b9c]">复制来源</span>
-            <div className="relative">
-              <select
-                value={effectiveSourceId}
-                onChange={(event) => onSourceChange(event.target.value)}
-                className={cn(
-                  SELECT_TRIGGER_CLASS,
-                  'w-full appearance-none px-3 pr-9 outline-none disabled:cursor-not-allowed disabled:opacity-60'
-                )}
-              >
-                <option value="" disabled>
-                  {sourcePlaceholder}
-                </option>
-                {sources.map((item) => (
-                  <option key={item.value} value={item.value}>
-                    {item.label}
-                  </option>
-                ))}
-              </select>
-              <ChevronDown className="pointer-events-none absolute right-3 top-1/2 size-4 -translate-y-1/2 text-[#858b9c]" />
-            </div>
-          </div>
-
-          <div className="flex flex-col gap-[6px]">
             <span className="text-[11px] font-semibold text-[#858b9c]">{itemsLabel}</span>
             <div className="max-h-[300px] overflow-y-auto rounded-[10px] border border-[#eef0f4] p-[6px]">
               {items.length === 0 ? (
-                <div className="py-[28px] text-center text-[12px] text-[#858b9c]">
-                  {sourceId ? emptyText : emptySourceText}
-                </div>
+                <div className="py-[28px] text-center text-[12px] text-[#858b9c]">{emptyText}</div>
               ) : (
                 items.map((item) => (
                   <label

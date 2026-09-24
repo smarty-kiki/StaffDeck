@@ -66,7 +66,7 @@ def _seed(db: Session) -> dict[str, User]:
     )
     db.add_all([admin, owner, member, wechat_user])
     db.add(
-        AgentProfile(
+        AgentProfile(owner_user_id=owner.id,
             id="agent_emp",
             tenant_id="tenant_demo",
             name="客服员工",
@@ -74,11 +74,10 @@ def _seed(db: Session) -> dict[str, User]:
         )
     )
     db.add(
-        AgentProfile(
-            id="agent_overall",
+        AgentProfile(owner_user_id="user_admin",
+            id="agent_admin_owned",
             tenant_id="tenant_demo",
-            name="整体智能体",
-            is_overall=True,
+            name="管理员名下员工",
             metadata_json={},
         )
     )
@@ -111,11 +110,11 @@ def _seed(db: Session) -> dict[str, User]:
                 slots_json={"step": "1"},
             ),
             ChatSession(
-                id="session_overall",
+                id="session_admin_agent",
                 tenant_id="tenant_demo",
                 user_id=member.id,
-                agent_id="agent_overall",
-                title="整体员工会话",
+                agent_id="agent_admin_owned",
+                title="管理员名下员工的会话",
             ),
         ]
     )
@@ -187,24 +186,24 @@ def test_enterprise_logs_keep_pilotdeck_sessions_visible() -> None:
         assert {row["id"] for row in rows} == {"session_member", "session_pilotdeck_log"}
 
 
-def test_overall_agent_never_opens_to_non_admin() -> None:
+def test_other_owners_employee_sessions_only_open_to_admin() -> None:
     with _test_session() as db:
         users = _seed(db)
-        # member 即使提供 agent_id 也仅见自己的整体员工会话
+        # member 即便提供了该 agent_id，也只看得到自己发起的会话。
         member_rows = list_sessions(
-            "tenant_demo", agent_id="agent_overall", current_user=users["member"], db=db
+            "tenant_demo", agent_id="agent_admin_owned", current_user=users["member"], db=db
         )
-        assert [row["id"] for row in member_rows] == ["session_overall"]
-        # owner 不是整体员工创建者(is_overall 创建者永不匹配),没有自己的会话则为空
+        assert [row["id"] for row in member_rows] == ["session_admin_agent"]
+        # owner 不是这个员工的归属人，没有自己的会话就是空。
         owner_rows = list_sessions(
-            "tenant_demo", agent_id="agent_overall", current_user=users["owner"], db=db
+            "tenant_demo", agent_id="agent_admin_owned", current_user=users["owner"], db=db
         )
         assert owner_rows == []
-        # admin 可见全部整体员工会话
+        # admin 可见该员工的全部会话。
         admin_rows = list_sessions(
-            "tenant_demo", agent_id="agent_overall", current_user=users["admin"], db=db
+            "tenant_demo", agent_id="agent_admin_owned", current_user=users["admin"], db=db
         )
-        assert [row["id"] for row in admin_rows] == ["session_overall"]
+        assert [row["id"] for row in admin_rows] == ["session_admin_agent"]
 
 
 def test_detail_allowed_for_owner_admin_and_agent_creator() -> None:
@@ -485,7 +484,7 @@ def test_feedback_scope_matches_agent_session_visibility(monkeypatch: pytest.Mon
                 Message(
                     id="msg_overall_assistant",
                     tenant_id="tenant_demo",
-                    session_id="session_overall",
+                    session_id="session_admin_agent",
                     role="assistant",
                     content="overall answer",
                 ),
@@ -508,7 +507,7 @@ def test_feedback_scope_matches_agent_session_visibility(monkeypatch: pytest.Mon
                 MessageFeedback(
                     id="feedback_overall",
                     tenant_id="tenant_demo",
-                    session_id="session_overall",
+                    session_id="session_admin_agent",
                     message_id="msg_overall_assistant",
                     user_id=users["member"].id,
                     rating="down",
@@ -559,7 +558,7 @@ def test_feedback_scope_matches_agent_session_visibility(monkeypatch: pytest.Mon
         assert member_error.value.status_code == 404
         with pytest.raises(HTTPException) as overall_error:
             get_feedback_session_detail(
-                "session_overall",
+                "session_admin_agent",
                 "tenant_demo",
                 current_user=users["owner"],
                 db=db,

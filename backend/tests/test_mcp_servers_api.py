@@ -18,8 +18,8 @@ from app.api.tools import (
     list_tools,
     sync_mcp_tools,
 )
-from app.db.models import MCPServer, Tenant, Tool, User
-from app.db.models import AgentProfile, AgentResourceBinding
+from app.db.models import GALLERY_SCOPE, MCPServer, Tenant, Tool, User
+from app.db.models import AgentProfile, AgentResourceReference
 from app.tools.tool_executor import ToolExecutor
 from app.tools.mcp_client import (
     MCPClientError,
@@ -38,11 +38,33 @@ from app.tools.tool_schema import (
 
 
 def _admin_user() -> User:
-    return User(id="user_admin", tenant_id="tenant_demo", username="ops", role="admin", password_hash="test")
+    return User(
+        id="user_admin", tenant_id="tenant_demo", username="ops", role="admin", password_hash="test"
+    )
 
 
 def _member_user() -> User:
-    return User(id="user_member", tenant_id="tenant_demo", username="member", role="member", password_hash="test")
+    return User(
+        id="user_member",
+        tenant_id="tenant_demo",
+        username="member",
+        role="member",
+        password_hash="test",
+    )
+
+
+def _reference_count(db: Session, agent_id: str, tool_id: str) -> int:
+    """某员工对某个工具的引用行数（引用行的存在即可见）。"""
+    return len(
+        db.exec(
+            select(AgentResourceReference).where(
+                AgentResourceReference.tenant_id == "tenant_demo",
+                AgentResourceReference.agent_id == agent_id,
+                AgentResourceReference.resource_type == "tool",
+                AgentResourceReference.resource_id == tool_id,
+            )
+        ).all()
+    )
 
 
 def test_discover_builtin_mcp_server_lists_tools() -> None:
@@ -162,14 +184,6 @@ def test_mcp_app_resource_limit_is_ten_mib() -> None:
 def test_synced_mcp_app_renders_and_calls_read_only_tool() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(
-            AgentProfile(
-                id="agent_overall",
-                tenant_id="tenant_demo",
-                name="整体智能体",
-                is_overall=True,
-            )
-        )
         db.commit()
         server = create_mcp_server(
             MCPServerCreateRequest(
@@ -203,7 +217,7 @@ def test_synced_mcp_app_renders_and_calls_read_only_tool() -> None:
         result = ToolExecutor(db).execute(
             "tenant_demo",
             ToolCall(name="apps_demo.render_card", arguments={"message": "hello"}),
-            agent_id="agent_overall",
+            agent_id=None,
             session_id="session_demo",
         )
         assert result.success is True
@@ -215,7 +229,7 @@ def test_synced_mcp_app_renders_and_calls_read_only_tool() -> None:
             server.id,
             "tenant_demo",
             "ui://staffdeck/demo-card",
-            "agent_overall",
+            None,
             db,
             _admin_user(),
         )
@@ -228,7 +242,7 @@ def test_synced_mcp_app_renders_and_calls_read_only_tool() -> None:
                 tenant_id="tenant_demo",
                 tool_name="render_card",
                 arguments={"message": "from app"},
-                agent_id="agent_overall",
+                agent_id=None,
             ),
             db,
             _admin_user(),
@@ -242,14 +256,6 @@ def test_synced_mcp_app_renders_and_calls_read_only_tool() -> None:
 def test_mcp_app_side_effect_call_requires_confirmation() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(
-            AgentProfile(
-                id="agent_overall",
-                tenant_id="tenant_demo",
-                name="整体智能体",
-                is_overall=True,
-            )
-        )
         server = MCPServer(
             id="server_apps_write",
             tenant_id="tenant_demo",
@@ -261,7 +267,7 @@ def test_mcp_app_side_effect_call_requires_confirmation() -> None:
             enabled=True,
         )
         db.add(server)
-        tool = Tool(
+        tool = Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
             id="tool_apps_write",
             tenant_id="tenant_demo",
             name="apps_write.render_card",
@@ -281,15 +287,6 @@ def test_mcp_app_side_effect_call_requires_confirmation() -> None:
             enabled=True,
         )
         db.add(tool)
-        db.add(
-            AgentResourceBinding(
-                tenant_id="tenant_demo",
-                agent_id="agent_overall",
-                resource_type="tool",
-                resource_id=tool.id,
-                status="active",
-            )
-        )
         db.commit()
 
         response = call_mcp_app_tool(
@@ -298,7 +295,7 @@ def test_mcp_app_side_effect_call_requires_confirmation() -> None:
                 tenant_id="tenant_demo",
                 tool_name="render_card",
                 arguments={"message": "write"},
-                agent_id="agent_overall",
+                agent_id=None,
             ),
             db,
             _admin_user(),
@@ -311,14 +308,6 @@ def test_mcp_app_side_effect_call_requires_confirmation() -> None:
 def test_mcp_app_sop_specific_call_requires_active_sop() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(
-            AgentProfile(
-                id="agent_overall",
-                tenant_id="tenant_demo",
-                name="整体智能体",
-                is_overall=True,
-            )
-        )
         server = MCPServer(
             id="server_apps_sop",
             tenant_id="tenant_demo",
@@ -330,7 +319,7 @@ def test_mcp_app_sop_specific_call_requires_active_sop() -> None:
             enabled=True,
         )
         db.add(server)
-        tool = Tool(
+        tool = Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
             id="tool_apps_sop",
             tenant_id="tenant_demo",
             name="apps_sop.render_card",
@@ -352,15 +341,6 @@ def test_mcp_app_sop_specific_call_requires_active_sop() -> None:
             enabled=True,
         )
         db.add(tool)
-        db.add(
-            AgentResourceBinding(
-                tenant_id="tenant_demo",
-                agent_id="agent_overall",
-                resource_type="tool",
-                resource_id=tool.id,
-                status="active",
-            )
-        )
         db.commit()
 
         with pytest.raises(HTTPException) as exc_info:
@@ -370,7 +350,7 @@ def test_mcp_app_sop_specific_call_requires_active_sop() -> None:
                     tenant_id="tenant_demo",
                     tool_name="render_card",
                     arguments={"message": "read"},
-                    agent_id="agent_overall",
+                    agent_id=None,
                 ),
                 db,
                 _admin_user(),
@@ -382,7 +362,6 @@ def test_mcp_app_sop_specific_call_requires_active_sop() -> None:
 def test_sync_mcp_tools_imports_tools_and_executes() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(AgentProfile(id="agent_overall", tenant_id="tenant_demo", name="整体智能体", is_overall=True))
         db.commit()
 
         server = create_mcp_server(
@@ -416,17 +395,22 @@ def test_sync_mcp_tools_imports_tools_and_executes() -> None:
         # display_name 应为工具名（leaf），不能是描述文本（否则列表里名字/描述会叠加）。
         assert imported.display_name == "echo"
         assert imported.description and imported.description != imported.display_name
-        # 同步的工具应建立 open gallery 绑定，才能在工具广场列表中可见。
-        binding = db.exec(
-            select(AgentResourceBinding).where(
-                AgentResourceBinding.tenant_id == "tenant_demo",
-                AgentResourceBinding.resource_type == "tool",
-                AgentResourceBinding.resource_id == imported.id,
-            )
-        ).first()
-        assert binding is not None
+        # 同步的工具是租户级资产：直接落工具广场（scope='gallery'），不产生引用行。
+        assert imported.scope == GALLERY_SCOPE
+        assert imported.owner_agent_id is None
+        assert imported.created_by_user_id == "user_admin"
+        assert (
+            db.exec(
+                select(AgentResourceReference).where(
+                    AgentResourceReference.tenant_id == "tenant_demo",
+                    AgentResourceReference.resource_type == "tool",
+                    AgentResourceReference.resource_id == imported.id,
+                )
+            ).all()
+            == []
+        )
         # 端到端：工具广场列表应能查到这个同步进来的工具。
-        listed = list_tools(tenant_id="tenant_demo", bucket=None, agent_id="agent_overall", db=db)
+        listed = list_tools(tenant_id="tenant_demo", bucket=None, agent_id=None, db=db)
         assert any(item.name == "builtin_demo.echo" for item in listed)
 
         result = ToolExecutor(db).execute(
@@ -449,7 +433,7 @@ def test_disabled_mcp_server_blocks_imported_tool_execution() -> None:
         )
         db.add(server)
         db.add(
-            Tool(
+            Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
                 id="tool_disabled_server",
                 tenant_id="tenant_demo",
                 name="disabled.echo",
@@ -487,7 +471,7 @@ def test_sync_mcp_tools_preserves_execution_policy() -> None:
         )
         db.add(server)
         db.add(
-            Tool(
+            Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
                 id="tool_policy",
                 tenant_id="tenant_demo",
                 name="mcp.builtin-policy.echo",
@@ -512,11 +496,20 @@ def test_sync_mcp_tools_preserves_execution_policy() -> None:
         assert tool.config_json == {"tool": "echo", "execution": {"timeout_seconds": 20}}
 
 
-def test_sync_mcp_tools_scoped_to_employee_binds_privately() -> None:
+def test_sync_mcp_tools_scoped_to_employee_references_gallery_tools() -> None:
+    """员工范围同步 = 给该员工「引用」广场工具，而不是给它做一份私有副本。"""
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(AgentProfile(id="agent_overall", tenant_id="tenant_demo", name="整体智能体", is_overall=True))
-        db.add(AgentProfile(id="agent_employee", tenant_id="tenant_demo", name="数字员工", is_overall=False))
+        db.add(
+            AgentProfile(owner_user_id="user_admin",
+                id="agent_employee", tenant_id="tenant_demo", name="数字员工"
+            )
+        )
+        db.add(
+            AgentProfile(owner_user_id="user_admin",
+                id="agent_other", tenant_id="tenant_demo", name="其他员工"
+            )
+        )
         db.commit()
 
         server = create_mcp_server(
@@ -541,13 +534,23 @@ def test_sync_mcp_tools_scoped_to_employee_binds_privately() -> None:
 
         imported = db.exec(select(Tool).where(Tool.mcp_server_id == server.id)).first()
         assert imported is not None
+        # 工具行是租户级广场资产，没有私有归属。
+        assert imported.scope == GALLERY_SCOPE
+        assert imported.owner_agent_id is None
 
-        # 员工范围内同步应建立私有绑定，工具只对该员工可见，不出现在工具广场。
-        employee_tools = list_tools(tenant_id="tenant_demo", bucket=None, agent_id="agent_employee", db=db)
+        # 被引用的员工看得到；未引用的员工看不到；广场（整体）看得到。
+        employee_tools = list_tools(
+            tenant_id="tenant_demo", bucket=None, agent_id="agent_employee", db=db
+        )
         assert any(item.id == imported.id for item in employee_tools)
-
-        plaza_tools = list_tools(tenant_id="tenant_demo", bucket=None, agent_id="agent_overall", db=db)
-        assert all(item.id != imported.id for item in plaza_tools)
+        other_tools = list_tools(
+            tenant_id="tenant_demo", bucket=None, agent_id="agent_other", db=db
+        )
+        assert all(item.id != imported.id for item in other_tools)
+        plaza_tools = list_tools(
+            tenant_id="tenant_demo", bucket=None, agent_id=None, db=db
+        )
+        assert any(item.id == imported.id for item in plaza_tools)
 
 
 def test_sync_is_idempotent_and_updates_schema() -> None:
@@ -591,14 +594,6 @@ def test_sync_is_idempotent_and_updates_schema() -> None:
 def test_discover_saved_server_marks_imported() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(
-            AgentProfile(
-                id="agent_overall",
-                tenant_id="tenant_demo",
-                name="整体智能体",
-                is_overall=True,
-            )
-        )
         db.commit()
 
         server = create_mcp_server(
@@ -636,11 +631,10 @@ def test_discover_saved_server_marks_imported_in_current_employee_scope() -> Non
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.add(
-            AgentProfile(
+            AgentProfile(owner_user_id="user_admin",
                 id="agent_employee",
                 tenant_id="tenant_demo",
                 name="数字员工",
-                is_overall=False,
             )
         )
         db.commit()
@@ -667,12 +661,15 @@ def test_discover_saved_server_marks_imported_in_current_employee_scope() -> Non
         before_echo = {tool.name: tool for tool in before.tools}["echo"]
         assert before_echo.imported is False
         assert before_echo.tool_id is None
-        assert list_tools(
-            tenant_id="tenant_demo",
-            bucket=None,
-            agent_id="agent_employee",
-            db=db,
-        ) == []
+        assert (
+            list_tools(
+                tenant_id="tenant_demo",
+                bucket=None,
+                agent_id="agent_employee",
+                db=db,
+            )
+            == []
+        )
 
         sync_mcp_tools(
             server.id,
@@ -736,11 +733,14 @@ def test_delete_mcp_server_removes_tools() -> None:
         assert len(db.exec(select(Tool).where(Tool.mcp_server_id == server.id)).all()) == 0
 
 
-def test_delete_mcp_server_in_employee_scope_only_unbinds() -> None:
+def test_delete_mcp_server_in_employee_scope_only_unreferences() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(AgentProfile(id="agent_overall", tenant_id="tenant_demo", name="整体智能体", is_overall=True))
-        db.add(AgentProfile(id="agent_employee", tenant_id="tenant_demo", name="数字员工", is_overall=False))
+        db.add(
+            AgentProfile(owner_user_id="user_admin",
+                id="agent_employee", tenant_id="tenant_demo", name="数字员工"
+            )
+        )
         db.commit()
 
         server = create_mcp_server(
@@ -759,6 +759,10 @@ def test_delete_mcp_server_in_employee_scope_only_unbinds() -> None:
             agent_id="agent_employee",
             current_user=_admin_user(),
         )
+        # 员工范围同步 = 给这个员工「引用」广场工具。
+        synced_tool = db.exec(select(Tool).where(Tool.mcp_server_id == server.id)).one()
+        assert synced_tool.scope == GALLERY_SCOPE
+        assert _reference_count(db, "agent_employee", synced_tool.id) == 1
 
         result = delete_mcp_server(
             server.id,
@@ -769,19 +773,25 @@ def test_delete_mcp_server_in_employee_scope_only_unbinds() -> None:
             current_user=_admin_user(),
         )
 
-        assert result == {"status": "hidden"}
-        # 工具集与工具行都是租户级资产,员工范围内的"移除"不得删除它们
+        assert result == {"status": "unreferenced"}
+        # 工具集与工具行都是租户级资产，员工范围内的「移除」只取消引用、不动它们。
         assert db.get(MCPServer, server.id) is not None
         assert len(db.exec(select(Tool).where(Tool.mcp_server_id == server.id)).all()) == 1
-        assert list_tools(tenant_id="tenant_demo", bucket=None, agent_id="agent_employee", db=db) == []
+        assert _reference_count(db, "agent_employee", synced_tool.id) == 0
+        assert (
+            list_tools(tenant_id="tenant_demo", bucket=None, agent_id="agent_employee", db=db) == []
+        )
 
 
 def test_resync_restores_tools_removed_from_employee() -> None:
     """移除是可逆的:再次同步必须把工具装回来,否则私有同步的工具会永久失联。"""
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(AgentProfile(id="agent_overall", tenant_id="tenant_demo", name="整体智能体", is_overall=True))
-        db.add(AgentProfile(id="agent_employee", tenant_id="tenant_demo", name="数字员工", is_overall=False))
+        db.add(
+            AgentProfile(owner_user_id="user_admin",
+                id="agent_employee", tenant_id="tenant_demo", name="数字员工"
+            )
+        )
         db.commit()
 
         server = create_mcp_server(
@@ -794,7 +804,9 @@ def test_resync_restores_tools_removed_from_employee() -> None:
             _admin_user(),
         )
         sync_request = MCPSyncRequest(tenant_id="tenant_demo", tool_names=["echo"])
-        sync_mcp_tools(server.id, sync_request, db, agent_id="agent_employee", current_user=_admin_user())
+        sync_mcp_tools(
+            server.id, sync_request, db, agent_id="agent_employee", current_user=_admin_user()
+        )
         delete_mcp_server(
             server.id,
             "tenant_demo",
@@ -803,18 +815,28 @@ def test_resync_restores_tools_removed_from_employee() -> None:
             remove_tools=True,
             current_user=_admin_user(),
         )
-        assert list_tools(tenant_id="tenant_demo", bucket=None, agent_id="agent_employee", db=db) == []
+        assert (
+            list_tools(tenant_id="tenant_demo", bucket=None, agent_id="agent_employee", db=db) == []
+        )
 
-        sync_mcp_tools(server.id, sync_request, db, agent_id="agent_employee", current_user=_admin_user())
+        sync_mcp_tools(
+            server.id, sync_request, db, agent_id="agent_employee", current_user=_admin_user()
+        )
 
-        restored = list_tools(tenant_id="tenant_demo", bucket=None, agent_id="agent_employee", db=db)
+        restored = list_tools(
+            tenant_id="tenant_demo", bucket=None, agent_id="agent_employee", db=db
+        )
         assert [item.name for item in restored] == ["builtin_demo.echo"]
 
 
 def test_delete_mcp_server_in_employee_scope_without_tools_returns_404() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(AgentProfile(id="agent_employee", tenant_id="tenant_demo", name="数字员工", is_overall=False))
+        db.add(
+            AgentProfile(owner_user_id="user_admin",
+                id="agent_employee", tenant_id="tenant_demo", name="数字员工"
+            )
+        )
         db.commit()
 
         server = create_mcp_server(

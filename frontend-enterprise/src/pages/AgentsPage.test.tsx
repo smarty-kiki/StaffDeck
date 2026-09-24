@@ -15,7 +15,9 @@ const agent: AgentProfileRead = {
   id: 'agent-1',
   tenant_id: 'tenant_demo',
   name: '小艾',
-  is_overall: false,
+  owner_user_id: 'user-1',
+  owner_display_name: 'demo',
+  is_published: false,
   status: 'active',
   metadata: {},
   resources: [],
@@ -75,6 +77,7 @@ describe('AgentsPage team scope compatibility', () => {
     );
 
     // 团队作用域匹配不到任何员工：不高亮、不报错，员工列表照常渲染。
-    expect((await screen.findByText('小艾')).textContent).toBeTruthy();
+    // 卡片按广场格式展示，名字后固定带 `@创建人`（同名消歧）。
+    expect((await screen.findByText('小艾 @demo')).textContent).toBeTruthy();
   });
 });

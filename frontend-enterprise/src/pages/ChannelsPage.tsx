@@ -557,8 +557,7 @@ export default function ChannelsPage({
         `/api/enterprise/agents?tenant_id=${TENANT_ID}`,
       );
       setAgentCandidates(
-        // 整体智能体(开放广场载体)是系统资源池,不是可对外服务的岗位员工,与其他页面一致排除
-        rows.filter((item) => !item.is_overall && canManageEmployeeAgent(item, currentUser)),
+        rows.filter((item) => canManageEmployeeAgent(item, currentUser)),
       );
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '加载员工列表失败');

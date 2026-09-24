@@ -6,16 +6,20 @@ import {
   ExperimentOutlined,
   GithubOutlined,
   PlusOutlined,
-  TeamOutlined,
   UploadOutlined,
 } from '../icons';
 import type { ChangeEvent, DragEvent, HTMLAttributes, ReactNode } from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { Ban, ChevronRight, CircleCheck, Copy, Eye, EyeOff, FilePlus2, FolderPlus, Users } from 'lucide-react';
+import { Ban, ChevronRight, CircleCheck, Eye, EyeOff, FilePlus2, FolderPlus } from 'lucide-react';
 import { ContextMenu } from 'radix-ui';
 
 import { api, streamPost, TENANT_ID } from '../api/client';
+import {
+  referencedResourceIdSet,
+  replaceReferencedResources,
+  unreferencePlazaResource,
+} from '../api/agentResources';
 import { isEnterpriseAdmin, type EnterpriseAuthUser } from '../auth';
 import AppHeader from '@/components/AppHeader';
 import CapabilityScopeLoading from '@/components/CapabilityScopeLoading';
@@ -57,7 +61,7 @@ import {
   formatDateTime,
 } from '@/lib/enterprise-ui';
 import { StatCard } from '@/components/StatCard';
-import { ResourceImportDialog } from '@/components/ResourceImportDialog';
+import { ResourceReferenceDialog } from '@/components/ResourceReferenceDialog';
 import CodeBlock, { renderCodeTokens } from '../components/CodeBlock';
 import { renderMarkdownBlocks } from './chat/chatHelpers';
 import IconAdd from '../assets/icons/add.svg?react';
@@ -76,10 +80,7 @@ import IconSkill from '../assets/icons/plaza-skill.svg?react';
 import IconTrash from '../assets/icons/trash.svg?react';
 import {
   canManageEmployeeAgent,
-  openGalleryAgentId,
-  openGalleryImportSourceOptions,
   resourceCreatorName,
-  visibleEmployeeAgents,
 } from '../employee';
 import { useClientPagination } from '../hooks/useClientPagination';
 import { StatusBadge } from './scheduled-tasks/StatusBadge';
@@ -194,7 +195,6 @@ function TraceDisclosureLabel() {
   );
 }
 
-const ENTERPRISE_AGENT_STORAGE_KEY = 'ultrarag_enterprise_agent_scope';
 const GENERAL_SKILL_RUN_IDLE_TIMEOUT_MS = 600_000;
 const FOLDER_INPUT_PROPS = {
   webkitdirectory: '',
@@ -216,8 +216,6 @@ type DroppedSkillFile = {
   file: File;
   path: string;
 };
-
-type GeneralSkillImportMode = 'plaza' | 'employee';
 
 type SkillFileSystemEntry = {
   name: string;
@@ -346,29 +344,29 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
   const [searchText, setSearchText] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | GeneralSkillRead['status']>('all');
   const [agentId, setAgentId] = useState(readEmployeeScope);
-  const [isOverallAgent, setIsOverallAgent] = useState(true);
+  const [isPlazaScope, setIsPlazaScope] = useState(true);
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
   const [clawhubModalOpen, setClawhubModalOpen] = useState(false);
   const [clawhubSource, setClawhubSource] = useState('');
   const [clawhubLoading, setClawhubLoading] = useState(false);
   const clawhubAbortRef = useRef<AbortController | null>(null);
   const [agentImportOpen, setAgentImportOpen] = useState(false);
-  const [agentImportMode, setAgentImportMode] = useState<GeneralSkillImportMode>('plaza');
   const [agentImportLoading, setAgentImportLoading] = useState(false);
-  const [agentImportAgents, setAgentImportAgents] = useState<AgentProfileRead[]>([]);
-  const [agentImportSourceAgentId, setAgentImportSourceAgentId] = useState('');
+  const [agentImportPlazaReady, setAgentImportPlazaReady] = useState(false);
   const [agentImportSourceSkills, setAgentImportSourceSkills] = useState<GeneralSkillRead[]>([]);
   const [agentImportSelectedSkillIds, setAgentImportSelectedSkillIds] = useState<string[]>([]);
+  // 当前员工**引用**（而非自有）的技能 id 集合：列表接口不区分来源，「取消引用」要据此判定。
+  const [referencedSkillIds, setReferencedSkillIds] = useState<Set<string>>(() => new Set());
   const [agentScopeLoaded, setAgentScopeLoaded] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<GeneralSkillRead | null>(null);
   const [deleting, setDeleting] = useState(false);
 
-  const pageTitle = isOverallAgent ? '技能广场' : '技能';
-  const listLabel = isOverallAgent ? '技能广场列表' : '技能列表';
+  const pageTitle = isPlazaScope ? '技能广场' : '技能';
+  const listLabel = isPlazaScope ? '技能广场列表' : '技能列表';
   const currentAgent = useMemo(() => agents.find((item) => item.id === agentId), [agents, agentId]);
   const canManageCurrentScope = currentAgent
     ? canManageEmployeeAgent(currentAgent, currentUser)
-    : isEnterpriseAdmin(currentUser) && isOverallAgent;
+    : isEnterpriseAdmin(currentUser) && isPlazaScope;
 
   const load = () => {
     const agentSuffix = agentId ? `&agent_id=${encodeURIComponent(agentId)}` : '';
@@ -380,21 +378,39 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
       .finally(() => setLoading(false));
   };
 
+  // 只有员工范围才有「引用」这回事：广场范围的技能归属广场，不存在引用行。
+  const loadReferencedSkillIds = () => {
+    if (!agentId || isPlazaScope) {
+      setReferencedSkillIds(new Set());
+      return Promise.resolve();
+    }
+    return referencedResourceIdSet(agentId, 'general_skill')
+      .then(setReferencedSkillIds)
+      .catch(() => setReferencedSkillIds(new Set()));
+  };
+
   useEffect(() => {
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agentId]);
 
   useEffect(() => {
+    if (!agentScopeLoaded) return;
+    void loadReferencedSkillIds();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentScopeLoaded, agentId, isPlazaScope]);
+
+  useEffect(() => {
     api
       .get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`)
       .then((items) => {
         setAgents(items);
-        setIsOverallAgent(Boolean(items.find((item) => item.id === agentId)?.is_overall ?? true));
+        // 广场不再是一条「员工」记录：没选中已知员工就是广场视角。
+        setIsPlazaScope(!items.some((item) => item.id === agentId));
         setAgentScopeLoaded(true);
       })
       .catch(() => {
-        setIsOverallAgent(true);
+        setIsPlazaScope(true);
         setAgentScopeLoaded(true);
       });
   }, [agentId]);
@@ -403,17 +419,17 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
     if (searchParams.get('add') !== 'plaza') return;
     if (!agentScopeLoaded) return;
     const resourceId = searchParams.get('resourceId') || undefined;
-    if (isOverallAgent) {
-      notify.warning('请先选择一个数字员工，再从广场复制技能');
+    if (isPlazaScope) {
+      notify.warning('请先选择一个数字员工，再引用广场技能');
     } else {
-      void requestAgentImport('plaza', resourceId);
+      void openReferenceDialog(resourceId);
     }
     const next = new URLSearchParams(searchParams);
     next.delete('add');
     next.delete('resourceId');
     setSearchParams(next, { replace: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agentScopeLoaded, isOverallAgent, searchParams, setSearchParams]);
+  }, [agentScopeLoaded, isPlazaScope, searchParams, setSearchParams]);
 
   useEffect(() => {
     const onScopeChange = (event: Event) => {
@@ -461,23 +477,10 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
     }
   }
 
-  async function publishSkillToGallery(row: GeneralSkillRead) {
-    if (!agentId) return;
-    try {
-      const next = await api.post<GeneralSkillRead>(
-        `/api/enterprise/general-skills/${encodeURIComponent(row.slug)}/publish-to-gallery?tenant_id=${TENANT_ID}&agent_id=${encodeURIComponent(agentId)}`,
-      );
-      setRows((current) => current.map((item) => (item.id === next.id ? next : item)));
-      notify.success('已发布到技能广场');
-    } catch (error) {
-      notify.error(error instanceof Error ? error.message : '发布到广场失败');
-    }
-  }
-
   async function confirmDeleteSkill() {
     const row = deleteTarget;
     if (!row) return;
-    const branchMode = !isOverallAgent;
+    const branchMode = !isPlazaScope;
     setDeleting(true);
     try {
       const agentSuffix = agentId ? `&agent_id=${encodeURIComponent(agentId)}` : '';
@@ -507,76 +510,83 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
     setClawhubModalOpen(false);
   }
 
-  async function requestAgentImport(mode: GeneralSkillImportMode, selectedResourceId?: string) {
+  // 打开「引用广场技能」对话框：只从广场取可引用技能，并预勾选当前已引用的集合。
+  async function openReferenceDialog(selectedResourceId?: string) {
     try {
-      const agents = await api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`);
-      const firstSource = mode === 'plaza'
-        ? openGalleryAgentId(agents)
-        : visibleEmployeeAgents(agents, currentUser, { activeOnly: true, excludeAgentId: agentId })[0]?.id || '';
-      setAgentImportMode(mode);
-      setAgentImportAgents(agents);
-      setAgentImportSourceAgentId(firstSource);
-      setAgentImportSelectedSkillIds([]);
+      const referenced = agentId
+        ? await referencedResourceIdSet(agentId, 'general_skill').catch(() => new Set<string>())
+        : new Set<string>();
+      setAgentImportPlazaReady(true);
+      setAgentImportSelectedSkillIds([...referenced]);
       setAgentImportOpen(true);
-      if (firstSource) {
-        const sourceRows = await loadAgentImportSourceSkills(firstSource);
-        if (selectedResourceId && sourceRows.some((item) => item.id === selectedResourceId)) {
-          setAgentImportSelectedSkillIds([selectedResourceId]);
-        }
-      } else {
-        setAgentImportSourceSkills([]);
+      const sourceRows = await loadReferablePlazaSkills();
+      // 从外部（如 ?add=plaza&resourceId=...）直达时，把目标技能一并勾上。
+      const targetId = selectedResourceId;
+      if (targetId && sourceRows.some((item) => item.id === targetId)) {
+        setAgentImportSelectedSkillIds((current) => (
+          current.includes(targetId) ? current : [...current, targetId]
+        ));
       }
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '加载员工列表失败');
+      notify.error(error instanceof Error ? error.message : '加载广场技能失败');
     }
   }
 
-  async function loadAgentImportSourceSkills(sourceAgentId: string): Promise<GeneralSkillRead[]> {
+  // 广场可引用的技能 = 广场里已发布的技能；引用从不复制内容。
+  async function loadReferablePlazaSkills(): Promise<GeneralSkillRead[]> {
     setAgentImportSourceSkills([]);
-    setAgentImportSelectedSkillIds([]);
-    if (!sourceAgentId) return [];
     try {
+      // 不带 agent_id 就是广场视角 —— 广场不是一条员工记录，而是资源自己的 scope。
       const sourceRows = await api.get<GeneralSkillRead[]>(
-        `/api/enterprise/general-skills?tenant_id=${TENANT_ID}&agent_id=${encodeURIComponent(sourceAgentId)}`,
+        `/api/enterprise/general-skills?tenant_id=${TENANT_ID}`,
       );
-      const existingIds = new Set(rows.map((item) => item.id));
-      const publishedRows = sourceRows.filter((item) => item.status === 'published' && !existingIds.has(item.id));
+      const publishedRows = sourceRows.filter((item) => item.status === 'published');
       setAgentImportSourceSkills(publishedRows);
       return publishedRows;
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '加载来源技能失败');
+      notify.error(error instanceof Error ? error.message : '加载广场技能失败');
       return [];
     }
   }
 
-  async function submitAgentImportSkills() {
+  // 引用是「整体替换该类型的引用集合」：只改引用行，其他类型的引用不动。
+  async function submitReferenceSkills() {
     if (!agentId) {
       notify.warning('请先选择一个数字员工');
       return;
     }
-    if (!agentImportSourceAgentId) {
-      notify.warning(agentImportMode === 'plaza' ? '请选择开放广场' : '请选择复制来源');
+    if (!agentImportPlazaReady) {
+      notify.warning('广场技能尚未加载');
       return;
     }
     if (!agentImportSelectedSkillIds.length) {
-      notify.warning('请选择要复制的技能');
+      notify.warning('请选择要引用的技能');
       return;
     }
     setAgentImportLoading(true);
     try {
-      await api.post(`/api/enterprise/agents/${encodeURIComponent(agentId)}/resources/import`, {
-        tenant_id: TENANT_ID,
-        source_agent_id: agentImportSourceAgentId,
-        resource_type: 'general_skill',
-        resource_ids: agentImportSelectedSkillIds,
-      });
-      notify.success(`已复制 ${agentImportSelectedSkillIds.length} 个技能`);
+      await replaceReferencedResources(agentId, 'general_skill', agentImportSelectedSkillIds);
+      notify.success(`已引用 ${agentImportSelectedSkillIds.length} 个技能`);
       setAgentImportOpen(false);
       await load();
+      await loadReferencedSkillIds();
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '复制技能失败');
+      notify.error(error instanceof Error ? error.message : '引用失败');
     } finally {
       setAgentImportLoading(false);
+    }
+  }
+
+  // 取消引用：只删引用行，不动技能本身，也不影响其作者与其他引用者。
+  async function unreferenceSkill(row: GeneralSkillRead) {
+    if (!agentId) return;
+    try {
+      await unreferencePlazaResource(agentId, 'general_skill', row.id);
+      notify.success('已取消引用');
+      await load();
+      await loadReferencedSkillIds();
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '取消引用失败');
     }
   }
 
@@ -592,7 +602,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
     try {
       const row = await api.postWithSignal<GeneralSkillRead>('/api/enterprise/general-skills/import-skillhub', {
         tenant_id: TENANT_ID,
-        agent_id: !isOverallAgent && agentId ? agentId : undefined,
+        agent_id: !isPlazaScope && agentId ? agentId : undefined,
         source: clawhubSource.trim(),
         status: 'published',
       }, controller.signal);
@@ -617,7 +627,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
 
   function renderActions(row: GeneralSkillRead) {
     const published = row.status === 'published';
-    if (isOverallAgent && !canManageCurrentScope) {
+    if (isPlazaScope && !canManageCurrentScope) {
       return null;
     }
     return (
@@ -634,7 +644,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
             onSelect={() => navigate(`/enterprise/general-skills/${encodeURIComponent(row.slug)}/edit`)}
           >
             <IconEdit />
-            {isOverallAgent ? '编辑' : '编辑本地版本'}
+            编辑
           </DropdownMenuItem>
           {published ? (
             <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void setSkillPublished(row, false)}>
@@ -647,10 +657,10 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
               启用
             </DropdownMenuItem>
           )}
-          {!isOverallAgent && row.metadata?.scope === 'agent_private' && (
-            <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void publishSkillToGallery(row)}>
-              <UploadOutlined />
-              发布到广场
+          {!isPlazaScope && referencedSkillIds.has(row.id) && (
+            <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void unreferenceSkill(row)}>
+              <CloseCircleOutlined />
+              取消引用
             </DropdownMenuItem>
           )}
           <DropdownMenuSeparator className="my-[2px] bg-[#eef0f4]" />
@@ -660,7 +670,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
             onSelect={() => setDeleteTarget(row)}
           >
             <IconTrash />
-            {isOverallAgent ? '删除' : '移除'}
+            {isPlazaScope ? '删除' : '移除'}
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
@@ -762,7 +772,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
     );
   };
 
-  const listEmptyText = isOverallAgent
+  const listEmptyText = isPlazaScope
     ? canManageCurrentScope ? '暂无技能，点击「新增」创建一个吧' : '暂无技能'
     : '当前员工暂无技能';
 
@@ -795,22 +805,16 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
                     <IconAdd />
                     新建技能
                   </DropdownMenuItem>
-                  {!isOverallAgent && (
-                    <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void requestAgentImport('plaza')}>
-                      <Copy />
-                      从广场复制
+                  {!isPlazaScope && (
+                    <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void openReferenceDialog()}>
+                      <IconSkill />
+                      引用广场技能
                     </DropdownMenuItem>
                   )}
                   <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => requestClawHubImport()}>
                     <GithubOutlined />
                     从开源平台导入
                   </DropdownMenuItem>
-                  {!isOverallAgent && (
-                    <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void requestAgentImport('employee')}>
-                      <Users />
-                      从数字员工复制
-                    </DropdownMenuItem>
-                  )}
                 </DropdownMenuContent>
               </DropdownMenu>
             )}
@@ -909,17 +913,11 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
         onSubmit={() => void importClawHubSource()}
       />
 
-      <ResourceImportDialog
+      <ResourceReferenceDialog
         open={agentImportOpen}
         loading={agentImportLoading}
         icon={<IconSkill className="size-[14px] shrink-0" />}
-        title={agentImportMode === 'plaza' ? '从广场复制技能' : '从数字员工复制技能'}
-        sourcePlaceholder={agentImportMode === 'plaza' ? '选择开放广场' : '选择复制来源'}
-        sources={agentImportMode === 'plaza'
-          ? openGalleryImportSourceOptions(agentImportAgents, '开放广场')
-          : visibleEmployeeAgents(agentImportAgents, currentUser, { activeOnly: true, excludeAgentId: agentId })
-            .map((item) => ({ value: item.id, label: item.name }))}
-        sourceId={agentImportSourceAgentId}
+        title="引用广场技能"
         itemsLabel="选择技能"
         items={agentImportSourceSkills.map((item) => ({
           id: item.id,
@@ -931,32 +929,24 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
           ),
         }))}
         selectedIds={agentImportSelectedSkillIds}
-        emptyText="没有可复制的技能"
-        note={
-          agentImportMode === 'plaza'
-            ? '从开放广场复制可用技能；不可复制内容不会出现在列表。'
-            : '从数字员工复制可用技能；不可见内容不会出现在列表。'
-        }
-        onSourceChange={(value) => {
-          setAgentImportSourceAgentId(value);
-          void loadAgentImportSourceSkills(value);
-        }}
+        emptyText="没有可引用的技能"
+        note="引用不是复制：技能只有一份、归属其作者，作者更新后所有引用者立刻生效。"
         onSelectedChange={setAgentImportSelectedSkillIds}
         onClose={() => setAgentImportOpen(false)}
-        onSubmit={() => void submitAgentImportSkills()}
+        onSubmit={() => void submitReferenceSkills()}
       />
 
       <ConfirmDialog
         open={Boolean(deleteTarget)}
         onOpenChange={(open) => !open && setDeleteTarget(null)}
         loading={deleting}
-        title={deleteTarget ? `${isOverallAgent ? '删除' : '移除'}技能「${deleteTarget.name}」？` : ''}
+        title={deleteTarget ? `${isPlazaScope ? '删除' : '移除'}技能「${deleteTarget.name}」？` : ''}
         description={
-          isOverallAgent
+          isPlazaScope
             ? '删除后该技能不会再出现在技能广场中，此操作不可撤销。'
-            : '这只会在当前数字员工中隐藏该技能；开放广场和其他数字员工仍然保留。'
+            : '删除后该技能不再属于当前数字员工，此操作不可撤销。'
         }
-        confirmText={isOverallAgent ? '删除' : '移除'}
+        confirmText={isPlazaScope ? '删除' : '移除'}
         onConfirm={() => void confirmDeleteSkill()}
       />
     </div>
@@ -1454,14 +1444,12 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
   const [clawhubSource, setClawhubSource] = useState('');
   const [clawhubLoading, setClawhubLoading] = useState(false);
   const [agentImportOpen, setAgentImportOpen] = useState(false);
-  const [agentImportMode, setAgentImportMode] = useState<GeneralSkillImportMode>('plaza');
   const [agentImportLoading, setAgentImportLoading] = useState(false);
-  const [agentImportAgents, setAgentImportAgents] = useState<AgentProfileRead[]>([]);
-  const [agentImportSourceAgentId, setAgentImportSourceAgentId] = useState('');
+  const [agentImportPlazaReady, setAgentImportPlazaReady] = useState(false);
   const [agentImportSourceSkills, setAgentImportSourceSkills] = useState<GeneralSkillRead[]>([]);
   const [agentImportSelectedSkillIds, setAgentImportSelectedSkillIds] = useState<string[]>([]);
   const [agentId, setAgentId] = useState(readEmployeeScope);
-  const [isOverallAgent, setIsOverallAgent] = useState(true);
+  const [isPlazaScope, setIsPlazaScope] = useState(true);
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
   const [deleteSkillTarget, setDeleteSkillTarget] = useState<GeneralSkillRead | null>(null);
   const [deleteFileTarget, setDeleteFileTarget] = useState<GeneralSkillFile | null>(null);
@@ -1501,9 +1489,9 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
   const currentAgent = useMemo(() => agents.find((item) => item.id === agentId), [agents, agentId]);
   const canManageCurrentScope = currentAgent
     ? canManageEmployeeAgent(currentAgent, currentUser)
-    : isEnterpriseAdmin(currentUser) && isOverallAgent;
+    : isEnterpriseAdmin(currentUser) && isPlazaScope;
   const pageTitle = isNew ? '新建空白技能' : '编辑技能';
-  const pageDescription = isOverallAgent
+  const pageDescription = isPlazaScope
     ? (isNew
       ? '填写技能定义并编辑 SKILL.md，保存后可在右侧运行测试。'
       : '维护技能广场中的技能定义、文件包和运行测试。')
@@ -1543,18 +1531,19 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
       .get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`)
       .then((items) => {
         setAgents(items);
-        const scopedAgent = forceGalleryScope
-          ? items.find((item) => item.is_overall)
-          : items.find((item) => item.id === agentId);
-        if (scopedAgent && scopedAgent.id !== agentId) {
-          window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, scopedAgent.id);
-          setAgentId(scopedAgent.id);
+        // forceGalleryScope（如路由直达广场技能）直接落在广场视角，且不改动当前选中的员工。
+        if (forceGalleryScope) {
+          setIsPlazaScope(true);
+          setAgentScopeLoaded(true);
+          return;
         }
-        setIsOverallAgent(Boolean(scopedAgent?.is_overall ?? true));
+        const scopedAgent = items.find((item) => item.id === agentId) || null;
+        // 广场不再是一条「员工」记录：没选中已知员工就是广场视角。
+        setIsPlazaScope(!scopedAgent);
         setAgentScopeLoaded(true);
       })
       .catch(() => {
-        setIsOverallAgent(true);
+        setIsPlazaScope(true);
         setAgentScopeLoaded(true);
       });
   }, [agentId, forceGalleryScope]);
@@ -1661,7 +1650,7 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
     try {
       const row = await api.post<GeneralSkillRead>('/api/enterprise/general-skills/import', {
         tenant_id: TENANT_ID,
-        agent_id: !isOverallAgent && agentId ? agentId : undefined,
+        agent_id: !isPlazaScope && agentId ? agentId : undefined,
         name: skillName.trim() || undefined,
         slug: editingSlug || skillSlug.trim() || undefined,
         description: skillDescription.trim() || undefined,
@@ -1780,7 +1769,7 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
       notify.error('只有管理员可以编辑技能广场内容');
       return;
     }
-    const branchMode = !isOverallAgent;
+    const branchMode = !isPlazaScope;
     try {
       const agentSuffix = agentId ? `&agent_id=${encodeURIComponent(agentId)}` : '';
       await api.delete(`/api/enterprise/general-skills/${row.slug}?tenant_id=${TENANT_ID}${agentSuffix}`);
@@ -1864,70 +1853,59 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
     setClawhubModalOpen(false);
   }
 
-  function requestAgentImport(mode: GeneralSkillImportMode) {
+  // 打开「引用广场技能」对话框：只从广场取可引用技能，并预勾选当前已引用的集合。
+  function openReferenceDialog() {
     void withImportPreparation(async () => {
       try {
-        const agents = await api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`);
-        const firstSource = mode === 'plaza'
-          ? openGalleryAgentId(agents)
-          : visibleEmployeeAgents(agents, currentUser, { activeOnly: true, excludeAgentId: agentId })[0]?.id || '';
-        setAgentImportMode(mode);
-        setAgentImportAgents(agents);
-        setAgentImportSourceAgentId(firstSource);
-        setAgentImportSelectedSkillIds([]);
+        const referenced = agentId
+          ? await referencedResourceIdSet(agentId, 'general_skill').catch(() => new Set<string>())
+          : new Set<string>();
+        setAgentImportPlazaReady(true);
+        setAgentImportSelectedSkillIds([...referenced]);
         setAgentImportOpen(true);
-        if (firstSource) {
-          await loadAgentImportSourceSkills(firstSource);
-        } else {
-          setAgentImportSourceSkills([]);
-        }
+        await loadReferablePlazaSkills();
       } catch (error) {
-        notify.error(error instanceof Error ? error.message : '加载员工列表失败');
+        notify.error(error instanceof Error ? error.message : '加载广场技能失败');
       }
     });
   }
 
-  async function loadAgentImportSourceSkills(sourceAgentId: string) {
+  // 广场可引用的技能 = 广场里已发布的技能；引用从不复制内容。
+  async function loadReferablePlazaSkills() {
     setAgentImportSourceSkills([]);
-    setAgentImportSelectedSkillIds([]);
-    if (!sourceAgentId) return;
     try {
+      // 不带 agent_id 就是广场视角 —— 广场不是一条员工记录，而是资源自己的 scope。
       const sourceRows = await api.get<GeneralSkillRead[]>(
-        `/api/enterprise/general-skills?tenant_id=${TENANT_ID}&agent_id=${encodeURIComponent(sourceAgentId)}`,
+        `/api/enterprise/general-skills?tenant_id=${TENANT_ID}`,
       );
-      const existingIds = new Set(rows.map((item) => item.id));
-      setAgentImportSourceSkills(sourceRows.filter((item) => item.status === 'published' && !existingIds.has(item.id)));
+      setAgentImportSourceSkills(sourceRows.filter((item) => item.status === 'published'));
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '加载来源技能失败');
+      notify.error(error instanceof Error ? error.message : '加载广场技能失败');
     }
   }
 
-  async function submitAgentImportSkills() {
+  // 引用是「整体替换该类型的引用集合」：只改引用行，其他类型的引用不动。
+  async function submitReferenceSkills() {
     if (!agentId) {
       notify.warning('请先选择一个数字员工');
       return;
     }
-    if (!agentImportSourceAgentId) {
-      notify.warning(agentImportMode === 'plaza' ? '请选择开放广场' : '请选择复制来源');
+    if (!agentImportPlazaReady) {
+      notify.warning('广场技能尚未加载');
       return;
     }
     if (!agentImportSelectedSkillIds.length) {
-      notify.warning('请选择要复制的技能');
+      notify.warning('请选择要引用的技能');
       return;
     }
     setAgentImportLoading(true);
     try {
-      await api.post(`/api/enterprise/agents/${encodeURIComponent(agentId)}/resources/import`, {
-        tenant_id: TENANT_ID,
-        source_agent_id: agentImportSourceAgentId,
-        resource_type: 'general_skill',
-        resource_ids: agentImportSelectedSkillIds,
-      });
-      notify.success(`已复制 ${agentImportSelectedSkillIds.length} 个技能`);
+      await replaceReferencedResources(agentId, 'general_skill', agentImportSelectedSkillIds);
+      notify.success(`已引用 ${agentImportSelectedSkillIds.length} 个技能`);
       setAgentImportOpen(false);
       await load();
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '复制技能失败');
+      notify.error(error instanceof Error ? error.message : '引用失败');
     } finally {
       setAgentImportLoading(false);
     }
@@ -1945,7 +1923,7 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
     try {
       const row = await api.postWithSignal<GeneralSkillRead>('/api/enterprise/general-skills/import-skillhub', {
         tenant_id: TENANT_ID,
-        agent_id: !isOverallAgent && agentId ? agentId : undefined,
+        agent_id: !isPlazaScope && agentId ? agentId : undefined,
         source: clawhubSource.trim(),
         status: 'published',
       }, controller.signal);
@@ -1980,7 +1958,7 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
       if (controller.signal.aborted) return;
       const row = await api.postWithSignal<GeneralSkillRead>('/api/enterprise/general-skills/import-package', {
         tenant_id: TENANT_ID,
-        agent_id: !isOverallAgent && agentId ? agentId : undefined,
+        agent_id: !isPlazaScope && agentId ? agentId : undefined,
         filename: file.name,
         content_base64: contentBase64,
         status: 'published',
@@ -2481,22 +2459,16 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
       <DropdownMenuContent align="end" className={MENU_CONTENT_CLASS}>
         <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => requestImport('file')}>选择文件</DropdownMenuItem>
         <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => requestImport('folder')}>选择文件夹</DropdownMenuItem>
-        {!isOverallAgent && (
-          <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => requestAgentImport('plaza')}>
-            <UploadOutlined />
-            从广场复制
+        {!isPlazaScope && (
+          <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => openReferenceDialog()}>
+            <IconSkill />
+            引用广场技能
           </DropdownMenuItem>
         )}
         <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => requestClawHubImport()}>
           <GithubOutlined />
           从开源平台导入
         </DropdownMenuItem>
-        {!isOverallAgent && (
-          <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => requestAgentImport('employee')}>
-            <TeamOutlined />
-            从数字员工复制技能
-          </DropdownMenuItem>
-        )}
       </DropdownMenuContent>
     </DropdownMenu>
   ) : null;
@@ -2916,17 +2888,11 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
         onClose={cancelClawHubImport}
         onSubmit={() => void importClawHubSource()}
       />
-      <ResourceImportDialog
+      <ResourceReferenceDialog
         open={agentImportOpen}
         loading={agentImportLoading}
         icon={<IconSkill className="size-[14px] shrink-0" />}
-        title={agentImportMode === 'plaza' ? '从广场复制技能' : '从数字员工复制技能'}
-        sourcePlaceholder={agentImportMode === 'plaza' ? '选择开放广场' : '选择复制来源'}
-        sources={agentImportMode === 'plaza'
-          ? openGalleryImportSourceOptions(agentImportAgents, '开放广场')
-          : visibleEmployeeAgents(agentImportAgents, currentUser, { activeOnly: true, excludeAgentId: agentId })
-            .map((item) => ({ value: item.id, label: item.name }))}
-        sourceId={agentImportSourceAgentId}
+        title="引用广场技能"
         itemsLabel="选择技能"
         items={agentImportSourceSkills.map((item) => ({
           id: item.id,
@@ -2938,27 +2904,21 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
           ),
         }))}
         selectedIds={agentImportSelectedSkillIds}
-        emptyText="没有可复制的技能"
-        note={agentImportMode === 'plaza'
-          ? '从开放广场复制可用技能；不会覆盖当前编辑区内容。'
-          : '从数字员工复制可用技能；不会覆盖当前编辑区内容。'}
-        onSourceChange={(value) => {
-          setAgentImportSourceAgentId(value);
-          void loadAgentImportSourceSkills(value);
-        }}
+        emptyText="没有可引用的技能"
+        note="引用不是复制：技能只有一份、归属其作者，作者更新后所有引用者立刻生效。"
         onSelectedChange={setAgentImportSelectedSkillIds}
         onClose={() => setAgentImportOpen(false)}
-        onSubmit={() => void submitAgentImportSkills()}
+        onSubmit={() => void submitReferenceSkills()}
       />
 
       <ConfirmDialog
         open={Boolean(deleteSkillTarget)}
         onOpenChange={(open) => !open && setDeleteSkillTarget(null)}
-        title={deleteSkillTarget ? `${isOverallAgent ? '删除' : '移除'}技能「${deleteSkillTarget.name}」？` : ''}
-        description={isOverallAgent
+        title={deleteSkillTarget ? `${isPlazaScope ? '删除' : '移除'}技能「${deleteSkillTarget.name}」？` : ''}
+        description={isPlazaScope
           ? '删除后该技能不会再出现在组织技能库中，此操作不可撤销。'
-          : '这只会在当前数字员工中隐藏该技能；开放广场和其他数字员工仍然保留。'}
-        confirmText={isOverallAgent ? '删除' : '移除'}
+          : '删除后该技能不再属于当前数字员工，此操作不可撤销。'}
+        confirmText={isPlazaScope ? '删除' : '移除'}
         onConfirm={() => void runDeleteSkill()}
       />
 

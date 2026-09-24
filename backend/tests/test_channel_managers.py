@@ -48,11 +48,10 @@ def _seed(engine) -> dict[str, User]:
         admin = User(id="user_admin", tenant_id="tenant_demo", username="admin", role="admin", password_hash="x")
         outsider = User(id="user_outsider", tenant_id="tenant_demo", username="outsider", password_hash="x")
         db.add(
-            AgentProfile(
+            AgentProfile(owner_user_id=owner.id,
                 id="agent_1",
                 tenant_id="tenant_demo",
                 name="客服员工",
-                is_overall=False,
                 metadata_json={"owner_user_id": owner.id},
             )
         )

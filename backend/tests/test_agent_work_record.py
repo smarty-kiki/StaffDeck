@@ -10,8 +10,9 @@ from sqlmodel import Session, SQLModel, create_engine
 from app.api import agents as agents_api
 from app.api.agents import get_agent_work_record
 from app.db.models import (
+    GALLERY_SCOPE,
     AgentProfile,
-    AgentResourceBinding,
+    AgentResourceReference,
     ChatSession,
     GeneralSkill,
     KnowledgeBase,
@@ -27,13 +28,13 @@ from app.db.models import (
 def test_work_record_returns_timezone_aware_reply_and_activity_times(monkeypatch) -> None:
     with _test_session() as db:
         owner, other = _seed_users(db)
-        agent = AgentProfile(
+        agent = AgentProfile(owner_user_id=owner.id,
             id="agent_work_record",
             tenant_id="tenant_demo",
             name="工作记录员工",
             metadata_json={"owner_user_id": owner.id, "owner_username": owner.username},
         )
-        skill = Skill(
+        skill = Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
             id="skill_bound",
             tenant_id="tenant_demo",
             skill_id="travel_v1",
@@ -42,7 +43,7 @@ def test_work_record_returns_timezone_aware_reply_and_activity_times(monkeypatch
             content_json={},
             status="published",
         )
-        general_skill = GeneralSkill(
+        general_skill = GeneralSkill(scope=GALLERY_SCOPE, owner_agent_id=None,
             id="general_bound",
             tenant_id="tenant_demo",
             slug="weather",
@@ -50,13 +51,13 @@ def test_work_record_returns_timezone_aware_reply_and_activity_times(monkeypatch
             skill_markdown="# weather",
             status="published",
         )
-        knowledge = KnowledgeBase(
+        knowledge = KnowledgeBase(scope=GALLERY_SCOPE, owner_agent_id=None,
             id="kb_bound",
             tenant_id="tenant_demo",
             name="差旅制度",
             status="active",
         )
-        tool = Tool(
+        tool = Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
             id="tool_bound",
             tenant_id="tenant_demo",
             name="expense.query",
@@ -79,7 +80,7 @@ def test_work_record_returns_timezone_aware_reply_and_activity_times(monkeypatch
             ]
         ):
             db.add(
-                AgentResourceBinding(
+                AgentResourceReference(
                     id=f"binding_{index}",
                     tenant_id="tenant_demo",
                     agent_id=agent.id,
@@ -183,9 +184,7 @@ def test_work_record_returns_timezone_aware_reply_and_activity_times(monkeypatch
         }
         assert all(event.timestamp.endswith("Z") for event in result.events)
         assert {
-            (event.phase, event.timestamp)
-            for event in result.events
-            if event.kind == "task"
+            (event.phase, event.timestamp) for event in result.events if event.kind == "task"
         } == {
             ("last_run", "2026-07-14T01:00:00Z"),
             ("next_run", "2026-07-15T01:00:00Z"),
@@ -195,7 +194,7 @@ def test_work_record_returns_timezone_aware_reply_and_activity_times(monkeypatch
 def test_work_record_rejects_invalid_timezone_and_private_agent_access() -> None:
     with _test_session() as db:
         owner, other = _seed_users(db)
-        agent = AgentProfile(
+        agent = AgentProfile(owner_user_id=owner.id,
             id="agent_private",
             tenant_id="tenant_demo",
             name="私有员工",

@@ -8,7 +8,7 @@ from sqlmodel import Session, SQLModel, create_engine
 
 from app.channels.adapters.feishu import FeishuPermanentError
 from app.channels.feishu_trace import FeishuTraceStreamer, _SinkEvent, is_feishu_trace_enabled
-from app.db.models import Skill, Tenant, Tool
+from app.db.models import GALLERY_SCOPE, Skill, Tenant, Tool
 
 
 def _binding(channel: str = "feishu", config: dict | None = None) -> SimpleNamespace:
@@ -463,7 +463,7 @@ def test_streamer_loads_step_names_from_db() -> None:
     with Session(engine) as db:
         db.add(Tenant(id="tenant_a", name="Demo"))
         db.add(
-            Skill(
+            Skill(scope=GALLERY_SCOPE, owner_agent_id=None,
                 tenant_id="tenant_a",
                 skill_id="skill_refund",
                 name="售后退款流程",
@@ -476,7 +476,7 @@ def test_streamer_loads_step_names_from_db() -> None:
             )
         )
         db.add(
-            Tool(
+            Tool(scope=GALLERY_SCOPE, owner_agent_id=None,
                 tenant_id="tenant_a",
                 name="hr.balance_query",
                 display_name="假期考勤查询",

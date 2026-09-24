@@ -173,7 +173,7 @@ def test_saved_tool_test_retries_use_same_request_id():
     with _session() as db:
         user, tool = _seed(db)
         user.role = "admin"
-        db.add(AgentProfile(id="overall", tenant_id="tenant_demo", name="All", is_overall=True))
+        db.add(AgentProfile(owner_user_id="user_admin", id="overall", tenant_id="tenant_demo", name="All"))
         db.flush()
         ensure_open_gallery_binding(db, "tenant_demo", "tool", tool.id)
         db.commit()

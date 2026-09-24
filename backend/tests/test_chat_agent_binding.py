@@ -6,7 +6,6 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.api import chat as chat_api
-from app.agents.branching import agent_private_metadata
 from app.api.chat import (
     _bind_request_to_session_agent,
     _ensure_chat_agent_available,
@@ -17,9 +16,10 @@ from app.api.chat import (
 )
 from app.core.agent_loop import AgentLoop, AgentLoopPreconditionError
 from app.db.models import (
+    GALLERY_SCOPE,
     AgentEvent,
     AgentProfile,
-    AgentResourceBinding,
+    AgentResourceReference,
     ChatSession,
     ExternalSessionBinding,
     GeneralSkill,
@@ -43,8 +43,22 @@ def test_existing_chat_session_cannot_switch_agent() -> None:
             id="user_demo", tenant_id="tenant_demo", username="demo", password_hash="x"
         )
         db.add(current_user)
-        db.add(AgentProfile(id="agent_a", tenant_id="tenant_demo", name="客服 A", is_overall=False))
-        db.add(AgentProfile(id="agent_b", tenant_id="tenant_demo", name="客服 B", is_overall=False))
+        db.add(
+            AgentProfile(
+                owner_user_id="user_demo",
+                id="agent_a",
+                tenant_id="tenant_demo",
+                name="客服 A",
+            )
+        )
+        db.add(
+            AgentProfile(
+                owner_user_id="user_demo",
+                id="agent_b",
+                tenant_id="tenant_demo",
+                name="客服 B",
+            )
+        )
         session = ChatSession(
             id="session_bound",
             tenant_id="tenant_demo",
@@ -69,7 +83,7 @@ def test_existing_chat_session_cannot_switch_agent() -> None:
         assert db.get(ChatSession, session.id).agent_id == "agent_a"
 
 
-def test_chat_agent_must_be_active_non_overall_agent() -> None:
+def test_chat_agent_must_be_active_and_visible_to_current_user() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         current_user = User(
@@ -77,29 +91,37 @@ def test_chat_agent_must_be_active_non_overall_agent() -> None:
         )
         db.add(current_user)
         db.add(
-            AgentProfile(id="agent_overall", tenant_id="tenant_demo", name="整体", is_overall=True)
-        )
-        db.add(
             AgentProfile(
+                owner_user_id="user_demo",
                 id="agent_archived",
                 tenant_id="tenant_demo",
                 name="已归档",
-                is_overall=False,
                 status="archived",
+            )
+        )
+        db.add(
+            AgentProfile(
+                owner_user_id="user_other",
+                id="agent_other_private",
+                tenant_id="tenant_demo",
+                name="别人的私有员工",
             )
         )
         db.commit()
 
         with pytest.raises(HTTPException) as missing:
             _ensure_chat_agent_available(db, "tenant_demo", None, current_user)
-        with pytest.raises(HTTPException) as overall:
-            _ensure_chat_agent_available(db, "tenant_demo", "agent_overall", current_user)
+        with pytest.raises(HTTPException) as unknown:
+            _ensure_chat_agent_available(db, "tenant_demo", "agent_does_not_exist", current_user)
         with pytest.raises(HTTPException) as archived:
             _ensure_chat_agent_available(db, "tenant_demo", "agent_archived", current_user)
+        with pytest.raises(HTTPException) as not_visible:
+            _ensure_chat_agent_available(db, "tenant_demo", "agent_other_private", current_user)
 
         assert missing.value.status_code == 400
-        assert overall.value.status_code == 404
+        assert unknown.value.status_code == 404
         assert archived.value.status_code == 404
+        assert not_visible.value.status_code == 403
 
 
 def test_chat_slash_commands_only_list_bound_executable_resources() -> None:
@@ -111,11 +133,10 @@ def test_chat_slash_commands_only_list_bound_executable_resources() -> None:
         db.add(current_user)
         db.add(
             AgentProfile(
+                owner_user_id=current_user.id,
                 id="agent_demo",
                 tenant_id="tenant_demo",
                 name="客服",
-                is_overall=False,
-                metadata_json={"owner_user_id": current_user.id},
             )
         )
         sop = Skill(
@@ -124,6 +145,7 @@ def test_chat_slash_commands_only_list_bound_executable_resources() -> None:
             name="退款流程",
             status="published",
             content_json={"start_node_id": "start", "nodes": [{"node_id": "start"}]},
+            scope=GALLERY_SCOPE,
         )
         general_skill = GeneralSkill(
             tenant_id="tenant_demo",
@@ -132,6 +154,7 @@ def test_chat_slash_commands_only_list_bound_executable_resources() -> None:
             status="published",
             capability_scope="general",
             skill_markdown="# Weather",
+            scope=GALLERY_SCOPE,
         )
         hidden_skill = GeneralSkill(
             tenant_id="tenant_demo",
@@ -140,6 +163,7 @@ def test_chat_slash_commands_only_list_bound_executable_resources() -> None:
             status="published",
             capability_scope="sop_specific",
             skill_markdown="# SOP only",
+            scope=GALLERY_SCOPE,
         )
         tool = Tool(
             tenant_id="tenant_demo",
@@ -149,6 +173,7 @@ def test_chat_slash_commands_only_list_bound_executable_resources() -> None:
             url="https://example.test/prices",
             enabled=True,
             capability_scope="general",
+            scope=GALLERY_SCOPE,
         )
         db.add(sop)
         db.add(general_skill)
@@ -162,13 +187,12 @@ def test_chat_slash_commands_only_list_bound_executable_resources() -> None:
             ("tool", tool.id),
         ):
             db.add(
-                AgentResourceBinding(
+                AgentResourceReference(
                     tenant_id="tenant_demo",
                     agent_id="agent_demo",
                     resource_type=resource_type,
                     resource_id=resource_id,
-                    status="active",
-                    metadata_json=agent_private_metadata("agent_demo"),
+                    created_by_user_id=current_user.id,
                 )
             )
         db.commit()
@@ -196,11 +220,10 @@ def test_create_chat_session_always_creates_new_agent_session() -> None:
         db.add(current_user)
         db.add(
             AgentProfile(
+                owner_user_id="user_demo",
                 id="agent_demo",
                 tenant_id="tenant_demo",
                 name="研发",
-                is_overall=False,
-                metadata_json={"owner_user_id": "user_demo"},
             )
         )
         db.add(
@@ -522,17 +545,16 @@ def test_agent_persona_prompt_includes_employee_identity_and_metadata() -> None:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.add(
             AgentProfile(
+                owner_user_id="user_demo",
                 id="agent_dev",
                 tenant_id="tenant_demo",
                 name="研发员工",
                 description="负责研发资料查询、SOP 执行和交付记录沉淀。",
-                is_overall=False,
                 metadata_json={
                     "role_name": "研发",
                     "work_styles": ["目标明确", "证据优先"],
                     "expertise_tags": ["代码检索", "SOP 执行"],
                     "work_modes": ["理解需求", "推进执行"],
-                    "owner_user_id": "user_demo",
                 },
             )
         )
@@ -557,12 +579,12 @@ def test_agent_persona_prompt_keeps_custom_prompt_with_identity() -> None:
         db.add(PersonaConfig(tenant_id="tenant_demo", system_prompt="全局员工设定"))
         db.add(
             AgentProfile(
+                owner_user_id="user_demo",
                 id="agent_finance",
                 tenant_id="tenant_demo",
                 name="财务员工",
                 description="负责报销核对。",
                 persona_prompt="只能在有证据时给结论。\n必要时先追问缺失凭证。",
-                is_overall=False,
                 metadata_json={"role_name": "财务"},
             )
         )

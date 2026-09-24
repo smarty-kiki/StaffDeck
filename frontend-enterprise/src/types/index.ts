@@ -63,9 +63,6 @@ export type KnowledgeBaseRead = {
   capability_scope?: CapabilityScope;
   status: string;
   version?: string;
-  branch_sync_state?: string;
-  branch_base_version?: string;
-  branch_head_version?: string;
   metadata?: Record<string, unknown>;
   document_count: number;
   bucket_count: number;
@@ -183,14 +180,17 @@ export type KnowledgeSearchResponse = {
 
 export type AgentResourceType = 'skill' | 'general_skill' | 'knowledge_base' | 'tool';
 
-export type AgentResourceBindingRead = {
+/**
+ * 员工对广场资源的一条引用（`agent_resource_references`）。
+ *
+ * 没有 `status` —— 有行即引用生效，删行即取消引用。
+ */
+export type AgentResourceReferenceRead = {
   id: string;
   tenant_id: string;
   agent_id: string;
   resource_type: AgentResourceType;
   resource_id: string;
-  status: 'active' | 'inactive' | string;
-  metadata: Record<string, unknown>;
   created_at: string;
   updated_at: string;
 };
@@ -198,14 +198,16 @@ export type AgentResourceBindingRead = {
 export type AgentProfileRead = {
   id: string;
   tenant_id: string;
+  owner_user_id: string;
+  owner_display_name: string;
   name: string;
   description?: string;
   persona_prompt?: string;
-  is_overall: boolean;
+  is_published: boolean;
   status: 'active' | 'archived' | string;
   harness_max_actions?: number;
   metadata: Record<string, unknown>;
-  resources: AgentResourceBindingRead[];
+  resources: AgentResourceReferenceRead[];
   created_at: string;
   updated_at: string;
 };
@@ -276,10 +278,6 @@ export type SkillRead = {
   recent_positive_rate: number;
   recent_negative_rate: number;
   agent_id?: string;
-  branch_status?: string;
-  branch_sync_state?: string;
-  branch_base_version?: string;
-  branch_head_version?: string;
   metadata?: Record<string, unknown>;
   created_at: string;
   updated_at: string;

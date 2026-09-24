@@ -7,9 +7,6 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.agents.branching import (
-    agent_private_metadata,
-    ensure_open_gallery_binding,
-    ensure_private_resource_binding,
     model_for_agent,
 )
 from app.agents.schema import (
@@ -17,7 +14,7 @@ from app.agents.schema import (
     AgentModelsUpdateRequest,
     AgentProfileCreateRequest,
     AgentProfileUpdateRequest,
-    AgentResourceBindingInput,
+    AgentResourceReferenceInput,
     AgentResourcesUpdateRequest,
 )
 from app.api.agents import (
@@ -26,6 +23,8 @@ from app.api.agents import (
     get_agent_models,
     list_agents,
     list_chat_agents,
+    reference_agent_resource,
+    unreference_agent_resource,
     unpublish_agent_from_gallery,
     update_agent,
     update_agent_models,
@@ -35,9 +34,11 @@ from app.api.agents import (
 from app.api.general_skills import import_general_skill
 from app.api.tools import create_tool, update_tool
 from app.db.models import (
+    AGENT_SCOPE,
+    GALLERY_SCOPE,
     AgentModelBinding,
     AgentProfile,
-    AgentResourceBinding,
+    AgentResourceReference,
     AgentUsage,
     ChatSession,
     GeneralSkill,
@@ -46,7 +47,7 @@ from app.db.models import (
     Tool,
     User,
 )
-from app.db.database import _seed_agent_branch_state
+from app.db.database import _purge_legacy_agent_model_bindings
 from app.general_skills.schema import GeneralSkillImportRequest
 from app.security.permissions import (
     ensure_agent_scope_manager,
@@ -56,15 +57,16 @@ from app.security.permissions import (
 from app.tools.tool_schema import ToolCreateRequest, ToolUpdateRequest
 
 
-def test_only_creator_or_admin_can_update_and_delete_agent() -> None:
+def test_only_owner_can_update_and_delete_agent() -> None:
+    """员工写权限只有归属人 —— **管理员也没有分支**（管理员只多"下架"一项）。"""
     with _test_session() as db:
         owner, other, admin = _seed_users(db)
         agent = AgentProfile(
+            owner_user_id=owner.id,
             id="agent_owned",
             tenant_id="tenant_demo",
             name="研发员工",
-            is_overall=False,
-            metadata_json={"owner_user_id": owner.id, "owner_username": owner.username},
+            metadata_json={"owner_username": owner.username},
         )
         db.add(agent)
         db.commit()
@@ -86,59 +88,34 @@ def test_only_creator_or_admin_can_update_and_delete_agent() -> None:
         )
         assert updated.name == "Owner 修改"
 
-        admin_updated = update_agent(
-            agent.id,
-            AgentProfileUpdateRequest(tenant_id="tenant_demo", name="Admin 修改"),
-            db=db,
-            current_user=admin,
-        )
-        assert admin_updated.name == "Admin 修改"
+        # 管理员不能编辑别人的员工 —— 这是本轮需求的硬约束。
+        with pytest.raises(HTTPException) as admin_error:
+            update_agent(
+                agent.id,
+                AgentProfileUpdateRequest(tenant_id="tenant_demo", name="Admin 修改"),
+                db=db,
+                current_user=admin,
+            )
+        assert admin_error.value.status_code == 403
 
         with pytest.raises(HTTPException) as delete_error:
             delete_agent(agent.id, tenant_id="tenant_demo", db=db, current_user=other)
         assert delete_error.value.status_code == 403
 
-
-def test_non_admin_cannot_manage_overall_agent() -> None:
-    with _test_session() as db:
-        owner, other, admin = _seed_users(db)
-        overall = AgentProfile(
-            id="agent_overall", tenant_id="tenant_demo", name="开放广场", is_overall=True
-        )
-        db.add(overall)
-        db.commit()
-
-        with pytest.raises(HTTPException) as update_error:
-            update_agent(
-                overall.id,
-                AgentProfileUpdateRequest(
-                    tenant_id="tenant_demo", description="普通用户不能改整体员工"
-                ),
-                db=db,
-                current_user=owner,
-            )
-        assert update_error.value.status_code == 403
-
-        updated = update_agent(
-            overall.id,
-            AgentProfileUpdateRequest(
-                tenant_id="tenant_demo", description="管理员可以维护整体员工"
-            ),
-            db=db,
-            current_user=admin,
-        )
-        assert updated.description == "管理员可以维护整体员工"
+        with pytest.raises(HTTPException) as admin_delete_error:
+            delete_agent(agent.id, tenant_id="tenant_demo", db=db, current_user=admin)
+        assert admin_delete_error.value.status_code == 403
 
 
 def test_agents_always_inherit_tenant_default_model_and_legacy_bindings_are_removed() -> None:
     with _test_session() as db:
-        owner, _other, admin = _seed_users(db)
+        owner, _other, _admin = _seed_users(db)
         agent = AgentProfile(
+            owner_user_id=owner.id,
             id="agent_default_model",
             tenant_id="tenant_demo",
             name="默认模型员工",
-            is_overall=False,
-            metadata_json={"owner_user_id": owner.id, "owner_username": owner.username},
+            metadata_json={"owner_username": owner.username},
         )
         tenant_default = ModelConfig(
             id="model_tenant_default",
@@ -178,7 +155,7 @@ def test_agents_always_inherit_tenant_default_model_and_legacy_bindings_are_remo
             agent.id,
             tenant_id="tenant_demo",
             db=db,
-            current_user=admin,
+            current_user=owner,
         )
         assert rows == [
             {
@@ -200,14 +177,17 @@ def test_agents_always_inherit_tenant_default_model_and_legacy_bindings_are_remo
                 ],
             ),
             db=db,
-            current_user=admin,
+            current_user=owner,
         )
-        assert db.exec(
-            select(AgentModelBinding).where(
-                AgentModelBinding.tenant_id == "tenant_demo",
-                AgentModelBinding.agent_id == agent.id,
-            )
-        ).all() == []
+        assert (
+            db.exec(
+                select(AgentModelBinding).where(
+                    AgentModelBinding.tenant_id == "tenant_demo",
+                    AgentModelBinding.agent_id == agent.id,
+                )
+            ).all()
+            == []
+        )
 
 
 def test_startup_seed_removes_legacy_agent_model_bindings() -> None:
@@ -221,6 +201,7 @@ def test_startup_seed_removes_legacy_agent_model_bindings() -> None:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.add(
             AgentProfile(
+                owner_user_id="user_owner",
                 id="agent_startup_cleanup",
                 tenant_id="tenant_demo",
                 name="启动清理员工",
@@ -249,7 +230,7 @@ def test_startup_seed_removes_legacy_agent_model_bindings() -> None:
 
     table_names = set(inspect(engine).get_table_names())
     with engine.begin() as conn:
-        _seed_agent_branch_state(conn, inspect(engine), table_names)
+        _purge_legacy_agent_model_bindings(conn, table_names)
 
     with Session(engine) as db:
         assert db.exec(select(AgentModelBinding)).all() == []
@@ -259,11 +240,11 @@ def test_resource_binding_requires_agent_manager() -> None:
     with _test_session() as db:
         owner, other, _admin = _seed_users(db)
         agent = AgentProfile(
+            owner_user_id=owner.id,
             id="agent_resource_owner",
             tenant_id="tenant_demo",
             name="资源员工",
-            is_overall=False,
-            metadata_json={"owner_user_id": owner.id, "owner_username": owner.username},
+            metadata_json={"owner_username": owner.username},
         )
         tool = Tool(
             id="tool_weather",
@@ -272,13 +253,15 @@ def test_resource_binding_requires_agent_manager() -> None:
             display_name="天气查询",
             method="POST",
             url="/weather",
+            scope=GALLERY_SCOPE,
+            owner_agent_id=None,
         )
         db.add(agent)
         db.add(tool)
         db.commit()
         request = AgentResourcesUpdateRequest(
             tenant_id="tenant_demo",
-            resources=[AgentResourceBindingInput(resource_type="tool", resource_id=tool.id)],
+            resources=[AgentResourceReferenceInput(resource_type="tool", resource_id=tool.id)],
         )
 
         with pytest.raises(HTTPException) as update_error:
@@ -293,47 +276,43 @@ def test_list_agents_filters_to_visible_agents_for_non_admin() -> None:
     with _test_session() as db:
         owner, other, admin = _seed_users(db)
         db.add(
-            AgentProfile(id="agent_overall", tenant_id="tenant_demo", name="整体", is_overall=True)
-        )
-        db.add(
             AgentProfile(
+                owner_user_id=owner.id,
                 id="agent_owned",
                 tenant_id="tenant_demo",
                 name="我的员工",
-                is_overall=False,
-                metadata_json={"owner_user_id": owner.id, "owner_username": owner.username},
+                metadata_json={"owner_username": owner.username},
             )
         )
         db.add(
             AgentProfile(
+                owner_user_id="user_owner",
                 id="agent_gallery",
                 tenant_id="tenant_demo",
                 name="广场员工",
-                is_overall=False,
-                metadata_json={"published_to_gallery": True, "owner_username": other.username},
+                is_published=True,
+                metadata_json={"owner_username": other.username},
             )
         )
         db.add(
             AgentProfile(
+                owner_user_id=other.id,
                 id="agent_private",
                 tenant_id="tenant_demo",
                 name="别人私有员工",
-                is_overall=False,
-                metadata_json={"owner_user_id": other.id, "owner_username": other.username},
+                metadata_json={"owner_username": other.username},
             )
         )
         db.add(
             AgentProfile(
+                owner_user_id=other.id,
                 id="agent_created_by_owner_only",
                 tenant_id="tenant_demo",
                 name="创建字段命中但非本人",
-                is_overall=False,
                 metadata_json={
-                    "owner_user_id": other.id,
                     "owner_username": other.username,
                     "created_by_user_id": owner.id,
                     "created_by_username": owner.username,
-                    "published_to_gallery": False,
                 },
             )
         )
@@ -342,9 +321,10 @@ def test_list_agents_filters_to_visible_agents_for_non_admin() -> None:
         owner_rows = list_agents("tenant_demo", db=db, current_user=owner)
         admin_rows = list_agents("tenant_demo", db=db, current_user=admin)
 
-        assert {row.id for row in owner_rows} == {"agent_overall", "agent_owned", "agent_gallery"}
+        # 可见性 = 自己的 ∪ 已发布到广场的：别人的私有员工一律看不见，管理员也一样
+        # （管理员相对归属人只多「下架」，不是「看见别人的私有员工」）。
+        assert {row.id for row in owner_rows} == {"agent_owned", "agent_gallery"}
         assert {row.id for row in admin_rows} == {
-            "agent_overall",
             "agent_owned",
             "agent_gallery",
             "agent_private",
@@ -356,15 +336,12 @@ def test_gallery_agent_is_visible_but_not_manageable_by_non_owner() -> None:
     with _test_session() as db:
         owner, other, admin = _seed_users(db)
         gallery_agent = AgentProfile(
+            owner_user_id=other.id,
             id="agent_gallery",
             tenant_id="tenant_demo",
             name="广场员工",
-            is_overall=False,
-            metadata_json={
-                "published_to_gallery": True,
-                "owner_user_id": other.id,
-                "owner_username": other.username,
-            },
+            is_published=True,
+            metadata_json={"owner_username": other.username},
         )
         db.add(gallery_agent)
         db.commit()
@@ -372,16 +349,13 @@ def test_gallery_agent_is_visible_but_not_manageable_by_non_owner() -> None:
         owner_visible_rows = list_agents("tenant_demo", db=db, current_user=owner)
         assert {row.id for row in owner_visible_rows} == {"agent_gallery"}
 
-        with pytest.raises(HTTPException) as manage_error:
-            ensure_agent_scope_manager(db, "tenant_demo", gallery_agent.id, owner)
-        assert manage_error.value.status_code == 403
+        for user in (owner, admin):
+            with pytest.raises(HTTPException) as manage_error:
+                ensure_agent_scope_manager(db, "tenant_demo", gallery_agent.id, user)
+            assert manage_error.value.status_code == 403
 
         assert (
             ensure_agent_scope_manager(db, "tenant_demo", gallery_agent.id, other).id
-            == gallery_agent.id
-        )
-        assert (
-            ensure_agent_scope_manager(db, "tenant_demo", gallery_agent.id, admin).id
             == gallery_agent.id
         )
 
@@ -401,34 +375,22 @@ def test_gallery_agent_is_visible_but_not_manageable_by_non_owner() -> None:
         assert db.exec(select(Tool).where(Tool.name == "blocked_gallery_tool")).first() is None
 
 
-def test_only_admin_can_unpublish_gallery_agent_without_deleting_it() -> None:
+def test_admin_can_unpublish_a_published_agent_but_not_edit_it() -> None:
+    """下架是管理员相对归属人的**唯一**额外权限：下架可以，编辑不行。"""
     with _test_session() as db:
         owner, other, admin = _seed_users(db)
         gallery_agent = AgentProfile(
+            owner_user_id=other.id,
             id="agent_gallery_governance",
             tenant_id="tenant_demo",
             name="待治理广场员工",
-            is_overall=False,
-            metadata_json={
-                "published_to_gallery": True,
-                "gallery_published_at": "2026-08-08T08:00:00+00:00",
-                "gallery_published_by": other.username,
-                "owner_user_id": other.id,
-                "owner_username": other.username,
-            },
-        )
-        binding = AgentResourceBinding(
-            id="binding_gallery_governance",
-            tenant_id="tenant_demo",
-            agent_id=gallery_agent.id,
-            resource_type="tool",
-            resource_id="tool_governance",
-            status="active",
+            is_published=True,
+            published_by=other.username,
         )
         db.add(gallery_agent)
-        db.add(binding)
         db.commit()
 
+        # 非归属人的普通成员既不能下架别人的员工。
         with pytest.raises(HTTPException) as member_error:
             unpublish_agent_from_gallery(
                 gallery_agent.id,
@@ -438,46 +400,41 @@ def test_only_admin_can_unpublish_gallery_agent_without_deleting_it() -> None:
             )
         assert member_error.value.status_code == 403
 
+        # 管理员可以下架别人的员工。
         unpublished = unpublish_agent_from_gallery(
             gallery_agent.id,
             tenant_id="tenant_demo",
             db=db,
             current_user=admin,
         )
-        assert unpublished.status == "active"
-        assert unpublished.metadata["published_to_gallery"] is False
-        assert unpublished.metadata["gallery_unpublished_by"] == admin.username
-        assert "gallery_published_at" not in unpublished.metadata
-        assert "gallery_published_by" not in unpublished.metadata
+        assert unpublished.is_published is False
         assert db.get(AgentProfile, gallery_agent.id) is not None
-        assert db.get(AgentResourceBinding, binding.id) is not None
-        assert gallery_agent.id not in {
-            row.id for row in list_agents("tenant_demo", db=db, current_user=owner)
-        }
+
+        # 作者下架自己的员工同样允许。
+        assert (
+            unpublish_agent_from_gallery(
+                gallery_agent.id,
+                tenant_id="tenant_demo",
+                db=db,
+                current_user=other,
+            ).is_published
+            is False
+        )
+        # 下架不等于删除：作者仍然看得见自己的员工。
         assert gallery_agent.id in {
             row.id for row in list_agents("tenant_demo", db=db, current_user=other)
         }
-
-        repeated = unpublish_agent_from_gallery(
-            gallery_agent.id,
-            tenant_id="tenant_demo",
-            db=db,
-            current_user=admin,
-        )
-        assert repeated.metadata["gallery_unpublished_at"] == unpublished.metadata[
-            "gallery_unpublished_at"
-        ]
 
 
 def test_agent_ownership_uses_immutable_user_id_not_username_metadata() -> None:
     with _test_session() as db:
         owner, other, _admin = _seed_users(db)
         agent = AgentProfile(
+            owner_user_id=other.id,
             id="agent_spoofed_owner_name",
             tenant_id="tenant_demo",
             name="用户名不能授权",
             metadata_json={
-                "owner_user_id": other.id,
                 "owner_username": owner.username,
             },
         )
@@ -495,20 +452,19 @@ def test_agent_scope_viewer_allows_owned_and_gallery_but_blocks_private_agents()
     with _test_session() as db:
         owner, other, admin = _seed_users(db)
         private = AgentProfile(
+            owner_user_id=owner.id,
             id="agent_private_scope",
             tenant_id="tenant_demo",
             name="私有员工",
-            metadata_json={"owner_user_id": owner.id, "owner_username": owner.username},
+            metadata_json={"owner_username": owner.username},
         )
         gallery = AgentProfile(
+            owner_user_id=owner.id,
             id="agent_gallery_scope",
             tenant_id="tenant_demo",
             name="广场员工",
-            metadata_json={
-                "owner_user_id": owner.id,
-                "owner_username": owner.username,
-                "published_to_gallery": True,
-            },
+            is_published=True,
+            metadata_json={"owner_username": owner.username},
         )
         db.add(private)
         db.add(gallery)
@@ -516,7 +472,10 @@ def test_agent_scope_viewer_allows_owned_and_gallery_but_blocks_private_agents()
 
         assert require_agent_scope_viewer("tenant_demo", private.id, owner, db) is owner
         assert require_agent_scope_viewer("tenant_demo", gallery.id, other, db) is other
-        assert require_agent_scope_viewer("tenant_demo", private.id, admin, db) is admin
+        # 读权限上管理员也不再无条件放行：别人的私人员工管理员同样读不到。
+        with pytest.raises(HTTPException) as admin_private_error:
+            require_agent_scope_viewer("tenant_demo", private.id, admin, db)
+        assert admin_private_error.value.status_code == 403
         with pytest.raises(HTTPException) as private_error:
             require_agent_scope_viewer("tenant_demo", private.id, other, db)
         assert private_error.value.status_code == 403
@@ -541,29 +500,26 @@ def test_chat_agents_exclude_unused_gallery_agents_until_current_user_marks_used
     with _test_session() as db:
         owner, other, admin = _seed_users(db)
         owned = AgentProfile(
+            owner_user_id=owner.id,
             id="agent_owned",
             tenant_id="tenant_demo",
             name="我的员工",
-            is_overall=False,
-            metadata_json={"owner_user_id": owner.id, "owner_username": owner.username},
+            metadata_json={"owner_username": owner.username},
         )
         gallery = AgentProfile(
+            owner_user_id=other.id,
             id="agent_gallery",
             tenant_id="tenant_demo",
             name="广场员工",
-            is_overall=False,
-            metadata_json={
-                "published_to_gallery": True,
-                "owner_user_id": other.id,
-                "owner_username": other.username,
-            },
+            is_published=True,
+            metadata_json={"owner_username": other.username},
         )
         private = AgentProfile(
+            owner_user_id=other.id,
             id="agent_private",
             tenant_id="tenant_demo",
-            name="管理员可见私有员工",
-            is_overall=False,
-            metadata_json={"owner_user_id": other.id, "owner_username": other.username},
+            name="别人私有员工",
+            metadata_json={"owner_username": other.username},
         )
         db.add(owned)
         db.add(gallery)
@@ -575,10 +531,8 @@ def test_chat_agents_exclude_unused_gallery_agents_until_current_user_marks_used
         assert {row.id for row in list_chat_agents("tenant_demo", current_user=owner, db=db)} == {
             "agent_owned"
         }
-        assert {row.id for row in list_chat_agents("tenant_demo", current_user=admin, db=db)} == {
-            "agent_owned",
-            "agent_private",
-        }
+        # 管理员在聊天列表里不再无条件看到所有人的员工 —— 额外权限只有"下架"。
+        assert list_chat_agents("tenant_demo", current_user=admin, db=db) == []
 
         used = use_chat_agent(gallery.id, tenant_id="tenant_demo", current_user=owner, db=db)
         assert used.id == gallery.id
@@ -610,12 +564,12 @@ def test_chat_agents_exclude_unused_gallery_agents_until_current_user_marks_used
         )
 
 
-def test_create_agent_records_creator_and_blocks_non_admin_overall() -> None:
+def test_create_agent_records_creator_and_keeps_name_unique_per_owner() -> None:
     with _test_session() as db:
         owner, other, admin = _seed_users(db)
 
         created = create_agent(
-            AgentProfileCreateRequest(tenant_id="tenant_demo", name="新员工", source_mode="blank"),
+            AgentProfileCreateRequest(tenant_id="tenant_demo", name="新员工"),
             db=db,
             current_user=owner,
         )
@@ -624,119 +578,85 @@ def test_create_agent_records_creator_and_blocks_non_admin_overall() -> None:
         assert created.metadata["created_by_user_id"] == owner.id
         assert created.metadata["created_by_username"] == owner.username
 
-        admin_updated = update_agent(
+        # 归属是列：即便管理员提交了伪造的 owner 字段，列的归属不变。
+        with pytest.raises(HTTPException) as admin_error:
+            update_agent(
+                created.id,
+                AgentProfileUpdateRequest(
+                    tenant_id="tenant_demo",
+                    metadata={
+                        **created.metadata,
+                        "owner_user_id": other.id,
+                        "owner_username": other.username,
+                        "role_name": "管理员可修改的业务字段",
+                    },
+                ),
+                db=db,
+                current_user=admin,
+            )
+        assert admin_error.value.status_code == 403
+
+        owner_updated = update_agent(
             created.id,
             AgentProfileUpdateRequest(
                 tenant_id="tenant_demo",
-                metadata={
-                    **created.metadata,
-                    "owner_user_id": other.id,
-                    "owner_username": other.username,
-                    "created_by_user_id": other.id,
-                    "created_by_username": other.username,
-                    "role_name": "管理员可修改的业务字段",
-                },
+                metadata={**created.metadata, "role_name": "归属人可修改的业务字段"},
             ),
             db=db,
-            current_user=admin,
+            current_user=owner,
         )
-        assert admin_updated.metadata["owner_user_id"] == owner.id
-        assert admin_updated.metadata["owner_username"] == owner.username
-        assert admin_updated.metadata["created_by_user_id"] == owner.id
-        assert admin_updated.metadata["created_by_username"] == owner.username
-        assert admin_updated.metadata["role_name"] == "管理员可修改的业务字段"
+        assert owner_updated.metadata["owner_user_id"] == owner.id
+        assert owner_updated.metadata["created_by_user_id"] == owner.id
+        assert owner_updated.metadata["role_name"] == "归属人可修改的业务字段"
 
-        source = AgentProfile(
-            id="agent_source",
-            tenant_id="tenant_demo",
-            name="源员工",
-            is_overall=False,
-            persona_prompt="源提示词",
-            metadata_json={
-                "owner_user_id": owner.id,
-                "owner_username": owner.username,
-                "created_by_user_id": owner.id,
-                "created_by_username": owner.username,
-                "published_to_gallery": True,
-                "role_name": "源角色",
-            },
-        )
-        db.add(source)
-        db.commit()
-        copied = create_agent(
-            AgentProfileCreateRequest(
-                tenant_id="tenant_demo",
-                name="复制员工",
-                source_mode="copy",
-                copy_from_agent_id=source.id,
-                metadata={
-                    **source.metadata_json,
-                    "owner_user_id": other.id,
-                    "owner_username": other.username,
-                },
-            ),
-            db=db,
-            current_user=other,
-        )
-        assert copied.metadata["owner_user_id"] == other.id
-        assert copied.metadata["owner_username"] == other.username
-        assert copied.metadata["created_by_user_id"] == other.id
-        assert copied.metadata["created_by_username"] == other.username
-        assert copied.metadata["role_name"] == "源角色"
-
-        with pytest.raises(HTTPException) as create_error:
+        # 同作者重名 → 409。
+        with pytest.raises(HTTPException) as duplicate_error:
             create_agent(
-                AgentProfileCreateRequest(
-                    tenant_id="tenant_demo", name="普通用户整体", is_overall=True
-                ),
+                AgentProfileCreateRequest(tenant_id="tenant_demo", name="新员工"),
                 db=db,
                 current_user=owner,
             )
-        assert create_error.value.status_code == 403
+        assert duplicate_error.value.status_code == 409
 
-        overall = create_agent(
-            AgentProfileCreateRequest(
-                tenant_id="tenant_demo", name="管理员整体", is_overall=True, source_mode="blank"
-            ),
+        # 不同作者可以建同名员工 —— 广场里靠 @创建人 消歧。
+        other_same_name = create_agent(
+            AgentProfileCreateRequest(tenant_id="tenant_demo", name="新员工"),
             db=db,
-            current_user=admin,
+            current_user=other,
         )
-        assert overall.is_overall is True
+        assert other_same_name.name == "新员工"
+        assert other_same_name.owner_user_id == other.id
+        assert other_same_name.id != created.id
 
 
-def test_private_tool_edit_does_not_mutate_open_gallery_tool() -> None:
+def test_private_tool_is_separate_from_gallery_tool_and_gallery_is_admin_only() -> None:
+    """私有工具与广场工具是两行，互不覆盖；广场工具只有管理员能改。"""
     with _test_session() as db:
-        owner, _other, _admin = _seed_users(db)
-        db.add(
-            AgentProfile(
-                id="agent_overall", tenant_id="tenant_demo", name="开放广场", is_overall=True
-            )
-        )
+        owner, _other, admin = _seed_users(db)
         agent = AgentProfile(
+            owner_user_id=owner.id,
             id="agent_owned",
             tenant_id="tenant_demo",
             name="研发员工",
-            is_overall=False,
-            metadata_json={"owner_user_id": owner.id, "owner_username": owner.username},
+            metadata_json={"owner_username": owner.username},
         )
-        open_tool = Tool(
+        gallery_tool = Tool(
             id="tool_open_weather",
             tenant_id="tenant_demo",
             name="weather",
             display_name="天气",
             method="POST",
             url="/api/weather",
+            scope=GALLERY_SCOPE,
+            owner_agent_id=None,
         )
         db.add(agent)
-        db.add(open_tool)
-        db.flush()
-        ensure_open_gallery_binding(db, "tenant_demo", "tool", open_tool.id, "active")
-        ensure_private_resource_binding(db, "tenant_demo", agent.id, "tool", open_tool.id, "active")
+        db.add(gallery_tool)
         db.commit()
 
-        updated = update_tool(
-            open_tool.id,
-            ToolUpdateRequest(
+        # 归属人在自己的员工下建同名私有工具 —— 不同平面，允许同名。
+        private_tool = create_tool(
+            ToolCreateRequest(
                 tenant_id="tenant_demo",
                 name="weather",
                 display_name="员工天气",
@@ -747,62 +667,67 @@ def test_private_tool_edit_does_not_mutate_open_gallery_tool() -> None:
             db=db,
             current_user=owner,
         )
+        assert private_tool.id != gallery_tool.id
+        private_row = db.get(Tool, private_tool.id)
+        assert private_row is not None
+        assert private_row.scope == AGENT_SCOPE
+        assert private_row.owner_agent_id == agent.id
 
-        db.refresh(open_tool)
-        assert updated.id != open_tool.id
-        assert open_tool.display_name == "天气"
-        assert open_tool.url == "/api/weather"
-        assert updated.display_name == "员工天气"
-        assert updated.name.startswith("weather-agent_ow")
-        visible_binding = db.exec(
-            select(AgentResourceBinding).where(
-                AgentResourceBinding.tenant_id == "tenant_demo",
-                AgentResourceBinding.agent_id == agent.id,
-                AgentResourceBinding.resource_type == "tool",
-                AgentResourceBinding.resource_id == updated.id,
-                AgentResourceBinding.status == "active",
-            )
-        ).first()
-        old_binding = db.exec(
-            select(AgentResourceBinding).where(
-                AgentResourceBinding.tenant_id == "tenant_demo",
-                AgentResourceBinding.agent_id == agent.id,
-                AgentResourceBinding.resource_type == "tool",
-                AgentResourceBinding.resource_id == open_tool.id,
-            )
-        ).first()
-        assert visible_binding is not None
-        assert old_binding and old_binding.status == "deleted"
+        # 改私有工具不影响广场工具。
+        update_tool(
+            private_tool.id,
+            ToolUpdateRequest(
+                tenant_id="tenant_demo",
+                name="weather",
+                display_name="员工天气 v2",
+                description=private_tool.description,
+                url=private_tool.url,
+            ),
+            agent_id=agent.id,
+            db=db,
+            current_user=owner,
+        )
+        db.refresh(gallery_tool)
+        assert gallery_tool.display_name == "天气"
+        assert gallery_tool.url == "/api/weather"
 
-        with pytest.raises(HTTPException) as rename_error:
+        # 成员不能改广场工具。
+        with pytest.raises(HTTPException) as member_error:
             update_tool(
-                updated.id,
+                gallery_tool.id,
                 ToolUpdateRequest(
                     tenant_id="tenant_demo",
-                    name="weather_renamed",
-                    display_name="员工天气重命名",
-                    description=updated.description,
-                    url=updated.url,
+                    name="weather",
+                    display_name="员工天气",
+                    url="/api/weather",
                 ),
-                agent_id=agent.id,
+                agent_id=None,
                 db=db,
                 current_user=owner,
             )
-        assert rename_error.value.status_code == 400
-        assert rename_error.value.detail == "Tool name cannot be modified"
+        assert member_error.value.status_code == 403
+
+        # 管理员改广场工具，私有工具不受影响。
+        update_tool(
+            gallery_tool.id,
+            ToolUpdateRequest(
+                tenant_id="tenant_demo",
+                name="weather",
+                display_name="广场天气",
+                url="/api/weather",
+            ),
+            agent_id=None,
+            db=db,
+            current_user=admin,
+        )
+        private_row = db.get(Tool, private_tool.id)
+        assert private_row is not None
+        assert private_row.display_name == "员工天气 v2"
 
 
 def test_tool_name_cannot_be_modified_after_create() -> None:
     with _test_session() as db:
         _owner, _other, admin = _seed_users(db)
-        db.add(
-            AgentProfile(
-                id="agent_overall",
-                tenant_id="tenant_demo",
-                name="开放广场",
-                is_overall=True,
-            )
-        )
         tool = Tool(
             id="tool_weather",
             tenant_id="tenant_demo",
@@ -810,10 +735,10 @@ def test_tool_name_cannot_be_modified_after_create() -> None:
             display_name="天气",
             method="POST",
             url="/api/weather",
+            scope=GALLERY_SCOPE,
+            owner_agent_id=None,
         )
         db.add(tool)
-        db.flush()
-        ensure_open_gallery_binding(db, "tenant_demo", "tool", tool.id, "active")
         db.commit()
 
         with pytest.raises(HTTPException) as exc_info:
@@ -834,22 +759,18 @@ def test_tool_name_cannot_be_modified_after_create() -> None:
         assert exc_info.value.detail == "Tool name cannot be modified"
 
 
-def test_private_general_skill_edit_does_not_mutate_open_gallery_skill() -> None:
+def test_private_general_skill_edit_does_not_mutate_gallery_skill() -> None:
+    """私有技能与广场技能是独立两行：改私有不动广场，改广场需管理员。"""
     with _test_session() as db:
-        owner, _other, _admin = _seed_users(db)
-        db.add(
-            AgentProfile(
-                id="agent_overall", tenant_id="tenant_demo", name="开放广场", is_overall=True
-            )
-        )
+        owner, _other, admin = _seed_users(db)
         agent = AgentProfile(
+            owner_user_id=owner.id,
             id="agent_owned",
             tenant_id="tenant_demo",
             name="研发员工",
-            is_overall=False,
-            metadata_json={"owner_user_id": owner.id, "owner_username": owner.username},
+            metadata_json={"owner_username": owner.username},
         )
-        open_skill = GeneralSkill(
+        gallery_skill = GeneralSkill(
             id="genskill_open_weather",
             tenant_id="tenant_demo",
             slug="weather",
@@ -857,21 +778,17 @@ def test_private_general_skill_edit_does_not_mutate_open_gallery_skill() -> None
             description="开放广场版本",
             skill_markdown="# 天气技能\n",
             status="published",
+            scope=GALLERY_SCOPE,
+            owner_agent_id=None,
         )
         db.add(agent)
-        db.add(open_skill)
-        db.flush()
-        ensure_open_gallery_binding(db, "tenant_demo", "general_skill", open_skill.id, "active")
-        ensure_private_resource_binding(
-            db, "tenant_demo", agent.id, "general_skill", open_skill.id, "active"
-        )
+        db.add(gallery_skill)
         db.commit()
 
-        updated = import_general_skill(
+        private_skill = import_general_skill(
             GeneralSkillImportRequest(
                 tenant_id="tenant_demo",
                 agent_id=agent.id,
-                original_slug="weather",
                 slug="weather",
                 name="员工天气技能",
                 description="员工私有版本",
@@ -881,195 +798,210 @@ def test_private_general_skill_edit_does_not_mutate_open_gallery_skill() -> None
             current_user=owner,
         )
 
-        db.refresh(open_skill)
-        assert updated.id != open_skill.id
-        assert updated.slug.startswith("weather-")
-        assert updated.name == "员工天气技能"
-        assert open_skill.name == "天气技能"
-        assert open_skill.description == "开放广场版本"
-        assert (
-            db.exec(
-                select(AgentResourceBinding).where(
-                    AgentResourceBinding.tenant_id == "tenant_demo",
-                    AgentResourceBinding.agent_id == agent.id,
-                    AgentResourceBinding.resource_type == "general_skill",
-                    AgentResourceBinding.resource_id == updated.id,
-                    AgentResourceBinding.status == "active",
-                )
-            ).first()
-            is not None
-        )
+        db.refresh(gallery_skill)
+        assert private_skill.id != gallery_skill.id
+        private_row = db.get(GeneralSkill, private_skill.id)
+        assert private_row is not None
+        assert private_row.scope == AGENT_SCOPE
+        assert private_row.owner_agent_id == agent.id
+        assert gallery_skill.name == "天气技能"
+        assert gallery_skill.description == "开放广场版本"
 
-        with pytest.raises(HTTPException) as rename_error:
+        # 归属人改写自己的私有技能，广场技能不变。
+        updated = import_general_skill(
+            GeneralSkillImportRequest(
+                tenant_id="tenant_demo",
+                agent_id=agent.id,
+                original_slug="weather",
+                slug="weather",
+                name="员工天气技能 v2",
+                description="员工私有版本 v2",
+                markdown="# 员工天气技能 v2\n",
+            ),
+            db=db,
+            current_user=owner,
+        )
+        db.refresh(gallery_skill)
+        assert updated.id == private_skill.id
+        assert updated.name == "员工天气技能 v2"
+        assert gallery_skill.name == "天气技能"
+
+        with pytest.raises(HTTPException) as admin_only_error:
             import_general_skill(
                 GeneralSkillImportRequest(
                     tenant_id="tenant_demo",
-                    agent_id=agent.id,
-                    original_slug=updated.slug,
-                    slug="weather-renamed",
-                    name="员工天气技能",
-                    markdown="# 员工天气技能\n",
+                    slug="weather",
+                    name="成员改广场技能",
+                    markdown="# 成员改广场技能\n",
                 ),
                 db=db,
                 current_user=owner,
             )
-        assert rename_error.value.status_code == 400
-        assert rename_error.value.detail == "General skill slug cannot be modified"
+        assert admin_only_error.value.status_code == 403
 
 
-def test_copy_agent_deep_copies_private_general_skill_package() -> None:
+def test_create_agent_never_copies_resources_from_another_agent() -> None:
+    """「以某员工为模板复制一份」这个能力整体消失：新建员工从空白开始。"""
     with _test_session() as db:
         _owner, _other, admin = _seed_users(db)
         source = AgentProfile(
-            id="agent_general_skill_source",
+            owner_user_id=admin.id,
+            id="agent_template_source",
             tenant_id="tenant_demo",
-            name="源企业微信员工",
-            is_overall=False,
-            metadata_json={"owner_user_id": admin.id, "owner_username": admin.username},
+            name="源员工",
         )
         skill = GeneralSkill(
-            id="genskill_private_wecom",
+            id="genskill_source_private",
             tenant_id="tenant_demo",
-            slug="wecom-unified",
-            name="企业微信",
-            skill_markdown=(
-                "# 企业微信\n\n读取 references/wecomcli-calendar-meeting-room.md。\n"
-            ),
-            skill_files_json=[
-                {
-                    "path": "SKILL.md",
-                    "content": (
-                        "# 企业微信\n\n读取 references/wecomcli-calendar-meeting-room.md。\n"
-                    ),
-                },
-                {
-                    "path": "references/wecomcli-calendar-meeting-room.md",
-                    "content": "# 日程查询\n",
-                },
-            ],
-            metadata_json=agent_private_metadata(source.id),
+            slug="source-private",
+            name="源员工私有技能",
+            skill_markdown="# 源员工私有技能\n",
             status="published",
+            scope=AGENT_SCOPE,
+            owner_agent_id=source.id,
         )
         db.add(source)
         db.add(skill)
-        db.flush()
-        ensure_private_resource_binding(
-            db,
-            "tenant_demo",
-            source.id,
-            "general_skill",
-            skill.id,
-            "active",
-        )
         db.commit()
 
-        copied_agent = create_agent(
-            AgentProfileCreateRequest(
-                tenant_id="tenant_demo",
-                name="复制企业微信员工",
-                source_mode="copy",
-                copy_from_agent_id=source.id,
-            ),
+        created = create_agent(
+            AgentProfileCreateRequest(tenant_id="tenant_demo", name="全新建员工"),
             db=db,
             current_user=admin,
         )
 
-        copied_binding = db.exec(
-            select(AgentResourceBinding).where(
-                AgentResourceBinding.tenant_id == "tenant_demo",
-                AgentResourceBinding.agent_id == copied_agent.id,
-                AgentResourceBinding.resource_type == "general_skill",
-                AgentResourceBinding.status == "active",
-            )
-        ).one()
-        copied_skill = db.get(GeneralSkill, copied_binding.resource_id)
-        assert copied_skill is not None
-        assert copied_skill.id != skill.id
-        assert copied_skill.slug == "wecom-unified-copy"
-        assert copied_skill.skill_files_json == skill.skill_files_json
-        assert copied_skill.metadata_json["owner_agent_id"] == copied_agent.id
-        assert copied_skill.metadata_json["copied_from_general_skill_id"] == skill.id
+        assert created.id != source.id
+        # 新员工没有任何资源引用，也没有拿到源员工的私有资源
+        assert (
+            db.exec(
+                select(AgentResourceReference).where(
+                    AgentResourceReference.agent_id == created.id,
+                )
+            ).all()
+            == []
+        )
+        # 源员工的私有资源仍然只归源员工
+        assert skill.owner_agent_id == source.id
 
 
-def test_editing_shared_private_general_skill_forks_instead_of_mutating_source() -> None:
+def test_referencing_gallery_resource_does_not_fork_content() -> None:
+    """启用广场资源 = 建引用行；内容始终只有一份，归作者。"""
     with _test_session() as db:
         _owner, _other, admin = _seed_users(db)
-        source = AgentProfile(
-            id="agent_shared_skill_source",
+        agent = AgentProfile(
+            owner_user_id=admin.id,
+            id="agent_referencing",
             tenant_id="tenant_demo",
-            name="共享技能源员工",
-            is_overall=False,
+            name="引用员工",
         )
-        target = AgentProfile(
-            id="agent_shared_skill_target",
+        gallery_skill = GeneralSkill(
+            id="genskill_gallery_referenced",
             tenant_id="tenant_demo",
-            name="共享技能复制员工",
-            is_overall=False,
-        )
-        original = GeneralSkill(
-            id="genskill_shared_private",
-            tenant_id="tenant_demo",
-            slug="wecom-shared-private",
-            name="企业微信共享技能",
-            skill_markdown="# 原始技能\n",
-            skill_files_json=[{"path": "SKILL.md", "content": "# 原始技能\n"}],
-            metadata_json=agent_private_metadata(source.id),
+            slug="gallery-referenced",
+            name="广场技能",
+            skill_markdown="# 广场技能\n",
             status="published",
+            scope=GALLERY_SCOPE,
+            owner_agent_id=None,
         )
-        db.add(source)
-        db.add(target)
-        db.add(original)
-        db.flush()
-        source_binding_metadata = agent_private_metadata(source.id)
-        db.add(
-            AgentResourceBinding(
-                tenant_id="tenant_demo",
-                agent_id=source.id,
-                resource_type="general_skill",
-                resource_id=original.id,
-                status="active",
-                metadata_json=source_binding_metadata,
-            )
-        )
-        db.add(
-            AgentResourceBinding(
-                tenant_id="tenant_demo",
-                agent_id=target.id,
-                resource_type="general_skill",
-                resource_id=original.id,
-                status="active",
-                metadata_json=source_binding_metadata,
-            )
-        )
+        db.add(agent)
+        db.add(gallery_skill)
         db.commit()
 
-        forked = import_general_skill(
-            GeneralSkillImportRequest(
+        reference_agent_resource(
+            agent.id,
+            AgentResourceReferenceInput(
                 tenant_id="tenant_demo",
-                agent_id=target.id,
-                original_slug=original.slug,
-                slug=original.slug,
-                name="复制员工版本",
-                markdown="# 复制员工修改后的技能\n",
+                resource_type="general_skill",
+                resource_id=gallery_skill.id,
             ),
+            tenant_id="tenant_demo",
             db=db,
             current_user=admin,
         )
+        db.commit()
 
-        db.refresh(original)
-        assert forked.id != original.id
-        assert forked.slug == "wecom-shared-private-2"
-        assert original.skill_markdown == "# 原始技能\n"
-        assert forked.skill_markdown == "# 复制员工修改后的技能\n"
-        assert forked.metadata["owner_agent_id"] == target.id
-        original_target_binding = db.exec(
-            select(AgentResourceBinding).where(
-                AgentResourceBinding.agent_id == target.id,
-                AgentResourceBinding.resource_type == "general_skill",
-                AgentResourceBinding.resource_id == original.id,
+        references = db.exec(
+            select(AgentResourceReference).where(
+                AgentResourceReference.agent_id == agent.id,
             )
-        ).one()
-        assert original_target_binding.status == "deleted"
+        ).all()
+        assert [row.resource_id for row in references] == [gallery_skill.id]
+        # 没有产生第二份技能内容
+        assert db.exec(select(GeneralSkill)).all() == [gallery_skill]
+
+
+def test_unreferencing_gallery_resource_keeps_the_resource_alive() -> None:
+    """取消引用 = 删引用行；资源本身与别人的引用都不受影响。"""
+    with _test_session() as db:
+        _owner, _other, admin = _seed_users(db)
+        first = AgentProfile(
+            owner_user_id=admin.id,
+            id="agent_first_reference",
+            tenant_id="tenant_demo",
+            name="首个引用员工",
+        )
+        second = AgentProfile(
+            owner_user_id=admin.id,
+            id="agent_second_reference",
+            tenant_id="tenant_demo",
+            name="第二个引用员工",
+        )
+        gallery_skill = GeneralSkill(
+            id="genskill_unref_target",
+            tenant_id="tenant_demo",
+            slug="unref-target",
+            name="待取消引用技能",
+            skill_markdown="# 待取消引用技能\n",
+            status="published",
+            scope=GALLERY_SCOPE,
+            owner_agent_id=None,
+        )
+        db.add(first)
+        db.add(second)
+        db.add(gallery_skill)
+        db.commit()
+        for agent in (first, second):
+            reference_agent_resource(
+                agent.id,
+                AgentResourceReferenceInput(
+                    tenant_id="tenant_demo",
+                    resource_type="general_skill",
+                    resource_id=gallery_skill.id,
+                ),
+                tenant_id="tenant_demo",
+                db=db,
+                current_user=admin,
+            )
+        db.commit()
+
+        unreference_agent_resource(
+            first.id,
+            "general_skill",
+            gallery_skill.id,
+            tenant_id="tenant_demo",
+            db=db,
+            current_user=admin,
+        )
+        db.commit()
+
+        assert (
+            db.exec(
+                select(AgentResourceReference).where(
+                    AgentResourceReference.agent_id == first.id,
+                )
+            ).all()
+            == []
+        )
+        assert (
+            db.exec(
+                select(AgentResourceReference).where(
+                    AgentResourceReference.agent_id == second.id,
+                )
+            ).one()
+            is not None
+        )
+        assert db.get(GeneralSkill, gallery_skill.id) is not None
 
 
 def _seed_users(db: Session) -> tuple[User, User, User]:

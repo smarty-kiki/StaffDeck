@@ -4,12 +4,11 @@ import hashlib
 import json
 from typing import Any
 
-from sqlmodel import Session, select
+from sqlmodel import Session
 
 from app.agents.branching import (
     get_agent,
-    is_bound_resource_visible_for_agent,
-    is_open_gallery_resource,
+    visible_general_skill_rows,
     visible_knowledge_base_versions,
     visible_tool_rows,
 )
@@ -20,7 +19,6 @@ from app.core.task_request_compiler import (
     current_step_capability_refs,
 )
 from app.db.models import (
-    AgentResourceBinding,
     GeneralSkill,
     KnowledgeBase,
     MCPServer,
@@ -595,36 +593,12 @@ def general_skill_snapshot_digest(skill: GeneralSkill) -> str:
 def _visible_general_skills(
     db: Session, tenant_id: str, agent_id: str | None
 ) -> list[GeneralSkill]:
-    agent = get_agent(db, tenant_id, agent_id)
-    rows = db.exec(
-        select(GeneralSkill).where(
-            GeneralSkill.tenant_id == tenant_id,
-            GeneralSkill.status == "published",
-        )
-    ).all()
-    if agent_id and not agent:
-        return []
-    if not agent or agent.is_overall:
-        return [
-            row for row in rows if is_open_gallery_resource(db, tenant_id, "general_skill", row)
-        ]
-    bindings = db.exec(
-        select(AgentResourceBinding).where(
-            AgentResourceBinding.tenant_id == tenant_id,
-            AgentResourceBinding.agent_id == agent.id,
-            AgentResourceBinding.resource_type == "general_skill",
-            AgentResourceBinding.status == "active",
-        )
-    ).all()
-    by_id = {row.id: row for row in rows}
-    visible: list[GeneralSkill] = []
-    for binding in bindings:
-        row = by_id.get(binding.resource_id)
-        if row is not None and is_bound_resource_visible_for_agent(
-            db, tenant_id, "general_skill", row, binding
-        ):
-            visible.append(row)
-    return visible
+    """员工可见且已发布的通用技能 = 自己拥有的 ∪ 已引用的广场技能。"""
+    return [
+        row
+        for row in visible_general_skill_rows(db, tenant_id, agent_id)
+        if row.status == "published"
+    ]
 
 
 def _scope(row: object | None) -> str | None:

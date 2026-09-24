@@ -7,13 +7,13 @@ from fastapi import APIRouter, Depends, Header, Request, Response
 from pydantic import ValidationError
 from sqlmodel import Session, select
 
+from app.agents.branching import referenced_resource_ids, visible_skill_rows
 from app.api import skills as internal_skills
-from app.agents.branching import visible_skill_rows
 from app.db import get_session
 from app.db.models import (
+    AGENT_SCOPE,
     APIJob,
     APISOPDraft,
-    AgentResourceBinding,
     GeneralSkill,
     KnowledgeBase,
     Skill,
@@ -34,6 +34,7 @@ from app.public_api.schemas import (
 from app.public_api.sessions import ensure_public_agent
 from app.public_api.utils import etag_for
 from app.skills import SkillDistiller, SkillEditor
+from app.skills.nesting import SopNestingError, validate_sop_nesting
 from app.skills.skill_schema import (
     SkillCard,
     SkillCreateRequest,
@@ -42,8 +43,6 @@ from app.skills.skill_schema import (
     SkillUpdateRequest,
     skill_card_from_persisted,
 )
-from app.skills.nesting import SopNestingError, validate_sop_nesting
-
 
 router = APIRouter(tags=["sops"])
 
@@ -148,6 +147,35 @@ def _require_etag(row: APISOPDraft, if_match: str | None) -> None:
         raise PublicAPIError(412, "ETAG_MISMATCH", "The SOP draft changed since it was read.")
 
 
+def _resource_visible_to_agent(
+    db: Session,
+    tenant_id: str,
+    agent_id: str,
+    resource_type: str,
+    resource: object,
+) -> bool:
+    """资源对该员工是否可用 = 自己拥有的私有资源 ∪ 已引用的广场资源。
+
+    归属即生效：私有资源不再产生引用行，因此不能再只看引用表。
+    """
+    if resource is None or getattr(resource, "tenant_id", None) != tenant_id:
+        return False
+    if getattr(resource, "scope", None) == AGENT_SCOPE:
+        if getattr(resource, "owner_agent_id", None) != agent_id:
+            return False
+    elif getattr(resource, "id", None) not in set(
+        referenced_resource_ids(db, tenant_id, agent_id, resource_type)
+    ):
+        return False
+    if resource_type == "tool" and not getattr(resource, "enabled", False):
+        return False
+    if resource_type == "general_skill" and getattr(resource, "status", None) != "published":
+        return False
+    if resource_type == "knowledge_base" and getattr(resource, "status", None) != "active":
+        return False
+    return True
+
+
 def _validate_capability_refs(db: Session, row: APISOPDraft, card: SkillCard) -> list[dict[str, str]]:
     errors: list[dict[str, str]] = []
     type_models = {
@@ -164,28 +192,15 @@ def _validate_capability_refs(db: Session, row: APISOPDraft, card: SkillCard) ->
         model = type_models[resource_type]
         for resource_id in ids:
             resource = db.get(model, resource_id)
-            binding = db.exec(
-                select(AgentResourceBinding).where(
-                    AgentResourceBinding.tenant_id == row.tenant_id,
-                    AgentResourceBinding.agent_id == row.agent_id,
-                    AgentResourceBinding.resource_type == resource_type,
-                    AgentResourceBinding.resource_id == resource_id,
-                    AgentResourceBinding.status == "active",
-                )
-            ).first()
-            unavailable = not resource or resource.tenant_id != row.tenant_id or not binding
-            if resource_type == "tool" and resource and not resource.enabled:
-                unavailable = True
-            if resource_type == "general_skill" and resource and resource.status != "published":
-                unavailable = True
-            if resource_type == "knowledge_base" and resource and resource.status != "active":
-                unavailable = True
+            unavailable = not _resource_visible_to_agent(
+                db, row.tenant_id, row.agent_id, resource_type, resource
+            )
             if unavailable:
                 errors.append(
                     {
                         "path": f"capability_refs.{resource_type}",
                         "code": "CAPABILITY_UNAVAILABLE",
-                        "detail": f"{resource_type} {resource_id} is not active and bound to this agent.",
+                        "detail": f"{resource_type} {resource_id} is not available to this agent.",
                     }
                 )
     return errors

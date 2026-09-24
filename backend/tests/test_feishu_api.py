@@ -45,7 +45,7 @@ def _seed(engine) -> User:
         )
         db.add(owner)
         db.add(
-            AgentProfile(
+            AgentProfile(owner_user_id=owner.id,
                 id="agent_a",
                 tenant_id="tenant_a",
                 name="Agent A",

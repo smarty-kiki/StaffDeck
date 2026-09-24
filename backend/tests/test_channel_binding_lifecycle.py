@@ -177,7 +177,7 @@ def _seed_users(engine) -> dict[str, User]:
         owner = User(id="user_owner", tenant_id="tenant_demo", username="owner", password_hash="x")
         db.add(owner)
         db.add(
-            AgentProfile(
+            AgentProfile(owner_user_id=owner.id,
                 id="agent_xz",
                 tenant_id="tenant_demo",
                 name="行政",
@@ -185,7 +185,7 @@ def _seed_users(engine) -> dict[str, User]:
             )
         )
         db.add(
-            AgentProfile(
+            AgentProfile(owner_user_id=owner.id,
                 id="agent_cw",
                 tenant_id="tenant_demo",
                 name="财务",
