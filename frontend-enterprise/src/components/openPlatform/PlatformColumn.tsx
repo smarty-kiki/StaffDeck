@@ -111,20 +111,17 @@ export default function PlatformColumn({
         </div>
       </div>
 
-      {!isEmpty && (
-        <>
-          <div className="h-px w-full shrink-0 bg-[#e3e7f1]" />
+      {/* 入口不随内容为空而消失：空列也要能进去创建/管理，否则用户没有路径到达该模块。 */}
+      <div className="h-px w-full shrink-0 bg-[#e3e7f1]" />
 
-          <button
-            type="button"
-            onClick={onViewAll}
-            className="flex w-[120px] shrink-0 items-center justify-center gap-[2px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[20px] py-[8px] text-[12px] text-[#757f9c] transition-colors hover:text-[#18181a]"
-          >
-            查看全部
-            <IconChevronDown className="size-[14px] shrink-0 -rotate-90" />
-          </button>
-        </>
-      )}
+      <button
+        type="button"
+        onClick={onViewAll}
+        className="flex w-[120px] shrink-0 items-center justify-center gap-[2px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[20px] py-[8px] text-[12px] text-[#757f9c] transition-colors hover:text-[#18181a]"
+      >
+        查看全部
+        <IconChevronDown className="size-[14px] shrink-0 -rotate-90" />
+      </button>
     </section>
   );
 }

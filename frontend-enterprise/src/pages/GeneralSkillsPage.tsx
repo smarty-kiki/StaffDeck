@@ -1405,11 +1405,37 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
   );
 }
 
+/**
+ * 编辑器「返回」的目标。
+ *
+ * 同一个编辑器有多个入口（技能管理页、开放广场的技能/SOP 模块列表、编辑页里的再新建）。
+ * 返回目标必须跟着入口走，否则从广场进来点返回会被丢回技能管理页，链路断掉。
+ * `from` 只接受站内 `/enterprise` 路径，避免被拼成外部地址。
+ */
+export function resolveEditorReturn(from: string | null | undefined): { path: string; label: string } {
+  const fallback = { path: '/enterprise/general-skills', label: '返回技能' };
+  const target = (from ?? '').trim();
+  if (!target.startsWith('/enterprise/') || target.startsWith('/enterprise//')) return fallback;
+  const isPlatformModule =
+    target === '/enterprise/platform' || target.startsWith('/enterprise/platform/');
+  return { path: target, label: isPlatformModule ? '返回开放广场' : '返回技能' };
+}
+
 function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' } & GeneralSkillPageProps) {
   const navigate = useNavigate();
   const { slug: routeSlug } = useParams();
   const [editorSearchParams] = useSearchParams();
   const forceGalleryScope = editorSearchParams.get('scope') === 'gallery';
+  const editorReturn = resolveEditorReturn(editorSearchParams.get('from'));
+  // 编辑页里的「新建技能」保持在同一条链路上：视角（广场/私有）与来源都要带过去。
+  const newSkillPath = (() => {
+    const params = new URLSearchParams();
+    if (forceGalleryScope) params.set('scope', 'gallery');
+    const from = editorSearchParams.get('from');
+    if (from) params.set('from', from);
+    const query = params.toString();
+    return `/enterprise/general-skills/new${query ? `?${query}` : ''}`;
+  })();
   const [agentScopeLoaded, setAgentScopeLoaded] = useState(false);
   const [rows, setRows] = useState<GeneralSkillRead[]>([]);
   const [markdown, setMarkdown] = useState(EMPTY_SKILL_MARKDOWN);
@@ -1679,8 +1705,16 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
         const withoutSaved = current.filter((item) => item.id !== row.id && item.slug !== row.slug);
         return [row, ...withoutSaved];
       });
-      const scopeQuery = row.metadata?.scope === 'open_gallery' ? '?scope=gallery' : '';
-      navigate(`/enterprise/general-skills/${encodeURIComponent(row.slug)}/edit${scopeQuery}`, { replace: !editingSlug });
+      // 保存后原地切到编辑态：视角与来源一起带过去，否则随后的「返回」会丢掉链路。
+      const savedParams = new URLSearchParams();
+      if (row.metadata?.scope === 'open_gallery') savedParams.set('scope', 'gallery');
+      const savedFrom = editorSearchParams.get('from');
+      if (savedFrom) savedParams.set('from', savedFrom);
+      const savedQuery = savedParams.toString();
+      navigate(
+        `/enterprise/general-skills/${encodeURIComponent(row.slug)}/edit${savedQuery ? `?${savedQuery}` : ''}`,
+        { replace: !editingSlug },
+      );
       return row;
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '保存技能失败');
@@ -2486,12 +2520,12 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
       />
 
       <div className="mt-[20px] mb-[16px] flex flex-wrap justify-end gap-[16px]">
-        <UIButton variant="outline" className={RETURN_BUTTON_CLASS} onClick={() => navigate('/enterprise/general-skills')}>
+        <UIButton variant="outline" className={RETURN_BUTTON_CLASS} onClick={() => navigate(editorReturn.path)}>
           <IconArrowRight className="size-3.5 rotate-180" />
-          返回技能
+          {editorReturn.label}
         </UIButton>
         {!isNew && canManageCurrentScope && (
-          <UIButton variant="outline" className={RETURN_BUTTON_CLASS} onClick={() => navigate('/enterprise/general-skills/new')}>
+          <UIButton variant="outline" className={RETURN_BUTTON_CLASS} onClick={() => navigate(newSkillPath)}>
             <PlusOutlined />
             新建技能
           </UIButton>

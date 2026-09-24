@@ -560,7 +560,9 @@ export default function OpenPlatformPage({
           onRefresh={() => void loadPlatformData()}
           onCreate={selectedKind === 'general-skills' ? () => {
             // 直接落在广场视角新建：广场不是一条员工记录，用 ?scope=gallery 表达。
-            navigate('/enterprise/general-skills/new?scope=gallery');
+            // 同时带上来源，新建页的「返回」才会回到这个广场列表，而不是技能管理页。
+            const from = `/enterprise/platform/${selectedKind}`;
+            navigate(`/enterprise/general-skills/new?scope=gallery&from=${encodeURIComponent(from)}`);
           } : undefined}
           onOpenItem={(item) => setDetailItem({ kind: selectedKind, item })}
           canManage={canManagePlatform && selectedKind === 'agents'}
