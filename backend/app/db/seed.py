@@ -7,7 +7,10 @@ from sqlalchemy import text
 from sqlmodel import Session, select
 
 from app import paths
-from app.agents.branching import ensure_open_gallery_binding
+from app.agents.branching import (
+    ensure_open_gallery_binding,
+    reclaim_orphan_preset_gallery_resources,
+)
 from app.config import Settings, get_settings
 from app.db.models import (
     GALLERY_SCOPE,
@@ -860,6 +863,8 @@ DEMO_SKILL_CONTENTS = (
 )
 # 一次性初始化标记：写在 app_data_migrations 里，存在即不再补齐 demo 预置内容。
 DEMO_SEED_MARKER_ID = "20260922_staffdeck_demo_content_initialized"
+# 一次性清账标记：存在即不再回收广场里的孤儿预置资源。
+ORPHAN_PRESET_RECLAIM_MARKER_ID = "20260924_reclaim_orphan_preset_resources"
 _APP_DATA_MIGRATIONS_DDL = (
     "CREATE TABLE IF NOT EXISTS app_data_migrations ("
     "id VARCHAR PRIMARY KEY, "
@@ -877,22 +882,30 @@ def _demo_skill_contents() -> list[dict]:
     return [_skill_content_graph(raw_content) for raw_content in DEMO_SKILL_CONTENTS]
 
 
-def _demo_seed_marker_present(session: Session) -> bool:
+def _applied_marker_present(session: Session, marker_id: str) -> bool:
     session.execute(text(_APP_DATA_MIGRATIONS_DDL))
     row = session.execute(
         text("SELECT 1 FROM app_data_migrations WHERE id = :id"),
-        {"id": DEMO_SEED_MARKER_ID},
+        {"id": marker_id},
     ).first()
     return row is not None
 
 
-def _mark_demo_seed_applied(session: Session) -> None:
-    if _demo_seed_marker_present(session):
+def _record_applied_marker(session: Session, marker_id: str) -> None:
+    if _applied_marker_present(session, marker_id):
         return
     session.execute(
         text("INSERT INTO app_data_migrations (id) VALUES (:id)"),
-        {"id": DEMO_SEED_MARKER_ID},
+        {"id": marker_id},
     )
+
+
+def _demo_seed_marker_present(session: Session) -> bool:
+    return _applied_marker_present(session, DEMO_SEED_MARKER_ID)
+
+
+def _mark_demo_seed_applied(session: Session) -> None:
+    _record_applied_marker(session, DEMO_SEED_MARKER_ID)
 
 
 def _demo_seed_rows_present(session: Session) -> bool:
@@ -928,6 +941,24 @@ def _seed_demo_content_once(session: Session, settings: Settings) -> None:
     session.flush()
     _publish_seeded_gallery_bindings(session)
     _mark_demo_seed_applied(session)
+
+
+def _reclaim_orphan_preset_resources_once(session: Session) -> None:
+    """一次性回收广场里的孤儿预置资源（预置员工已删、资源还挂在广场）。
+
+    预置员工带着一整套预置资源（知识库 / SOP / 技能 / 工具）落地，这些资源以
+    `scope='gallery'` 发布在广场，本就不属于员工私有。删除预置员工时，旧版本不会
+    回收它们，带一次性标记的 seed 也不会再碰，于是就在广场里攒成没人能用的孤儿。
+
+    新版本在删除预置员工时已连带回收（见 `purge_agent`），这里只补一次历史欠账：
+    扫一遍广场，把「主人已经不在、也没人引用」的预置资源清掉。清完写标记，之后不再
+    重复扫描。
+    """
+    if _applied_marker_present(session, ORPHAN_PRESET_RECLAIM_MARKER_ID):
+        return
+    for tenant in session.exec(select(Tenant)).all():
+        reclaim_orphan_preset_gallery_resources(session, tenant.id)
+    _record_applied_marker(session, ORPHAN_PRESET_RECLAIM_MARKER_ID)
 
 
 def _seed_demo_skills(session: Session) -> None:
@@ -1093,6 +1124,8 @@ def seed_demo_data(session: Session) -> None:
     _normalize_seed_system_agents(session)
     _seed_demo_content_once(session, settings)
     seed_staffdeck_admin_gallery(session)
+    # 排在两条 seed 之后：先把该补的补齐，再回收「主人已被删除」的广场孤儿资源。
+    _reclaim_orphan_preset_resources_once(session)
 
     default_model = session.exec(
         select(ModelConfig).where(

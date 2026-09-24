@@ -11,6 +11,7 @@ from app.agents.branching import (
     count_resource_references,
     is_open_gallery_resource,
     purge_agent_owned_resources,
+    reclaim_preset_gallery_resource,
     reference_resource,
     resource_model_for_type,
     unreference_resource,
@@ -58,6 +59,7 @@ from app.db.models import (
     User,
     utc_now,
 )
+from app.db.preset_resources import preset_agent_ids
 from app.public_api.auth import generate_api_key
 from app.public_api.credential_profiles import (
     AGENT_KEY_ALLOWED_SCOPES,
@@ -467,8 +469,18 @@ def purge_agent(db: Session, tenant_id: str, row: AgentProfile) -> list[tuple[st
     references = db.exec(
         select(AgentResourceReference).where(AgentResourceReference.agent_id == row.id)
     ).all()
+    # 预置员工随附一整套预置演示资源（知识库/SOP/技能/工具）。员工被删掉后，这些资源
+    # 因为挂在广场（scope='gallery'）不会跟着走，也没人再引用 —— 不回收就会变成广场
+    # 里的孤儿数据。这里先记下引用，删完引用行再逐条判断「是否已无任何使用者」。
+    preset_candidates = (
+        [(reference.resource_type, reference.resource_id) for reference in references]
+        if row.id in preset_agent_ids()
+        else []
+    )
     for reference in references:
         db.delete(reference)
+    for resource_type, resource_id in preset_candidates:
+        reclaim_preset_gallery_resource(db, tenant_id, resource_type, resource_id)
     # 渠道挂载同步清理:否则孤儿挂载行会让 /员工 列出已删除员工的裸 ID,
     # 甚至可被 /切换 路由到。默认挂载被删时把首个剩余挂载提升为默认并同步
     # binding.agent_id,保持存量绑定回退路径有效。会话指针无需处理:

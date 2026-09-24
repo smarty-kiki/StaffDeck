@@ -17,6 +17,7 @@ from app.db.models import (
     KnowledgeConcept,
     KnowledgeDiscoverySuggestion,
     KnowledgeDocument,
+    KnowledgeIngestJob,
     MCPServer,
     ModelConfig,
     Skill,
@@ -221,6 +222,7 @@ def _purge_resource_children(
             KnowledgeConcept,
             KnowledgeDiscoverySuggestion,
             KnowledgeBaseVersion,
+            KnowledgeIngestJob,
         ):
             children = db.exec(
                 select(model).where(
@@ -278,6 +280,75 @@ def count_resource_references(
         )
     ).all()
     return len(set(agent_ids))
+
+
+def reclaim_preset_gallery_resource(
+    db: Session, tenant_id: str, resource_type: str, resource_id: str
+) -> bool:
+    """回收一条预置演示广场资源，返回是否真的删掉了。
+
+    前提缺一不可：资源存在且属于该租户、确实属于预置演示内容、仍在广场
+    （`scope='gallery'`）、且已经没有任何员工引用它。任何一条不满足都不动手 ——
+    尤其是「还有人引用」，那是用户正在用的资源，不能因为它是预置内容就删掉。
+    """
+    from app.db.preset_resources import is_preset_resource
+
+    model = RESOURCE_MODELS.get(resource_type)
+    if model is None:
+        return False
+    row = db.get(model, resource_id)
+    if row is None or getattr(row, "tenant_id", None) != tenant_id:
+        return False
+    if getattr(row, "scope", None) != GALLERY_SCOPE:
+        return False
+    if not is_preset_resource(resource_type, row):
+        return False
+    if count_resource_references(db, tenant_id, resource_type, resource_id) > 0:
+        return False
+    purge_resource_references(db, tenant_id, resource_type, resource_id)
+    _purge_resource_children(db, tenant_id, resource_type, row)
+    db.delete(row)
+    return True
+
+
+def reclaim_orphan_preset_gallery_resources(db: Session, tenant_id: str) -> dict[str, int]:
+    """回收「预置员工已不在、资源还挂在广场且无人引用」的孤儿资源。
+
+    只认演示包引用表里**明确归属某个预置员工**的资源：主人还在，那是正常演示内容，
+    留着；主人已经没了、资源也没人引用，它就是删除员工时漏掉的那一份，删掉。演示包
+    之外、不归属任何员工的预置内容不在本函数射程内 —— 那些是安装包自带的展示内容，
+    不该被生命周期清理误伤。
+
+    用于一次性清账：存量孤儿是在归属化改造前留下的，删员工不会带走它们，带一次性
+    标记的 seed 也不会再碰，只能主动回收。
+    """
+    from app.db.preset_resources import preset_resource_owners
+
+    owners = preset_resource_owners()
+    counts: dict[str, int] = {}
+    for resource_type, model in RESOURCE_MODELS.items():
+        if model is None:
+            continue
+        rows = db.exec(
+            select(model).where(
+                model.tenant_id == tenant_id,
+                model.scope == GALLERY_SCOPE,
+            )
+        ).all()
+        for row in rows:
+            owner_ids = owners.get((resource_type, row.id))
+            if not owner_ids:
+                continue
+            if any(_agent_exists(db, tenant_id, agent_id) for agent_id in owner_ids):
+                continue
+            if reclaim_preset_gallery_resource(db, tenant_id, resource_type, row.id):
+                counts[resource_type] = counts.get(resource_type, 0) + 1
+    return counts
+
+
+def _agent_exists(db: Session, tenant_id: str, agent_id: str) -> bool:
+    row = db.get(AgentProfile, agent_id)
+    return row is not None and getattr(row, "tenant_id", None) == tenant_id
 
 
 def reference_resource(
