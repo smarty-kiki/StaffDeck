@@ -385,7 +385,9 @@ export default function OpenPlatformPage({
 
   function platformDeleteUrl(platformKind: PlatformKind, item: PlatformItem): string {
     const resourceKey = encodeURIComponent(item.deleteKey || item.id);
-    // 广场资源不带 agent_id：管理员在广场作用域下架/删除它们。
+    // 广场两种治理动作不同：数字员工走专属的 gallery:unpublish 端点（员工本体保留），
+    // 知识库 / 技能 / SOP / 工具没有这层中间态，从广场拿掉就是直接删掉这条资源。
+    // 广场资源都不带 agent_id，写权限在管理员这一侧。
     if (platformKind === 'agents') return `/api/enterprise/agents/${resourceKey}?tenant_id=${TENANT_ID}`;
     if (platformKind === 'knowledge') return `/api/enterprise/knowledge-bases/${resourceKey}?tenant_id=${TENANT_ID}`;
     if (platformKind === 'general-skills') return `/api/enterprise/general-skills/${resourceKey}?tenant_id=${TENANT_ID}`;
@@ -408,7 +410,7 @@ export default function OpenPlatformPage({
       } else {
         await api.delete(platformDeleteUrl(platformKind, item));
       }
-      notify.success(platformKind === 'agents' ? '员工已从广场下线' : '已从广场移除');
+      notify.success(platformKind === 'agents' ? '员工已从广场下线' : '已从广场删除');
       setDetailItem((current) => (
         current && current.kind === platformKind && current.item.id === item.id ? null : current
       ));
@@ -572,11 +574,11 @@ export default function OpenPlatformPage({
             : undefined}
           createLabel={isPlazaCreateKind(selectedKind) ? plazaCreateLabel(selectedKind) : undefined}
           onOpenItem={(item) => setDetailItem({ kind: selectedKind, item })}
-          canManage={canManagePlatform && selectedKind === 'agents'}
-          unpublishingItemId={deletingItemKey.startsWith('agents:')
-            ? deletingItemKey.slice('agents:'.length)
+          canManage={canManagePlatform}
+          removingItemKey={deletingItemKey.startsWith(`${selectedKind}:`)
+            ? deletingItemKey.slice(selectedKind.length + 1)
             : undefined}
-          onUnpublishItem={(item) => setConfirmTarget({ kind: 'agents', item })}
+          onRemoveItem={(item) => setConfirmTarget({ kind: selectedKind, item })}
           onLogout={onLogout}
           userName={currentUser?.username}
         />
@@ -648,6 +650,10 @@ export default function OpenPlatformPage({
                     description={item.description}
                     tags={item.tags.slice(0, 2)}
                     onClick={() => setDetailItem({ kind: platform.kind, item })}
+                    onDelete={canManagePlatform
+                      ? () => setConfirmTarget({ kind: platform.kind, item })
+                      : undefined}
+                    deleting={deletingItemKey === platformItemDeleteKey(platform.kind, item)}
                   />
                 )
               ))}

@@ -29,7 +29,9 @@ function record(rawValue, sourceFile, node, kind) {
   if (ignoredFragments.some((fragment) => value.includes(fragment))) return;
   if (Object.prototype.hasOwnProperty.call(catalog, value)) return;
   const line = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1;
-  const key = `${sourceFile.fileName}:${line}:${kind}`;
+  // 键里必须带上文案本身：同一行出现两条未翻译文案时，只按 行+类型 做键会互相覆盖，
+  // 结果只报出后一条，前一条静默溜过去。
+  const key = `${sourceFile.fileName}:${line}:${kind}:${value}`;
   missing.set(key, value);
 }
 

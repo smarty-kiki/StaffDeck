@@ -285,6 +285,8 @@
   "从广场下架": "Unpublish from Marketplace",
   "从广场下线": "Take Offline from Marketplace",
   "从广场下线员工「{1}」？": "Take employee “{1}” offline from the Marketplace?",
+  "从广场删除": "Delete from Marketplace",
+  "已从广场删除": "Deleted from Marketplace",
   "从开放广场复制可用 SOP；不可复制内容不会出现在列表。": "Copy an available SOP from the Marketplace. Items that cannot be copied are hidden.",
   "从开放广场复制可用工具；复制后会成为当前员工的本地工具绑定。": "Copy an available tool from the Marketplace and bind it locally to the current employee.",
   "从开放广场复制可用技能；不会覆盖当前编辑区内容。": "Copy an available skill from the Marketplace without overwriting the current editor content.",

@@ -27,6 +27,11 @@ export type PlatformDetailKind = 'agents' | 'knowledge' | 'general-skills' | 'sk
 
 export type PlatformDetailItem = {
   id: string;
+  /**
+   * 广场治理用的业务键。数字员工 / 知识库 / 工具就是 id，技能是 slug、SOP 是 skill_id ——
+   * 缺省按 id 处理。
+   */
+  deleteKey?: string;
   title: string;
   description: string;
   meta: string;
@@ -64,9 +69,12 @@ export type PlatformKindDetailViewProps = {
   /** 管理员的「创建开放 XX」文案，随模块变化（知识库 / 技能 / SOP / 工具）。 */
   createLabel?: string;
   onOpenItem: (item: PlatformDetailItem) => void;
+  /** 管理员才拿到广场治理动作（数字员工「下架」/ 其他资源「删除」）。 */
   canManage?: boolean;
-  unpublishingItemId?: string;
-  onUnpublishItem?: (item: PlatformDetailItem) => void;
+  /** 正在被治理的那条 item 的 deleteKey，用于按钮 loading。 */
+  removingItemKey?: string;
+  /** 数字员工是「下架」，知识库 / 技能 / SOP / 工具是「删除」。 */
+  onRemoveItem?: (item: PlatformDetailItem) => void;
   onLogout?: () => void;
   userName?: string;
 };
@@ -108,12 +116,20 @@ export default function PlatformKindDetailView({
   createLabel = '创建开放技能',
   onOpenItem,
   canManage = false,
-  unpublishingItemId,
-  onUnpublishItem,
+  removingItemKey,
+  onRemoveItem,
   onLogout,
   userName,
 }: PlatformKindDetailViewProps) {
   const [searchText, setSearchText] = useState('');
+
+  /** 治理键：优先用 deleteKey（技能是 slug、SOP 是 skill_id），缺省退回 id。 */
+  const itemGovernanceKey = (item: PlatformDetailItem) => item.deleteKey || item.id;
+  const isRemoving = (item: PlatformDetailItem) => Boolean(removingItemKey)
+    && removingItemKey === itemGovernanceKey(item);
+  const removeHandler = (item: PlatformDetailItem) => (canManage && onRemoveItem
+    ? () => onRemoveItem(item)
+    : undefined);
 
   const filteredItems = useMemo(() => {
     const keyword = searchText.trim().toLowerCase();
@@ -223,8 +239,8 @@ export default function PlatformKindDetailView({
                   description={item.description}
                   stats={employeeStats(item.agent)}
                   onOpen={() => onOpenItem(item)}
-                  onUnpublish={canManage && onUnpublishItem ? () => onUnpublishItem(item) : undefined}
-                  unpublishing={unpublishingItemId === item.id}
+                  onUnpublish={removeHandler(item)}
+                  unpublishing={isRemoving(item)}
                 />
               ))}
             </div>
@@ -242,6 +258,8 @@ export default function PlatformKindDetailView({
                   description={item.description}
                   tags={item.tags.slice(0, 2)}
                   onClick={() => onOpenItem(item)}
+                  onDelete={removeHandler(item)}
+                  deleting={isRemoving(item)}
                 />
               ))}
             </div>

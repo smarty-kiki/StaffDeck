@@ -66,3 +66,43 @@ describe('PlatformKindDetailView create entry', () => {
     expect(screen.queryByRole('button', { name: /创建开放知识库/ })).toBeNull();
   });
 });
+
+describe('PlatformKindDetailView plaza governance', () => {
+  const knowledgeItem = {
+    id: 'row-uuid',
+    deleteKey: 'kb-1',
+    title: 'Finance KB',
+    description: 'Plaza knowledge base',
+    meta: '12 documents',
+    tags: ['v1.0.0'],
+  };
+
+  it('offers delete on plaza resources, not the employee unpublish wording', async () => {
+    const onRemoveItem = vi.fn();
+    renderDetail({ items: [knowledgeItem], canManage: true, onRemoveItem });
+
+    expect(screen.queryByRole('button', { name: '从广场下架' })).toBeNull();
+    await userEvent.click(screen.getByRole('button', { name: '从广场删除' }));
+    expect(onRemoveItem).toHaveBeenCalledTimes(1);
+    expect(onRemoveItem.mock.calls[0][0]).toMatchObject({ id: 'row-uuid' });
+  });
+
+  it('hides the governance action from non-admins', () => {
+    renderDetail({ items: [knowledgeItem], onRemoveItem: vi.fn() });
+    expect(screen.queryByRole('button', { name: '从广场删除' })).toBeNull();
+  });
+
+  it('matches the in-flight item by its plaza delete key, not the row id', () => {
+    // 技能用 slug、SOP 用 skill_id：拿 row id 去比会永远匹配不上，按钮不会进 loading。
+    renderDetail({
+      kind: 'general-skills',
+      items: [{ ...knowledgeItem, deleteKey: 'skill-slug' }],
+      canManage: true,
+      onRemoveItem: vi.fn(),
+      removingItemKey: 'skill-slug',
+    });
+
+    const action = screen.getByRole('button', { name: '从广场删除' }) as HTMLButtonElement;
+    expect(action.disabled).toBe(true);
+  });
+});
