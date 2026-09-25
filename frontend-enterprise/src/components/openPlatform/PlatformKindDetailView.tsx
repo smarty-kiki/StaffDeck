@@ -61,6 +61,8 @@ export type PlatformKindDetailViewProps = {
   onBack: () => void;
   onRefresh: () => void;
   onCreate?: () => void;
+  /** 管理员的「创建开放 XX」文案，随模块变化（知识库 / 技能 / SOP / 工具）。 */
+  createLabel?: string;
   onOpenItem: (item: PlatformDetailItem) => void;
   canManage?: boolean;
   unpublishingItemId?: string;
@@ -103,6 +105,7 @@ export default function PlatformKindDetailView({
   onBack,
   onRefresh,
   onCreate,
+  createLabel = '创建开放 Skill',
   onOpenItem,
   canManage = false,
   unpublishingItemId,
@@ -140,7 +143,7 @@ export default function PlatformKindDetailView({
         {onCreate && (
           <UIButton onClick={onCreate} className="h-8 gap-1 rounded-[10px] bg-[#18181a] px-5 text-[12px] font-normal text-white hover:bg-[#303030]">
             <IconAdd className="size-3.5" />
-            创建开放 Skill
+            {createLabel}
           </UIButton>
         )}
         <UIButton

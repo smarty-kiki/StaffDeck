@@ -52,6 +52,7 @@ import { Button as UIButton } from '@/components/ui/button';
 import { notify } from '@/components/ui/app-toast';
 import { cn } from '@/lib/utils';
 import { isTeamScope, readEmployeeScope } from '@/lib/agent-scope-storage';
+import { isPlazaScopeValue, PLAZA_SCOPE_VALUE, resolveReturnTarget } from '@/lib/plaza-navigation';
 import {
   MENU_CONTENT_CLASS,
   MENU_ITEM_CLASS,
@@ -1410,27 +1411,21 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
  *
  * 同一个编辑器有多个入口（技能管理页、开放广场的技能/SOP 模块列表、编辑页里的再新建）。
  * 返回目标必须跟着入口走，否则从广场进来点返回会被丢回技能管理页，链路断掉。
- * `from` 只接受站内 `/enterprise` 路径，避免被拼成外部地址。
  */
 export function resolveEditorReturn(from: string | null | undefined): { path: string; label: string } {
-  const fallback = { path: '/enterprise/general-skills', label: '返回技能' };
-  const target = (from ?? '').trim();
-  if (!target.startsWith('/enterprise/') || target.startsWith('/enterprise//')) return fallback;
-  const isPlatformModule =
-    target === '/enterprise/platform' || target.startsWith('/enterprise/platform/');
-  return { path: target, label: isPlatformModule ? '返回开放广场' : '返回技能' };
+  return resolveReturnTarget(from, { path: '/enterprise/general-skills', label: '返回技能' });
 }
 
 function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' } & GeneralSkillPageProps) {
   const navigate = useNavigate();
   const { slug: routeSlug } = useParams();
   const [editorSearchParams] = useSearchParams();
-  const forceGalleryScope = editorSearchParams.get('scope') === 'gallery';
+  const forceGalleryScope = isPlazaScopeValue(editorSearchParams.get('scope'));
   const editorReturn = resolveEditorReturn(editorSearchParams.get('from'));
   // 编辑页里的「新建技能」保持在同一条链路上：视角（广场/私有）与来源都要带过去。
   const newSkillPath = (() => {
     const params = new URLSearchParams();
-    if (forceGalleryScope) params.set('scope', 'gallery');
+    if (forceGalleryScope) params.set('scope', PLAZA_SCOPE_VALUE);
     const from = editorSearchParams.get('from');
     if (from) params.set('from', from);
     const query = params.toString();
@@ -1707,7 +1702,7 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
       });
       // 保存后原地切到编辑态：视角与来源一起带过去，否则随后的「返回」会丢掉链路。
       const savedParams = new URLSearchParams();
-      if (row.metadata?.scope === 'open_gallery') savedParams.set('scope', 'gallery');
+      if (row.metadata?.scope === 'open_gallery') savedParams.set('scope', PLAZA_SCOPE_VALUE);
       const savedFrom = editorSearchParams.get('from');
       if (savedFrom) savedParams.set('from', savedFrom);
       const savedQuery = savedParams.toString();

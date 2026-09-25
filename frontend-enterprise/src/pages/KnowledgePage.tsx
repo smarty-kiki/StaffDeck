@@ -71,6 +71,7 @@ import {
   persistSharedAgentScope,
   readEmployeeScope,
 } from '@/lib/agent-scope-storage';
+import { isPlazaScopeValue, resolveReturnTarget } from '@/lib/plaza-navigation';
 import IconAdd from '../assets/icons/add.svg?react';
 import IconChevronDown from '../assets/icons/chevron-down.svg?react';
 import IconClear from '../assets/icons/field-clear.svg?react';
@@ -1658,10 +1659,17 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
 
 export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  // 从开放广场进来时强制落在广场视角：这里的知识库会挂到广场，而不是某个员工的私有范围。
+  const forcePlazaScope = isPlazaScopeValue(searchParams.get('scope'));
+  const returnTarget = resolveReturnTarget(searchParams.get('from'), {
+    path: '/enterprise/knowledge',
+    label: '返回',
+  });
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBaseRead[]>([]);
   const [capabilityScope, setCapabilityScope] = useState<CapabilityScope>('general');
   const [jobs, setJobs] = useState<Record<string, KnowledgeIngestJobRead>>({});
-  const [agentId, setAgentId] = useState(readEmployeeScope);
+  const [agentId, setAgentId] = useState(() => (forcePlazaScope ? '' : readEmployeeScope()));
   const [agentScopeLoaded, setAgentScopeLoaded] = useState(false);
   const [checkedDiscoveryJobIds, setCheckedDiscoveryJobIds] = useState<string[]>([]);
   const [pendingDiscoveries, setPendingDiscoveries] = useState<KnowledgeDiscoveryRead[]>([]);
@@ -1685,6 +1693,14 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
 
   useEffect(() => {
     let active = true;
+    // 广场视角不参与「当前员工」的解析，也不把广场写回共享的员工选择。
+    if (forcePlazaScope) {
+      setAgentId('');
+      setAgentScopeLoaded(true);
+      return () => {
+        active = false;
+      };
+    }
     api
       .get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`)
       .then((agentRows) => {
@@ -1707,7 +1723,7 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
     return () => {
       active = false;
     };
-  }, [currentUser?.id]);
+  }, [currentUser?.id, forcePlazaScope]);
 
   useEffect(() => {
     if (!agentScopeLoaded) return;
@@ -1717,12 +1733,14 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
 
   useEffect(() => {
     const onScopeChange = (event: Event) => {
+      // 广场视角由入口决定，不跟着别处切换的员工走。
+      if (forcePlazaScope) return;
       const next = (event as CustomEvent<{ agentId?: string }>).detail?.agentId || '';
       setAgentId(next && !isTeamScope(next) ? next : readEmployeeScope());
     };
     window.addEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
     return () => window.removeEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
-  }, []);
+  }, [forcePlazaScope]);
 
   useEffect(() => {
     if (activeJobs.length === 0) return;
@@ -1876,9 +1894,9 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
             <h3 className="my-[4px] text-[20px] font-semibold text-foreground">新建知识库</h3>
             <span className="text-[13px] text-[#858b9c]">上传业务文档后，系统会先生成知识图谱，再刷新目录索引、引用来源与自发现建议。</span>
           </div>
-            <UIButton variant="outline" onClick={() => navigate('/enterprise/knowledge')}>
+            <UIButton variant="outline" onClick={() => navigate(returnTarget.path)}>
               <RightOutlined />
-              返回
+              {returnTarget.label}
             </UIButton>
         </div>
 

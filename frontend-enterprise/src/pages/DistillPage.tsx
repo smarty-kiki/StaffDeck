@@ -75,6 +75,7 @@ import {
 import { ModelConfigDropdown } from '@/components/ModelConfigDropdown';
 import { cn } from '@/lib/utils';
 import { isTeamScope, readEmployeeScope } from '@/lib/agent-scope-storage';
+import { isPlazaScopeValue, PLAZA_SCOPE_VALUE, resolveReturnTarget } from '@/lib/plaza-navigation';
 import { subscribeEnterpriseCapabilityCatalogRefresh } from '@/lib/capability-catalog-events';
 import { SELECT_TRIGGER_CLASS } from '@/lib/enterprise-ui';
 import { formatHandoffAssigneeValue, parseHandoffAssigneeValue } from '@/lib/handoff-assignee';
@@ -611,8 +612,15 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
   const skillId = searchParams.get('skill_id');
   const mode = searchParams.get('mode') || '';
   const workspaceId = searchParams.get('workspace_id') || '';
+  // 从开放广场的 SOP 模块进来：这条 SOP 要建在广场，不能被 localStorage 里
+  // 还留着的员工范围拽回私有资源。
+  const forcePlazaScope = isPlazaScopeValue(searchParams.get('scope'));
+  const returnTarget = resolveReturnTarget(searchParams.get('from'), {
+    path: '/enterprise/skills',
+    label: '返回',
+  });
   const [selectedAgentId, setSelectedAgentId] = useState(readEmployeeScope);
-  const activeAgentId = searchParams.get('agent_id') || selectedAgentId;
+  const activeAgentId = forcePlazaScope ? '' : (searchParams.get('agent_id') || selectedAgentId);
   const agentQuery = activeAgentId ? `&agent_id=${encodeURIComponent(activeAgentId)}` : '';
   const agentSearchParam = activeAgentId ? `agent_id=${encodeURIComponent(activeAgentId)}` : '';
   const agentOnlyQuery = agentSearchParam ? `?${agentSearchParam}` : '';
@@ -1826,6 +1834,10 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     const nextWorkspaceId = createDistillWorkspaceId();
     const nextParams = new URLSearchParams({ mode: 'create', workspace_id: nextWorkspaceId });
     if (activeAgentId) nextParams.set('agent_id', activeAgentId);
+    // 广场视角与来源跟着走，下一次新建仍在同一条链路上。
+    if (forcePlazaScope) nextParams.set('scope', PLAZA_SCOPE_VALUE);
+    const from = searchParams.get('from');
+    if (from) nextParams.set('from', from);
     const nextRoute = `/enterprise/skills/distill?${nextParams.toString()}`;
     const nextCacheKey = `skill-distill:${TENANT_ID}:${activeAgentId || 'default'}:create:${nextWorkspaceId}`;
     removeDistillCache(cacheKey);
@@ -2239,9 +2251,9 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     <div className={DISTILL_PAGE_CLASS}>
       <AppHeader className="shrink-0" onLogout={onLogout} userName={currentUser?.username} title={pageTitle} />
       <div className={DISTILL_ACTIONS_CLASS}>
-        <UIButton variant="outline" className={RETURN_BUTTON_CLASS} onClick={() => navigate('/enterprise/skills')}>
+        <UIButton variant="outline" className={RETURN_BUTTON_CLASS} onClick={() => navigate(returnTarget.path)}>
           <ArrowLeftOutlined />
-          返回
+          {returnTarget.label}
         </UIButton>
       </div>
       <div className={WORKBENCH_CLASS}>

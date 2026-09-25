@@ -67,6 +67,7 @@ import {
 } from '../employee';
 import { useClientPagination } from '../hooks/useClientPagination';
 import { isTeamScope, readEmployeeScope } from '../lib/agent-scope-storage';
+import { isPlazaScopeValue, PLAZA_SCOPE_VALUE, resolveReturnTarget } from '../lib/plaza-navigation';
 import { StatusBadge } from './scheduled-tasks/StatusBadge';
 import type {
   AgentProfileRead,
@@ -971,8 +972,9 @@ export function McpServerEditPage(props: ToolPageProps = {}) {
  * 新建工具时顶部的类型切换条：HTTP 工具 / MCP 服务器。
  * 点击即跳转到对应的新建页，体验上像同一个「新建工具」流程里的分支。
  */
-function ToolTypeSwitcher({ active, onProtocolChange }: { active: 'http' | 'a2a' | 'mcp'; onProtocolChange?: (protocol: 'http' | 'a2a') => void }) {
+function ToolTypeSwitcher({ active, onProtocolChange, carryQuery = '' }: { active: 'http' | 'a2a' | 'mcp'; onProtocolChange?: (protocol: 'http' | 'a2a') => void; carryQuery?: string }) {
   const navigate = useNavigate();
+  const withQuery = (to: string) => (carryQuery ? `${to}?${carryQuery}` : to);
   const options: { value: 'http' | 'a2a' | 'mcp'; label: string; hint: string; to: string }[] = [
     { value: 'http', label: 'HTTP 工具', hint: '配置单个 HTTP 接口作为工具', to: '/enterprise/tools/new' },
     { value: 'a2a', label: 'A2A Agent', hint: '通过 A2A SendMessage 调用远程智能体', to: '/enterprise/tools/new' },
@@ -989,9 +991,18 @@ function ToolTypeSwitcher({ active, onProtocolChange }: { active: 'http' | 'a2a'
               key={option.value}
               type="button"
               onClick={() => {
-                if (option.value === 'mcp') navigate(option.to);
-                else if (onProtocolChange) onProtocolChange(option.value);
-                else navigate(`${option.to}?type=${option.value}`);
+                if (option.value === 'mcp') {
+                  navigate(withQuery(option.to));
+                  return;
+                }
+                if (onProtocolChange) {
+                  onProtocolChange(option.value);
+                  return;
+                }
+                // 切换类型不能丢掉来源：广场视角与返回目标都要跟着走。
+                const params = new URLSearchParams(carryQuery);
+                params.set('type', option.value);
+                navigate(`${option.to}?${params.toString()}`);
               }}
               className={cn(
                 'relative flex min-w-[200px] flex-1 items-start gap-[10px] rounded-[12px] border px-[16px] py-[12px] text-left transition-all',
@@ -1040,6 +1051,19 @@ function ToolEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' 
   const { toolId } = useParams();
   const isEdit = mode === 'edit';
   const requestedToolType = searchParams.get('type') === 'a2a' ? 'a2a' : 'http';
+  // 从开放广场进来：工具要建在广场，而不是当前 localStorage 里还留着的那个员工名下。
+  const forcePlazaScope = isPlazaScopeValue(searchParams.get('scope'));
+  const returnTarget = resolveReturnTarget(searchParams.get('from'), {
+    path: '/enterprise/tools',
+    label: '返回工具',
+  });
+  const carryQuery = (() => {
+    const params = new URLSearchParams();
+    if (forcePlazaScope) params.set('scope', PLAZA_SCOPE_VALUE);
+    const from = searchParams.get('from');
+    if (from) params.set('from', from);
+    return params.toString();
+  })();
 
   const setField = <K extends keyof ToolFormValues>(name: K, value: ToolFormValues[K]) =>
     setValues((prev) => ({ ...prev, [name]: value }));
@@ -1080,14 +1104,14 @@ function ToolEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' 
     if (!payload) return;
     setLoading(true);
     try {
-      const agentQuery = currentAgentQuery();
+      const agentQuery = forcePlazaScope ? '' : currentAgentQuery();
       const saved = isEdit && toolId
         ? await api.put<ToolRead>(`/api/enterprise/tools/${toolId}${agentQuery ? `?${agentQuery.slice(1)}` : ''}`, payload)
         : await api.post<ToolRead>(`/api/enterprise/tools${agentQuery ? `?${agentQuery.slice(1)}` : ''}`, payload);
       notify.success('已保存');
       announceEnterpriseCapabilityCatalogChange({
         resourceType: 'tool',
-        agentId: readEmployeeScope() || undefined,
+        agentId: forcePlazaScope ? undefined : readEmployeeScope() || undefined,
       });
       setTool(saved);
       setValues(toolToFormValues(saved));
@@ -1114,9 +1138,9 @@ function ToolEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' 
         }
       />
       <div className="mt-[20px] mb-[16px] flex flex-wrap justify-end gap-[16px]">
-        <UIButton variant="outline" onClick={() => navigate('/enterprise/tools')} className={RETURN_BUTTON_CLASS}>
+        <UIButton variant="outline" onClick={() => navigate(returnTarget.path)} className={RETURN_BUTTON_CLASS}>
           <IconArrowRight className="size-3.5 rotate-180" />
-          返回工具
+          {returnTarget.label}
         </UIButton>
         {isEdit && tool && (
           <UIButton
@@ -1132,7 +1156,7 @@ function ToolEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' 
           保存
         </UIButton>
       </div>
-      {!isEdit && <ToolTypeSwitcher active={values.tool_type} onProtocolChange={(protocol) => setValues((previous) => ({ ...previous, tool_type: protocol, method: 'POST' }))} />}
+      {!isEdit && <ToolTypeSwitcher active={values.tool_type} carryQuery={carryQuery} onProtocolChange={(protocol) => setValues((previous) => ({ ...previous, tool_type: protocol, method: 'POST' }))} />}
       <div className="grid grid-cols-1 items-start gap-[20px] xl:grid-cols-2">
         <SectionCard title="工具定义" loading={loading && isEdit && !tool}>
           <ToolFormFields values={values} setField={setField} bucketOptions={bucketOptions} lockName={isEdit} />
@@ -1474,6 +1498,20 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
   const navigate = useNavigate();
   const { serverId } = useParams();
   const isEdit = mode === 'edit';
+  const [searchParams] = useSearchParams();
+  // 从开放广场进来：发现工具与返回都要落在广场视角，而不是回到工具管理页。
+  const forcePlazaScope = isPlazaScopeValue(searchParams.get('scope'));
+  const returnTarget = resolveReturnTarget(searchParams.get('from'), {
+    path: '/enterprise/tools',
+    label: '返回工具',
+  });
+  const carryQuery = (() => {
+    const params = new URLSearchParams();
+    if (forcePlazaScope) params.set('scope', PLAZA_SCOPE_VALUE);
+    const from = searchParams.get('from');
+    if (from) params.set('from', from);
+    return params.toString();
+  })();
 
   const setField = <K extends keyof McpFormValues>(name: K, value: McpFormValues[K]) =>
     setValues((prev) => ({ ...prev, [name]: value }));
@@ -1587,7 +1625,7 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
     if (!built) return;
     setDiscovering(true);
     try {
-      const agentQuery = currentAgentQuery();
+      const agentQuery = forcePlazaScope ? '' : currentAgentQuery();
       const response = server
         ? await api.post<MCPDiscoverResponse>(`/api/enterprise/mcp-servers/${server.id}/discover${agentQuery ? `?${agentQuery.slice(1)}` : ''}`, {
             tenant_id: TENANT_ID,
@@ -1624,7 +1662,7 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
     }
     setSyncing(true);
     try {
-      const agentQuery = currentAgentQuery();
+      const agentQuery = forcePlazaScope ? '' : currentAgentQuery();
       const response = await api.post<MCPSyncResponse>(
         `/api/enterprise/mcp-servers/${server.id}/sync${agentQuery ? `?${agentQuery.slice(1)}` : ''}`,
         {
@@ -1639,7 +1677,7 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
       notify.success(`同步完成：新增 ${response.imported.length}，更新 ${response.updated.length}`);
       announceEnterpriseCapabilityCatalogChange({
         resourceType: 'tool',
-        agentId: readEmployeeScope() || undefined,
+        agentId: forcePlazaScope ? undefined : readEmployeeScope() || undefined,
       });
       try {
         const refreshed = await api.get<MCPServerRead>(
@@ -1722,15 +1760,15 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
         description="配置 MCP Server 连接后，可发现其提供的工具并同步为工具集。"
       />
       <div className="mt-[20px] mb-[16px] flex flex-wrap justify-end gap-[16px]">
-        <UIButton variant="outline" onClick={() => navigate('/enterprise/tools')} className={RETURN_BUTTON_CLASS}>
+        <UIButton variant="outline" onClick={() => navigate(returnTarget.path)} className={RETURN_BUTTON_CLASS}>
           <IconArrowRight className="size-3.5 rotate-180" />
-          返回工具
+          {returnTarget.label}
         </UIButton>
         <UIButton disabled={saving} onClick={() => void save()} className={PRIMARY_BUTTON_CLASS}>
           保存
         </UIButton>
       </div>
-      {!isEdit && <ToolTypeSwitcher active="mcp" />}
+      {!isEdit && <ToolTypeSwitcher active="mcp" carryQuery={carryQuery} />}
       <div className="grid grid-cols-1 items-start gap-[20px] xl:grid-cols-2">
         <SectionCard title="连接配置" loading={loading && isEdit && !server}>
           <div className="flex flex-col gap-[16px]">
