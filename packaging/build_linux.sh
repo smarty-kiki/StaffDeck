@@ -109,7 +109,8 @@ packaging/out/staffdeck/staffdeck --packaging-smoke
 rm -rf packaging/out/staffdeck/runtime
 cp -a "$RUNTIME_DL_ROOT/python" packaging/out/staffdeck/runtime
 echo "==> [5b/8] Bundling SRT + Node runtime"
-rm -rf packaging/sandbox_runtime packaging/out/staffdeck/sandbox
+# 只清产物里的副本；packaging/sandbox_runtime 交给 fetch_sandbox_runtime.py 自己判断复用。
+rm -rf packaging/out/staffdeck/sandbox
 python3 packaging/fetch_sandbox_runtime.py packaging/sandbox_runtime
 cp -a packaging/sandbox_runtime packaging/out/staffdeck/sandbox
 python3 packaging/smoke_sandbox_bundle.py packaging/out/staffdeck/sandbox

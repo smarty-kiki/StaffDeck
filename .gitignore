@@ -33,6 +33,7 @@ packaging/build/
 packaging/runtime/
 packaging/runtime_dl/
 packaging/sandbox_runtime/
+packaging/.runtime-cache/
 packaging/_win_reqs.txt
 *.tsbuildinfo
 *.egg-info/

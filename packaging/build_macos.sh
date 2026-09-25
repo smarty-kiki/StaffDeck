@@ -162,7 +162,9 @@ rm -rf "$APP/Contents/Resources/runtime" "$APP/Contents/MacOS/runtime"
 cp -R packaging/runtime_dl/python "$APP/Contents/Resources/runtime"
 
 echo "==> [4b/5] 附带 SRT + Node 运行时"
-rm -rf packaging/sandbox_runtime "$APP/Contents/Resources/sandbox"
+# 只清 app 里的那份副本；packaging/sandbox_runtime 交给 fetch_sandbox_runtime.py 自己判断 ——
+# bundle 校验通过就直接复用，不再重下 Node、不再重跑 npm ci。
+rm -rf "$APP/Contents/Resources/sandbox"
 python3 packaging/fetch_sandbox_runtime.py packaging/sandbox_runtime
 cp -R packaging/sandbox_runtime "$APP/Contents/Resources/sandbox"
 python3 packaging/smoke_sandbox_bundle.py "$APP/Contents/Resources/sandbox"

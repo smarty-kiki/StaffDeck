@@ -3,6 +3,12 @@
 The resulting directory contains ``bin/node`` and the SRT package. Runtime
 code invokes the package entrypoint with the bundled Node binary, so the
 installed app does not depend on a user's global npm installation.
+
+复用策略（避免每次构建都重新下载 Node + 重跑 npm ci）：
+  - 目标目录里已经有 ``bin/node``、依赖版本与评审过的 lockfile 一致、补丁也在位时，
+    直接复用整个 bundle，不再联网也不再 npm ci。
+  - Node 的 tar 包缓存在 <cache>/ 里，重装依赖时才需要用；缓存被截断会自动重下一次。
+  - STAFFDECK_RUNTIME_CACHE 可指定缓存目录；STAFFDECK_RUNTIME_REFRESH=1 强制重装。
 """
 
 from __future__ import annotations
@@ -17,7 +23,6 @@ import socket
 import subprocess
 import sys
 import tarfile
-import tempfile
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -27,6 +32,8 @@ MANIFEST_DIR = Path(__file__).resolve().parent
 PACKAGE_JSON = MANIFEST_DIR / "sandbox-runtime-package.json"
 PACKAGE_LOCK = MANIFEST_DIR / "sandbox-runtime-package-lock.json"
 NODE_VERSION = os.environ.get("STAFFDECK_NODE_VERSION", "v22.14.0")
+# Node tar 包缓存：与会被重装的 bundle 目录分开，且已被 .gitignore 忽略。
+DEFAULT_CACHE_DIR = MANIFEST_DIR / ".runtime-cache"
 PATCH_MARKER = "staffdeck-allow-all-domains-patch-v1"
 PATCHED_SHA256 = {
     "sandbox-config.js": "17a9bdd4cce375bb098f9c02eb564cf80806079571d4ff784e2af7d27db446bb",
@@ -88,15 +95,62 @@ def _verify_patched_dist(config_path: Path, manager_path: Path) -> None:
             raise SystemExit(f"Patched SRT dist hash mismatch: {path.name}")
 
 
+def _cache_dir() -> Path:
+    override = os.environ.get("STAFFDECK_RUNTIME_CACHE", "").strip()
+    return Path(override) if override else DEFAULT_CACHE_DIR
+
+
+def _node_file_name() -> str:
+    """按当前平台给出 bundle 里 Node 可执行文件的名字。"""
+    return "node.exe" if platform.system().lower() == "windows" else "node"
+
+
+def _bundle_is_ready(destination: Path) -> bool:
+    """判断已有 bundle 能否直接复用：Node 在位、依赖与 lockfile 一致、补丁已打。
+
+    这三项分别由 ``_verify_srt_integrity``（逐包版本比对评审过的 lockfile）和
+    ``_apply_allow_all_domains_patch``（幂等 + 补丁后文件哈希校验）把关，
+    所以复用和重新 npm ci 一样可信。
+    """
+    node = destination / "bin" / _node_file_name()
+    if not node.is_file():
+        return False
+    # 清单被改过（例如升了 SRT 版本）就必须重建，不能复用旧依赖。
+    for manifest, name in ((PACKAGE_JSON, "package.json"), (PACKAGE_LOCK, "package-lock.json")):
+        installed = destination / name
+        if not installed.is_file() or installed.read_bytes() != manifest.read_bytes():
+            return False
+    try:
+        _verify_srt_integrity(destination)
+        _apply_allow_all_domains_patch(destination)
+    except SystemExit:
+        return False
+    return _node_version(node) == NODE_VERSION
+
+
+def _node_version(node: Path) -> str | None:
+    probe = subprocess.run([str(node), "--version"], capture_output=True, text=True, check=False)
+    if probe.returncode != 0:
+        return None
+    return ((probe.stdout or "") + (probe.stderr or "")).strip() or None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("destination", type=Path)
     args = parser.parse_args()
+
+    destination = args.destination.resolve()
+    refresh = os.environ.get("STAFFDECK_RUNTIME_REFRESH", "").strip() == "1"
+    # 复用优先：bundle 校验通过就不再依赖 npm，也不再联网。
+    if not refresh and _bundle_is_ready(destination):
+        print(f"复用已准备好的 SRT runtime（跳过 Node 下载与 npm ci）：{destination}")
+        return 0
+
     npm = shutil.which("npm.cmd" if os.name == "nt" else "npm") or shutil.which("npm")
     if not npm:
         raise SystemExit("npm is required to prepare the SRT runtime bundle.")
 
-    destination = args.destination.resolve()
     destination.mkdir(parents=True, exist_ok=True)
     bin_dir = destination / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
@@ -114,6 +168,26 @@ def main() -> int:
     _apply_allow_all_domains_patch(destination)
     print(f"SRT runtime ready at {destination}")
     return 0
+
+
+def _cached_node_archive(filename: str, url: str, *, force: bool = False) -> Path:
+    """取回 Node 包：缓存里有就直接用，否则下载到缓存后再返回。"""
+    cache_dir = _cache_dir()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    archive = cache_dir / filename
+    if archive.is_file() and not force:
+        print(f"复用已缓存的 Node 运行时包 {filename}（跳过下载）")
+        return archive
+    print(f"下载 {url} ...")
+    staged = archive.with_suffix(archive.suffix + ".part")
+    try:
+        socket.setdefaulttimeout(60)
+        urllib.request.urlretrieve(url, staged)
+    except Exception as exc:
+        staged.unlink(missing_ok=True)
+        raise SystemExit(f"Failed to download Node runtime from {url}: {exc}") from exc
+    staged.replace(archive)
+    return archive
 
 
 def _download_node_runtime(destination: Path) -> None:
@@ -140,57 +214,56 @@ def _download_node_runtime(destination: Path) -> None:
         raise SystemExit(f"Unsupported Node platform: {system}")
     filename = f"node-{NODE_VERSION}-{target}.{suffix}"
     url = f"https://nodejs.org/dist/{NODE_VERSION}/{filename}"
-    with tempfile.TemporaryDirectory(prefix="staffdeck-node-") as temp:
-        archive = Path(temp) / filename
-        try:
-            socket.setdefaulttimeout(60)
-            urllib.request.urlretrieve(url, archive)
-        except Exception as exc:
-            raise SystemExit(f"Failed to download Node runtime from {url}: {exc}") from exc
-        expected_hash = (
-            os.environ.get("STAFFDECK_NODE_SHA256", "").strip().lower()
-            or NODE_SHA256.get(filename, "")
+    archive = _cached_node_archive(filename, url)
+    expected_hash = (
+        os.environ.get("STAFFDECK_NODE_SHA256", "").strip().lower()
+        or NODE_SHA256.get(filename, "")
+    )
+    if not expected_hash:
+        raise SystemExit(
+            f"No trusted SHA256 is configured for {filename}; set STAFFDECK_NODE_SHA256."
         )
-        if not expected_hash:
-            raise SystemExit(
-                f"No trusted SHA256 is configured for {filename}; set STAFFDECK_NODE_SHA256."
-            )
+    actual_hash = hashlib.sha256(archive.read_bytes()).hexdigest()
+    if actual_hash != expected_hash:
+        # 缓存包被截断/损坏：丢掉重下一次，仍不一致才报错（避免脏缓存卡死后续构建）。
+        print(f"缓存 {filename} 摘要不一致，重新下载", file=sys.stderr)
+        archive = _cached_node_archive(filename, url, force=True)
         actual_hash = hashlib.sha256(archive.read_bytes()).hexdigest()
-        if actual_hash != expected_hash:
-            raise SystemExit(
-                f"Node runtime SHA256 mismatch: expected {expected_hash}, got {actual_hash}"
-            )
-        target_bin = destination / "bin"
-        target_bin.mkdir(parents=True, exist_ok=True)
-        node_name = "node.exe" if system == "windows" else "node"
-        target_node = target_bin / node_name
-        if suffix == "tar.gz":
-            with tarfile.open(archive, "r:gz") as handle:
-                members = [
-                    member
-                    for member in handle.getmembers()
-                    if member.name.endswith("/bin/node") and member.isfile()
-                ]
-                if len(members) != 1:
-                    raise SystemExit("Node archive does not contain exactly one bin/node.")
-                source = handle.extractfile(members[0])
-                if source is None:
-                    raise SystemExit("Node executable cannot be read from the archive.")
-                with source, target_node.open("wb") as output:
-                    shutil.copyfileobj(source, output)
-        else:
-            with zipfile.ZipFile(archive) as handle:
-                members = [
-                    name
-                    for name in handle.namelist()
-                    if name.endswith("/node.exe") and not name.endswith("/")
-                ]
-                if len(members) != 1:
-                    raise SystemExit("Node archive does not contain exactly one node.exe.")
-                with handle.open(members[0]) as source, target_node.open("wb") as output:
-                    shutil.copyfileobj(source, output)
-        if system != "windows":
-            target_node.chmod(target_node.stat().st_mode | 0o111)
+    if actual_hash != expected_hash:
+        raise SystemExit(
+            f"Node runtime SHA256 mismatch: expected {expected_hash}, got {actual_hash}"
+        )
+    target_bin = destination / "bin"
+    target_bin.mkdir(parents=True, exist_ok=True)
+    node_name = "node.exe" if system == "windows" else "node"
+    target_node = target_bin / node_name
+    if suffix == "tar.gz":
+        with tarfile.open(archive, "r:gz") as handle:
+            members = [
+                member
+                for member in handle.getmembers()
+                if member.name.endswith("/bin/node") and member.isfile()
+            ]
+            if len(members) != 1:
+                raise SystemExit("Node archive does not contain exactly one bin/node.")
+            source = handle.extractfile(members[0])
+            if source is None:
+                raise SystemExit("Node executable cannot be read from the archive.")
+            with source, target_node.open("wb") as output:
+                shutil.copyfileobj(source, output)
+    else:
+        with zipfile.ZipFile(archive) as handle:
+            members = [
+                name
+                for name in handle.namelist()
+                if name.endswith("/node.exe") and not name.endswith("/")
+            ]
+            if len(members) != 1:
+                raise SystemExit("Node archive does not contain exactly one node.exe.")
+            with handle.open(members[0]) as source, target_node.open("wb") as output:
+                shutil.copyfileobj(source, output)
+    if system != "windows":
+        target_node.chmod(target_node.stat().st_mode | 0o111)
 
 
 def _machine() -> str:
