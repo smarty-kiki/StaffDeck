@@ -52,7 +52,7 @@ import { Button as UIButton } from '@/components/ui/button';
 import { notify } from '@/components/ui/app-toast';
 import { cn } from '@/lib/utils';
 import { isTeamScope, readEmployeeScope } from '@/lib/agent-scope-storage';
-import { isPlazaScopeValue, PLAZA_SCOPE_VALUE, resolveReturnTarget } from '@/lib/plaza-navigation';
+import { isPlazaScopeValue, PLAZA_SCOPE_VALUE, resolveCreatePageTitle, resolveReturnTarget } from '@/lib/plaza-navigation';
 import {
   MENU_CONTENT_CLASS,
   MENU_ITEM_CLASS,
@@ -1511,7 +1511,9 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
   const canManageCurrentScope = currentAgent
     ? canManageEmployeeAgent(currentAgent, currentUser)
     : isEnterpriseAdmin(currentUser) && isPlazaScope;
-  const pageTitle = isNew ? '新建空白技能' : '编辑技能';
+  const pageTitle = isNew
+    ? resolveCreatePageTitle('general-skills', forceGalleryScope, '新建空白技能')
+    : '编辑技能';
   const pageDescription = isPlazaScope
     ? (isNew
       ? '填写技能定义并编辑 SKILL.md，保存后可在右侧运行测试。'

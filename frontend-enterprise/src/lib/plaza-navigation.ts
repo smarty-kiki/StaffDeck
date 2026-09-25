@@ -52,13 +52,27 @@ export type PlazaCreateKind = 'knowledge' | 'general-skills' | 'skills' | 'tools
 
 const PLAZA_CREATE_LABEL: Record<PlazaCreateKind, string> = {
   knowledge: '创建开放知识库',
-  'general-skills': '创建开放 Skill',
+  'general-skills': '创建开放技能',
   skills: '创建开放 SOP',
   tools: '创建开放工具',
 };
 
 export function plazaCreateLabel(kind: PlazaCreateKind): string {
   return PLAZA_CREATE_LABEL[kind];
+}
+
+/**
+ * 广场视角下的新建页标题。
+ *
+ * 入口按钮写的是「创建开放 XX」，落地页却还挂着「新建 XX」—— 用户一路点下来会觉得
+ * 自己进错了页。标题统一走这里取词，两边由同一份映射产出，不会各改各的。
+ */
+export function resolveCreatePageTitle(
+  kind: PlazaCreateKind,
+  isPlazaScope: boolean,
+  fallback: string,
+): string {
+  return isPlazaScope ? plazaCreateLabel(kind) : fallback;
 }
 
 export function isPlazaCreateKind(kind: string): kind is PlazaCreateKind {

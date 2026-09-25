@@ -44,7 +44,7 @@ describe('PlatformKindDetailView create entry', () => {
     // 「创建开放 XX」必须随模块变化，否则知识库/工具广场会挂着一个「创建开放 Skill」。
     for (const [kind, label] of [
       ['knowledge', '创建开放知识库'],
-      ['general-skills', '创建开放 Skill'],
+      ['general-skills', '创建开放技能'],
       ['skills', '创建开放 SOP'],
       ['tools', '创建开放工具'],
     ] as const) {

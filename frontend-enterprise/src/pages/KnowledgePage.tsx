@@ -71,7 +71,7 @@ import {
   persistSharedAgentScope,
   readEmployeeScope,
 } from '@/lib/agent-scope-storage';
-import { isPlazaScopeValue, resolveReturnTarget } from '@/lib/plaza-navigation';
+import { isPlazaScopeValue, resolveCreatePageTitle, resolveReturnTarget } from '@/lib/plaza-navigation';
 import IconAdd from '../assets/icons/add.svg?react';
 import IconChevronDown from '../assets/icons/chevron-down.svg?react';
 import IconClear from '../assets/icons/field-clear.svg?react';
@@ -1666,6 +1666,12 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
     path: '/enterprise/knowledge',
     label: '返回',
   });
+  // 落地页的抬头跟入口按钮同词：入口写「创建开放知识库」，这里就不能还写「新建知识库」。
+  const pageTitle = resolveCreatePageTitle('knowledge', forcePlazaScope, '新建知识库');
+  const pageKicker = forcePlazaScope ? '开放广场 / 知识库 / 新建' : '知识库 / 新建';
+  const pageDescription = forcePlazaScope
+    ? '上传业务文档后直接发布到开放广场，供其他数字员工引用。'
+    : '上传业务文档后，系统会先生成知识图谱，再刷新目录索引、引用来源与自发现建议。';
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBaseRead[]>([]);
   const [capabilityScope, setCapabilityScope] = useState<CapabilityScope>('general');
   const [jobs, setJobs] = useState<Record<string, KnowledgeIngestJobRead>>({});
@@ -1890,9 +1896,9 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
       <div className="knowledge-floating-shell">
         <div className="knowledge-floating-head">
           <div>
-            <span className="section-kicker">知识库 / 新建</span>
-            <h3 className="my-[4px] text-[20px] font-semibold text-foreground">新建知识库</h3>
-            <span className="text-[13px] text-[#858b9c]">上传业务文档后，系统会先生成知识图谱，再刷新目录索引、引用来源与自发现建议。</span>
+            <span className="section-kicker">{pageKicker}</span>
+            <h3 className="my-[4px] text-[20px] font-semibold text-foreground">{pageTitle}</h3>
+            <span className="text-[13px] text-[#858b9c]">{pageDescription}</span>
           </div>
             <UIButton variant="outline" onClick={() => navigate(returnTarget.path)}>
               <RightOutlined />
@@ -1906,7 +1912,11 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
               <strong className="block text-[14px] font-semibold text-foreground">上传文档即创建知识库</strong>
               <span className="text-[13px] text-[#858b9c]">一个文件对应一份独立知识库；回到知识库后可查看文档卡片、知识索引和知识图谱。</span>
             </div>
-            <UIButton variant="outline" onClick={() => navigate('/enterprise/knowledge')}>管理已有知识库</UIButton>
+            {/* 这枚按钮写死去员工私有的知识库管理页。从广场进来时它会把用户甩出广场，
+                而广场里「已有的知识库」正是「返回」的那一个落点，多一枚同义按钮只会让人猜。 */}
+            {!forcePlazaScope && (
+              <UIButton variant="outline" onClick={() => navigate('/enterprise/knowledge')}>管理已有知识库</UIButton>
+            )}
           </div>
         {visibleKnowledgeBases.length > 0 && (
           <div className="knowledge-base-target-strip">

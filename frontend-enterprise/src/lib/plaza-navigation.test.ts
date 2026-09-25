@@ -5,6 +5,7 @@ import {
   isPlazaScopeValue,
   plazaCreateLabel,
   plazaCreatePath,
+  resolveCreatePageTitle,
   resolveReturnTarget,
 } from './plaza-navigation';
 
@@ -83,8 +84,31 @@ describe('plaza create labels', () => {
 
   it('names the created resource after the module', () => {
     expect(plazaCreateLabel('knowledge')).toBe('创建开放知识库');
+    expect(plazaCreateLabel('general-skills')).toBe('创建开放技能');
     expect(plazaCreateLabel('skills')).toBe('创建开放 SOP');
     expect(plazaCreateLabel('tools')).toBe('创建开放工具');
+  });
+
+  it('never calls the open skill entry a plain "Skill"', () => {
+    // 广场里这条是给技能用的，文案要和模块内的「技能」叫法一致。
+    expect(plazaCreateLabel('general-skills')).not.toContain('Skill');
+  });
+});
+
+describe('resolveCreatePageTitle', () => {
+  const kinds = ['knowledge', 'general-skills', 'skills', 'tools'] as const;
+
+  it('uses the entry wording on the landing page', () => {
+    // 入口按钮与落地页标题必须同词，否则用户会以为自己进错了页。
+    for (const kind of kinds) {
+      expect(resolveCreatePageTitle(kind, true, '新建 XX')).toBe(plazaCreateLabel(kind));
+    }
+  });
+
+  it('keeps the module wording outside the plaza', () => {
+    for (const kind of kinds) {
+      expect(resolveCreatePageTitle(kind, false, '新建 XX')).toBe('新建 XX');
+    }
   });
 });
 

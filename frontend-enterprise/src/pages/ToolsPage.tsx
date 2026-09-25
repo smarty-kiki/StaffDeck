@@ -67,7 +67,7 @@ import {
 } from '../employee';
 import { useClientPagination } from '../hooks/useClientPagination';
 import { isTeamScope, readEmployeeScope } from '../lib/agent-scope-storage';
-import { isPlazaScopeValue, PLAZA_SCOPE_VALUE, resolveReturnTarget } from '../lib/plaza-navigation';
+import { isPlazaScopeValue, PLAZA_SCOPE_VALUE, resolveCreatePageTitle, resolveReturnTarget } from '../lib/plaza-navigation';
 import { StatusBadge } from './scheduled-tasks/StatusBadge';
 import type {
   AgentProfileRead,
@@ -1130,7 +1130,7 @@ function ToolEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' 
       <AppHeader
         onLogout={onLogout}
         userName={currentUser?.username}
-        title={isEdit ? '编辑工具' : '新建工具'}
+        title={isEdit ? '编辑工具' : resolveCreatePageTitle('tools', forcePlazaScope, '新建工具')}
         description={
           isEdit
             ? '修改工具定义，并在右侧验证当前配置或已保存版本。'
@@ -1756,7 +1756,7 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
       <AppHeader
         onLogout={onLogout}
         userName={currentUser?.username}
-        title={isEdit ? '编辑 MCP 服务器' : '新建工具'}
+        title={isEdit ? '编辑 MCP 服务器' : resolveCreatePageTitle('tools', forcePlazaScope, '新建工具')}
         description="配置 MCP Server 连接后，可发现其提供的工具并同步为工具集。"
       />
       <div className="mt-[20px] mb-[16px] flex flex-wrap justify-end gap-[16px]">

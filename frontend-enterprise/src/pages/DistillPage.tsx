@@ -75,7 +75,7 @@ import {
 import { ModelConfigDropdown } from '@/components/ModelConfigDropdown';
 import { cn } from '@/lib/utils';
 import { isTeamScope, readEmployeeScope } from '@/lib/agent-scope-storage';
-import { isPlazaScopeValue, PLAZA_SCOPE_VALUE, resolveReturnTarget } from '@/lib/plaza-navigation';
+import { isPlazaScopeValue, PLAZA_SCOPE_VALUE, resolveCreatePageTitle, resolveReturnTarget } from '@/lib/plaza-navigation';
 import { subscribeEnterpriseCapabilityCatalogRefresh } from '@/lib/capability-catalog-events';
 import { SELECT_TRIGGER_CLASS } from '@/lib/enterprise-ui';
 import { formatHandoffAssigneeValue, parseHandoffAssigneeValue } from '@/lib/handoff-assignee';
@@ -2245,7 +2245,11 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     animationTimersRef.current = [];
   }
 
-  const pageTitle = mode === 'create' && !skillId ? '新建 SOP' : '编辑 SOP';
+  const pageTitle = resolveCreatePageTitle(
+    'skills',
+    forcePlazaScope,
+    mode === 'create' && !skillId ? '新建 SOP' : '编辑 SOP',
+  );
 
   return (
     <div className={DISTILL_PAGE_CLASS}>

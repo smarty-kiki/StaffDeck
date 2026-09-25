@@ -105,7 +105,7 @@ export default function PlatformKindDetailView({
   onBack,
   onRefresh,
   onCreate,
-  createLabel = '创建开放 Skill',
+  createLabel = '创建开放技能',
   onOpenItem,
   canManage = false,
   unpublishingItemId,
