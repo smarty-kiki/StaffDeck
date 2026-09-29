@@ -808,7 +808,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
                   </DropdownMenuItem>
                   {!isPlazaScope && (
                     <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void openReferenceDialog()}>
-                      <IconSkill />
+                      <Copy />
                       引用广场技能
                     </DropdownMenuItem>
                   )}
