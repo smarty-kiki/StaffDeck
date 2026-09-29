@@ -45,7 +45,7 @@ import IconHistory from '../assets/icons/profile-history.svg?react';
 import IconMore from '../assets/icons/more.svg?react';
 import IconRefresh from '../assets/icons/refresh.svg?react';
 import IconSearch from '../assets/icons/search.svg?react';
-import IconSkill from '../assets/icons/plaza-skill.svg?react';
+import IconSop from '../assets/icons/plaza-sop.svg?react';
 import IconTrash from '../assets/icons/trash.svg?react';
 import { isEnterpriseAdmin, type EnterpriseAuthUser } from '../auth';
 import {
@@ -734,7 +734,7 @@ export default function SkillsPage({
       <ResourceReferenceDialog
         open={importOpen}
         loading={importLoading}
-        icon={<IconSkill className="size-[14px] shrink-0" />}
+        icon={<IconSop className="size-[14px] shrink-0" />}
         title="引用广场 SOP"
         itemsLabel="选择 SOP"
         items={importSourceSkills.map((item) => ({
@@ -967,7 +967,7 @@ function RankingDialog({
         className="flex max-h-[calc(100dvh-4rem)] w-[calc(100%-2rem)] flex-col gap-[16px] overflow-hidden rounded-[14px] px-[20px] py-[16px] sm:max-w-[1000px]"
       >
         <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
-          <IconSkill className="size-[14px] shrink-0" />
+          <IconSop className="size-[14px] shrink-0" />
           <DialogTitle className="text-[14px] font-normal leading-none text-[#757f9c]">
             {rankingTitle(mode, scope)}
           </DialogTitle>
@@ -1110,7 +1110,7 @@ function VersionDetailDialog({
         className="flex max-h-[calc(100dvh-4rem)] w-[calc(100%-2rem)] flex-col gap-[16px] overflow-hidden rounded-[14px] px-[20px] py-[16px] sm:max-w-[900px]"
       >
         <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
-          <IconSkill className="size-[14px] shrink-0" />
+          <IconSop className="size-[14px] shrink-0" />
           <DialogTitle className="min-w-0 truncate text-[14px] font-normal leading-none text-[#757f9c]">
             {detail ? `版本详情：${detail.name} / ${detail.version}` : '版本详情'}
           </DialogTitle>
