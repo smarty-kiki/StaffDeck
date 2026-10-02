@@ -44,6 +44,9 @@ const CHART_HEIGHT = 168;
 /** 当日没有调用时留一段灰色基线，让「空档」和「用量极小」一眼能分开。 */
 const CHART_EMPTY_STUB_PERCENT = 2;
 const RANGE_CONTROL_CLASS = 'h-[28px] rounded-[8px] px-[12px] text-[12px]';
+/** 强调色取项目 --chart-1 / --primary 的取值（teal），用于柱状图、占比条与汇总数值。 */
+const ACCENT_TEXT_CLASS = 'text-[#0f766e]';
+const ACCENT_BG_CLASS = 'bg-[#0f766e]';
 
 export default function UsageStatsPage() {
   const [stats, setStats] = useState<UsageStats | null>(null);
@@ -160,15 +163,25 @@ export default function UsageStatsPage() {
             <p className="text-[12px] text-[#858b9c]">当前账号为普通成员，这里只统计你自己的用量。</p>
           )}
           <div className="flex flex-wrap items-stretch gap-[20px]" aria-label="用量统计">
-            <StatCard label="调用次数" value={stats ? formatTokenCount(stats.totals.calls) : '-'} />
-            <StatCard label="总 Token" value={stats ? formatTokenCount(totalTokens) : '-'} />
+            <StatCard
+              label="调用次数"
+              value={stats ? formatTokenCount(stats.totals.calls) : '-'}
+              valueClassName={ACCENT_TEXT_CLASS}
+            />
+            <StatCard
+              label="总 Token"
+              value={stats ? formatTokenCount(totalTokens) : '-'}
+              valueClassName={ACCENT_TEXT_CLASS}
+            />
             <StatCard
               label="输入 Token"
               value={stats ? formatTokenCount(stats.totals.input_tokens) : '-'}
+              valueClassName={ACCENT_TEXT_CLASS}
             />
             <StatCard
               label="输出 Token"
               value={stats ? formatTokenCount(stats.totals.output_tokens) : '-'}
+              valueClassName={ACCENT_TEXT_CLASS}
             />
           </div>
         </CardContent>
@@ -198,7 +211,7 @@ export default function UsageStatsPage() {
                           'w-full rounded-t-[3px]',
                           isEmpty
                             ? 'bg-[#e9e9e9]'
-                            : 'bg-[#282931] transition-colors group-hover:bg-[#18181a]',
+                            : `${ACCENT_BG_CLASS} transition-opacity group-hover:opacity-85`,
                         )}
                         style={{ height: `${isEmpty ? CHART_EMPTY_STUB_PERCENT : percent}%` }}
                       />
@@ -328,7 +341,7 @@ function buildBreakdownColumns(
           <span className="flex items-center gap-[8px]">
             <span className="block h-[4px] w-[72px] overflow-hidden rounded-[90px] bg-[#e9e9e9]">
               <span
-                className="block h-full rounded-[90px] bg-[#282931]"
+                className={cn('block h-full rounded-[90px]', ACCENT_BG_CLASS)}
                 style={{ width: `${Math.min(100, Math.max(share > 0 ? 2 : 0, share))}%` }}
               />
             </span>
