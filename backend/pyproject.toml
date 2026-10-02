@@ -23,7 +23,11 @@ dependencies = [
   "python-docx>=1.1.2",
   "python-dotenv>=1.0.1",
   "requests>=2.32.0",
-  "sqlmodel>=0.0.21",
+  # 全库 datetime 字段按「UTC naive」存储（models.utc_now() 显式去掉 tzinfo），
+  # sqlmodel 0.0.45 起对裸 datetime 注解强制要求带时区，naive 值一律拒绝：
+  # ValueError: Datetime values must have timezone information。
+  # 后果不是某个接口报错，而是首次启动 seed demo 租户即崩、应用起不来。
+  "sqlmodel>=0.0.21,<0.0.45",
   "tzdata>=2025.2",
   "uvicorn[standard]>=0.30.0",
   "wecom-aibot-python-sdk>=1.0.2",
