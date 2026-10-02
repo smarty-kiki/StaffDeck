@@ -16,5 +16,6 @@ export enum EnterpriseRoute {
   Tools = '/enterprise/tools',
   Accounts = '/enterprise/accounts',
   Models = '/enterprise/models',
+  Usage = '/enterprise/usage',
   RuntimeSettings = '/enterprise/runtime-settings',
 }

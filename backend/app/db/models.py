@@ -686,6 +686,52 @@ class ModelConfig(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
+class LlmUsageRecord(SQLModel, table=True):
+    """大模型调用用量账本 —— 一行 = 一次模型调用。
+
+    为什么单独建表而不是直接聚合 ``agent_events``：
+
+    * ``agent_events`` 是排障用的观测数据，一条 ``llm_call_finished`` 带 46~50 个
+      字段（含完整请求/响应正文），按天/按人聚合要反复解析 JSON；
+    * 会话被删除时 ``purge_chat_session_records`` 会把该会话的 ``agent_events``
+      一并删掉，用量（成本）数据不该跟着会话消失。
+
+    因此账本只保留聚合需要的列，且**不随会话删除**。``span_id`` 唯一，保证
+    从历史 ``agent_events`` 回填时幂等。
+    """
+
+    __tablename__ = "llm_usage_records"
+    __table_args__ = (
+        UniqueConstraint("span_id", name="uq_llm_usage_span"),
+        Index("ix_llm_usage_tenant_created", "tenant_id", "created_at"),
+        Index("ix_llm_usage_tenant_user", "tenant_id", "user_id", "created_at"),
+        Index("ix_llm_usage_tenant_agent", "tenant_id", "agent_id", "created_at"),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("llmuse"), primary_key=True)
+    tenant_id: str = Field(index=True)
+    # 归因维度：会话 / 用户 / 数字员工。渠道入站会话可能没有平台用户，此时 user_id 为空。
+    session_id: str | None = Field(default=None, index=True)
+    user_id: str | None = Field(default=None, index=True)
+    agent_id: str | None = Field(default=None, index=True)
+    # 调用标识：与 agent_events 的 span_id 对应，回填去重靠它
+    span_id: str
+    # 调用场景（turn_planner.plan / harness.task_action / session.title ...）与模型
+    operation: str = Field(default="", index=True)
+    model_name: str = Field(default="")
+    provider_model: str = Field(default="")
+    status: str = Field(default="success")
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    cached_input_tokens: int = 0
+    duration_ms: float = 0.0
+    # 来源：live = 调用结束实时落账；backfill = 升级时从 agent_events 补齐
+    source: str = Field(default="live", index=True)
+    # 调用发生时间（UTC naive，与项目其余时间列一致）
+    created_at: datetime = Field(default_factory=utc_now)
+
+
 class PersonaConfig(SQLModel, table=True):
     __tablename__ = "persona_configs"
 

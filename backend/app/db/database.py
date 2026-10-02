@@ -161,6 +161,10 @@ def _migrate_sqlite_skill_schema() -> None:
         _migrate_wechat_kf_accounts(conn, tables)
         _migrate_capability_scope_schema(conn, inspector, tables)
         _migrate_harness_v2_schema(conn, inspector, tables)
+        # 大模型用量账本：从既有 agent_events 补齐历史用量（一次性）
+        from app.observability.usage_ledger import migrate_backfill_llm_usage
+
+        migrate_backfill_llm_usage(conn, tables)
 
         if "api_jobs" in tables:
             job_columns = {column["name"] for column in inspector.get_columns("api_jobs")}

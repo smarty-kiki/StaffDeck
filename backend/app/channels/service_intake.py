@@ -54,6 +54,7 @@ from app.db.models import (
     utc_now,
 )
 from app.observability.spans import bind_span_sink
+from app.observability.usage_ledger import record_llm_usage
 from app.session.session_schema import ChatTurnRequest
 
 logger = logging.getLogger(__name__)
@@ -1582,6 +1583,13 @@ def process_inbound(
                 def persist_span(event_type: str, payload: dict[str, object]) -> None:
                     event_payload = dict(payload)
                     event_payload.setdefault("client_turn_id", inbound.event_id)
+                    record_llm_usage(
+                        db,
+                        tenant_id=binding.tenant_id,
+                        session_id=session_id,
+                        event_type=event_type,
+                        payload=event_payload,
+                    )
                     db.add(
                         AgentEvent(
                             tenant_id=binding.tenant_id,

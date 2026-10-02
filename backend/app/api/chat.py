@@ -57,6 +57,7 @@ from app.observability.spans import (
     reset_span_sink,
     set_span_sink,
 )
+from app.observability.usage_ledger import record_llm_usage
 from app.scheduled_tasks.schema import ScheduledTaskDraftRead
 from app.scheduled_tasks.service import DEFAULT_TASK_TIME, detect_scheduled_task_draft
 from app.security.auth import get_current_user
@@ -1148,6 +1149,14 @@ def chat_stream(
                         event_payload.setdefault("user_message_id", turn_id)
                     if request.client_turn_id:
                         event_payload.setdefault("client_turn_id", request.client_turn_id)
+                    # 模型调用结束顺带落一行用量账本，与事件同批提交（见 usage_ledger）
+                    record_llm_usage(
+                        worker_db,
+                        tenant_id=request.tenant_id,
+                        session_id=session_id,
+                        event_type=event_type,
+                        payload=event_payload,
+                    )
                     _persist_relay_only_event(
                         worker_db,
                         request.tenant_id,

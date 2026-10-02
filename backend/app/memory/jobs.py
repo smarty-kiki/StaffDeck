@@ -10,6 +10,7 @@ from app.db.models import AgentEvent, ChatSession, Message, ModelConfig
 from app.memory.service import MemoryService, memory_read
 from app.observability import EventLog
 from app.observability.spans import bind_span_sink
+from app.observability.usage_ledger import record_llm_usage
 from app.session.session_schema import ChatTurnRequest, StepAgentResult
 from app.tools.tool_schema import ToolResult
 
@@ -110,6 +111,13 @@ def run_memory_capture_job(payload: dict[str, Any]) -> None:
                 traced_payload.setdefault("user_message_id", turn_id)
             if request.client_turn_id:
                 traced_payload.setdefault("client_turn_id", request.client_turn_id)
+            record_llm_usage(
+                db,
+                tenant_id=request.tenant_id,
+                session_id=session_id,
+                event_type=event_type,
+                payload=traced_payload,
+            )
             events.record(request.tenant_id, session_id, event_type, traced_payload)
             db.commit()
 

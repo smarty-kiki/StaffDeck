@@ -17,6 +17,7 @@ from app.api.skills import router as skills_router
 from app.api.tools import mcp_router, router as tools_router
 from app.api.traces import router as traces_router
 from app.api.ui_config import enterprise_router as ui_config_router
+from app.api.usage import router as usage_router
 
 
 def test_enterprise_read_endpoints_require_authentication() -> None:
@@ -38,6 +39,7 @@ def test_enterprise_read_endpoints_require_authentication() -> None:
     app.include_router(external_tasks_router)
     app.include_router(scheduled_tasks_router)
     app.include_router(sessions_router)
+    app.include_router(usage_router)
     client = TestClient(app)
 
     paths = [
@@ -63,6 +65,8 @@ def test_enterprise_read_endpoints_require_authentication() -> None:
         "/api/enterprise/scheduled-tasks?tenant_id=tenant_demo",
         "/api/enterprise/sessions?tenant_id=tenant_demo",
         "/api/enterprise/external-business-tasks/provider-1?tenant_id=tenant_demo",
+        "/api/enterprise/usage/stats?tenant_id=tenant_demo",
+        "/api/enterprise/usage/operations?tenant_id=tenant_demo",
     ]
 
     for path in paths:

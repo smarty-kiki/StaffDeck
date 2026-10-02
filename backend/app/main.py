@@ -29,6 +29,7 @@ from app.api import (
     tools,
     traces,
     ui_config,
+    usage,
     wechat_kf,
 )
 from app.async_jobs import shutdown_async_jobs, start_async_jobs
@@ -149,6 +150,7 @@ app.include_router(external_business_tasks.enterprise_router)
 app.include_router(external_business_tasks.callback_router)
 app.include_router(sessions.router)
 app.include_router(traces.router)
+app.include_router(usage.router)
 app.include_router(mock.router)
 app.include_router(a2a_router)
 

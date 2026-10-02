@@ -50,6 +50,7 @@ import KnowledgeManagePage, { KnowledgeAddPage } from "./pages/KnowledgePage";
 import LoginPage from "./pages/LoginPage";
 import ModelsPage from "./pages/ModelsPage";
 import RuntimeSettingsPage from "./pages/RuntimeSettingsPage";
+import UsageStatsPage from "./pages/UsageStatsPage";
 import OpenPlatformPage from "./pages/OpenPlatformPage";
 import PersonaPage from "./pages/PersonaPage";
 import SkillsPage from "./pages/SkillsPage";
@@ -707,6 +708,16 @@ function Shell({
                 element={
                   isAdmin ? (
                     <ModelsPage currentUser={auth.user} onLogout={onLogout} />
+                  ) : (
+                    <Navigate to={EnterpriseRoute.Gallery} replace />
+                  )
+                }
+              />
+              <Route
+                path="/enterprise/usage"
+                element={
+                  isAdmin ? (
+                    <UsageStatsPage />
                   ) : (
                     <Navigate to={EnterpriseRoute.Gallery} replace />
                   )

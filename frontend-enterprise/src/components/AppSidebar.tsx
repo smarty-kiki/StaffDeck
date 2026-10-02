@@ -48,6 +48,7 @@ import IconChevronDown from '../assets/icons/chevron-down.svg?react';
 import IconAdd from '../assets/icons/add.svg?react';
 import IconSort from '../assets/icons/sort.svg?react';
 import IconGlobe from '../assets/icons/globe.svg?react';
+import IconGrowthArrow from '../assets/icons/growth-arrow.svg?react';
 import IconViewMasonry from '../assets/icons/view-masonry.svg?react';
 import IconChatBubble from '../assets/icons/chat.svg?react';
 import IconEdit from '../assets/icons/edit.svg?react';
@@ -85,6 +86,7 @@ const CAPABILITY_NAV: NavItem[] = [
 const SYSTEM_NAV: NavItem[] = [
   { route: EnterpriseRoute.Accounts, label: '账号管理', Icon: IconAccounts },
   { route: EnterpriseRoute.Models, label: '模型配置', Icon: IconModels },
+  { route: EnterpriseRoute.Usage, label: '用量统计', Icon: IconGrowthArrow },
   { route: EnterpriseRoute.RuntimeSettings, label: '运行设置', Icon: IconSettings },
 ];
 
