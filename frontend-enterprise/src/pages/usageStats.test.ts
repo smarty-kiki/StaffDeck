@@ -4,7 +4,6 @@ import {
   UNATTRIBUTED_KEY,
   barHeightPercent,
   breakdownLabel,
-  formatCompactTokenCount,
   formatTokenCount,
   localDayIso,
   localTimezoneOffsetMinutes,
@@ -64,16 +63,7 @@ describe('usage stats number formatting', () => {
     expect(formatTokenCount(Number.NaN)).toBe('0');
   });
 
-  it('uses locale-independent K/M/B units in compact form', () => {
-    // 单位不随语言变，避免中文「万」被翻译后倍数算错
-    expect(formatCompactTokenCount(689868)).toBe('689.9K');
-    expect(formatCompactTokenCount(2_500_000)).toBe('2.50M');
-    expect(formatCompactTokenCount(3_000_000_000)).toBe('3.00B');
-    expect(formatCompactTokenCount(999)).toBe('999');
-    expect(formatCompactTokenCount(0)).toBe('0');
-  });
-
-  it('never scales a bar past 100% and keeps non-zero bars visible', () => {
+  it('reserves 0 for days without usage so the chart can tell them from tiny values', () => {
     expect(barHeightPercent(0, 100)).toBe(0);
     expect(barHeightPercent(50, 100)).toBe(50);
     expect(barHeightPercent(100, 100)).toBe(100);

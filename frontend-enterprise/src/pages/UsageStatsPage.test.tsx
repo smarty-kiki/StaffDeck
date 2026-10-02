@@ -111,8 +111,10 @@ describe('UsageStatsPage', () => {
     expect(screen.getAllByText('104').length).toBeGreaterThan(0);
     expect(screen.getAllByText('512,486').length).toBeGreaterThan(0);
     expect(screen.getAllByText('177,382').length).toBeGreaterThan(0);
-    // 紧凑写法只作为总 Token 的副标题出现
-    expect(screen.getAllByText('689.9K').length).toBe(1);
+    // 汇总卡沿用项目共享的 StatCard（值与标签同排）
+    expect(screen.getAllByText('总 Token').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('输入 Token').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('输出 Token').length).toBeGreaterThan(0);
   });
 
   it('asks the backend for the selected range and the browser timezone', async () => {

@@ -83,18 +83,7 @@ export function formatTokenCount(value: number): string {
   return Math.round(value).toLocaleString('en-US');
 }
 
-/** 图表/提示用的紧凑写法。用 K/M/B 而非「万/亿」：单位不随语言变，
- *  中文界面下也不会出现「{数值}万」被翻译成英文单位却算错倍数的问题。 */
-export function formatCompactTokenCount(value: number): string {
-  if (!Number.isFinite(value)) return '0';
-  const abs = Math.abs(value);
-  if (abs >= 1_000_000_000) return `${(value / 1_000_000_000).toFixed(2)}B`;
-  if (abs >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`;
-  if (abs >= 1_000) return `${(value / 1_000).toFixed(1)}K`;
-  return formatTokenCount(value);
-}
-
-/** 柱高百分比；全 0 时返回 0，避免除零。 */
+/** 柱高百分比；0 值返回 0，由页面渲染成灰色基线，避免除零也避免与"用量极小"混淆。 */
 export function barHeightPercent(value: number, max: number): number {
   if (!Number.isFinite(value) || !Number.isFinite(max) || max <= 0) return 0;
   if (value <= 0) return 0;
